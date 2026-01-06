@@ -3,32 +3,35 @@
 
 Adafruit_INA219 ina219;
 
-void setup() {
-  Serial.begin(9600); // 통신 속도
-  
-  // INA219 칩 시작
-  if (!ina219.begin()) {
-    Serial.println("Failed to find INA219 chip");
+void setup(void) 
+{
+  Serial.begin(9600);
+  while (!Serial) {
+      // 시리얼 연결 기다림
+      delay(1);
+  }
+
+  if (! ina219.begin()) {
+    Serial.println("INA219 칩을 찾을 수 없습니다. 배선을 확인하세요!");
     while (1) { delay(10); }
   }
+
+  Serial.println("측정 시작...");
 }
 
-void loop() {
-  float busVoltage_V = 0;
+void loop(void) 
+{
   float current_mA = 0;
-  float power_mW = 0;
+  float loadvoltage = 0;
 
-  // 값 읽기
-  busVoltage_V = ina219.getBusVoltage_V();
+  // 전류 측정 (mA)
   current_mA = ina219.getCurrent_mA();
-  power_mW = ina219.getPower_mW();
+  
+  // 전압 측정 (V) - PV가 주는 전압
+  loadvoltage = ina219.getBusVoltage_V() + (ina219.getShuntVoltage_mV() / 1000);
 
-  // 데이터 전송 (전압,전류,전력)
-  Serial.print(busVoltage_V);
-  Serial.print(",");
-  Serial.print(current_mA);
-  Serial.print(",");
-  Serial.println(power_mW);
+  Serial.print("생성 전압: "); Serial.print(loadvoltage); Serial.print(" V  |  ");
+  Serial.print("충전 전류: "); Serial.print(current_mA); Serial.println(" mA");
 
-  delay(500); 
+  delay(1000); // 1초마다 갱신
 }
