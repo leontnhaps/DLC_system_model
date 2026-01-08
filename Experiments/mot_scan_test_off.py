@@ -30,7 +30,7 @@ except ImportError:
 MODEL_PATH = "yolov11m_diff.pt"
 
 # ⭐ 여기에 스캔 폴더 경로 입력! (예시)
-SCAN_FOLDER = r"C:\Users\gmlwn\OneDrive\바탕 화면\ICon1학년\OpticalWPT\추계 이후자료\Diff YOLO Dataset\젤먼거10"
+SCAN_FOLDER = r"C:\Users\gmlwn\OneDrive\바탕 화면\ICon1학년\OpticalWPT\PTCamera_waveshare\captures_gui_20260107_181822"
 
 CONF_THRES = 0.50
 IOU_THRES = 0.45
@@ -589,13 +589,13 @@ def parse_scan_images(scan_folder):
     images = []
     
     for img_file in folder.glob("*.jpg"):
-        # ⭐ _ud (undistorted) 파일만 처리
-        if '_ud' not in img_file.name:
+        # ⭐ .ud (undistorted) 파일만 처리
+        if '.ud' not in img_file.name:
             continue
             
-        # 파일명 파싱: img_t+00_p+000_20251128_221105_941_led_on_ud.jpg
-        # 패턴: t[tilt]_p[pan]_[timestamp]_led_[on/off]_ud.jpg
-        match = re.search(r't([+-]?\d+)_p([+-]?\d+)_(\d{8}_\d{6}_\d{3})_(led_on|led_off)_ud', img_file.name)
+        # 파일명 파싱: img_t+00_p+000_20260107_181924_352_led_on.ud.jpg
+        # 패턴: t[tilt]_p[pan]_[timestamp]_led_[on/off].ud.jpg
+        match = re.search(r't([+-]?\d+)_p([+-]?\d+)_(\d{8}_\d{6}_\d{3})_(led_on|led_off)\.ud', img_file.name)
         if not match:
             continue
         

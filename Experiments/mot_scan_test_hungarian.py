@@ -1,6 +1,7 @@
 """
-MOT Scan Simulation Test
+MOT Scan Simulation Test - Hungarian Algorithm Version
 기존 스캔 이미지 폴더로 전체 추적 알고리즘 테스트
+⭐ 헝가리안 알고리즘 사용 (최적 매칭)
 """
 import cv2
 import numpy as np
@@ -10,6 +11,7 @@ import re
 from pathlib import Path
 from numpy.linalg import norm
 from ultralytics import YOLO
+from scipy.optimize import linear_sum_assignment  # ⭐ 헝가리안 알고리즘
 
 # ---------------------------------------------------------
 # 기존 모듈 로드
@@ -129,7 +131,7 @@ def calc_cosine_similarity(vec_a, vec_b):
         return 0.0
     return dot / (n_a * n_b)
 
-def save_tracked_objects(tracker, output_folder="./mot_output"):
+def save_tracked_objects(tracker, output_folder="./mot_output_hungarian"):
     """
     각 track_id별로 검출된 모든 ROI를 그리드로 저장
     """
@@ -294,96 +296,114 @@ class ObjectTracker:
             unique_id = str(self.unique_id_counter)
             self.unique_id_counter += 1
             obj['unique_id'] = unique_id
-        
-        # 2-1. 직접 후보 매칭 (threshold = 0.3)
-        direct_matches = []
-        for obj_idx, obj in enumerate(curr_objects):
-            for candidate in direct_candidates:
-                sim = calc_cosine_similarity(obj['vec'], candidate['vec'])
-                direct_matches.append((sim, obj_idx, candidate, 'direct'))
-        
-        # 2-2. 건너뛰기 후보 매칭 (threshold = 0.35)
-        skip_matches = []
-        for obj_idx, obj in enumerate(curr_objects):
-            for candidate in skip_candidates:
-                sim = calc_cosine_similarity(obj['vec'], candidate['vec'])
-                skip_matches.append((sim, obj_idx, candidate, 'skip'))
-        
-        # 3. 직접 후보를 우선 정렬 (유사도 높은 순)
-        direct_matches.sort(key=lambda x: x[0], reverse=True)
-        skip_matches.sort(key=lambda x: x[0], reverse=True)
-        
-        # 4. 탐욕적 할당 (2단계)
-        used_objects = set()
-        used_track_ids = set()
-        obj_assignments = {}  # {obj_idx: (track_id, similarity, candidate, source)}
-        
-        # 4-1. 먼저 직접 후보로 매칭 시도 (threshold = 0.3)
-        for sim, obj_idx, candidate, source in direct_matches:
-            if obj_idx in used_objects or candidate['track_id'] in used_track_ids:
-                continue
-            
-            if sim > 0.5:  # 직접 후보 threshold
-                obj_assignments[obj_idx] = (candidate['track_id'], sim, candidate, source)
-                used_objects.add(obj_idx)
-                used_track_ids.add(candidate['track_id'])
-        
-        # 4-2. 매칭 실패한 객체는 건너뛰기 후보로 시도 (threshold = 0.35)
-        for sim, obj_idx, candidate, source in skip_matches:
-            if obj_idx in used_objects or candidate['track_id'] in used_track_ids:
-                continue
-            
-            if sim > 0.5:  # 건너뛰기 후보 threshold (더 엄격)
-                obj_assignments[obj_idx] = (candidate['track_id'], sim, candidate, source)
-                used_objects.add(obj_idx)
-                used_track_ids.add(candidate['track_id'])
-        
-        # 5. 최종 track_id 할당 및 로그 생성
-        # 모든 후보 합치기 (로그용)
+        # 2. 유사도 매트릭스 생성 및 헝가리안 알고리즘 적용
+        # ⭐ HUNGARIAN ALGORITHM (최적 매칭)
         all_candidates = direct_candidates + skip_candidates
         
-        for obj_idx, obj in enumerate(curr_objects):
-            if obj_idx in obj_assignments:
-                # 매칭 성공
-                track_id, best_sim, best_candidate, source = obj_assignments[obj_idx]
-            else:
-                # 매칭 실패 → 새 ID
+        if not all_candidates:
+            # 후보가 없으면 모두 새 ID
+            track_ids = []
+            for obj_idx, obj in enumerate(curr_objects):
                 track_id = self.next_id
                 self.next_id += 1
-                best_sim = 0.0
-                best_candidate = None
-                source = None
+                obj['track_id'] = track_id
+                track_ids.append(track_id)
+                
+                # 로그 생성
+                log_entry = {
+                    'pan': pan,
+                    'tilt': tilt,
+                    'timestamp': timestamp,
+                    'obj_idx': obj_idx,
+                    'unique_id': obj['unique_id'],
+                    'comparisons': [],
+                    'assigned_id': track_id,
+                    'best_similarity': 0.0,
+                    'is_new_object': True,
+                    'match_source': None
+                }
+                self.similarity_log.append(log_entry)
+        else:
+            # ⭐ Cost Matrix 생성 (유사도를 cost로 변환: cost = 1 - similarity)
+            n_objects = len(curr_objects)
+            n_candidates = len(all_candidates)
             
-            obj['track_id'] = track_id
-            track_ids.append(track_id)
+            # Cost matrix: rows=objects, cols=candidates
+            cost_matrix = np.ones((n_objects, n_candidates))  # 기본 cost = 1 (유사도 0)
+            similarity_matrix = np.zeros((n_objects, n_candidates))
             
-            # ⭐ 로그 생성 (모든 후보와의 비교 기록)
-            log_entry = {
-                'pan': pan,
-                'tilt': tilt,
-                'timestamp': timestamp,
-                'obj_idx': obj_idx,
-                'unique_id': obj['unique_id'],
-                'comparisons': []
-            }
+            for i, obj in enumerate(curr_objects):
+                for j, candidate in enumerate(all_candidates):
+                    sim = calc_cosine_similarity(obj['vec'], candidate['vec'])
+                    similarity_matrix[i, j] = sim
+                    cost_matrix[i, j] = 1.0 - sim  # cost = 1 - similarity
             
-            for candidate in all_candidates:
-                sim = calc_cosine_similarity(obj['vec'], candidate['vec'])
-                log_entry['comparisons'].append({
-                    'candidate_id': candidate['track_id'],
-                    'candidate_unique_id': candidate.get('unique_id', 'N/A'),
-                    'candidate_pan': candidate['frame_pan'],
-                    'candidate_tilt': candidate['frame_tilt'],
-                    'candidate_timestamp': candidate['frame_timestamp'],
-                    'similarity': float(sim)
-                })
+            # ⭐ 헝가리안 알고리즘 적용 (최소 비용 매칭)
+            row_ind, col_ind = linear_sum_assignment(cost_matrix)
             
-            log_entry['assigned_id'] = track_id
-            log_entry['best_similarity'] = float(best_sim)
-            log_entry['is_new_object'] = (best_candidate is None)
-            log_entry['match_source'] = source  # 'direct', 'skip', or None
+            # 3. 매칭 결과 적용 (임계값 필터링)
+            obj_assignments = {}
             
-            self.similarity_log.append(log_entry)
+            for obj_idx, cand_idx in zip(row_ind, col_ind):
+                candidate = all_candidates[cand_idx]
+                sim = similarity_matrix[obj_idx, cand_idx]
+                
+                # 후보 소스 판단 (direct vs skip)
+                if cand_idx < len(direct_candidates):
+                    source = 'direct'
+                    threshold = 0.5  # Direct threshold
+                else:
+                    source = 'skip'
+                    threshold = 0.5  # Skip threshold
+                
+                # ⭐ 임계값 이상일 때만 매칭
+                if sim >= threshold:
+                    obj_assignments[obj_idx] = (candidate['track_id'], sim, candidate, source)
+            
+            # 4. 최종 track_id 할당
+            track_ids = []
+            for obj_idx, obj in enumerate(curr_objects):
+                if obj_idx in obj_assignments:
+                    # 매칭 성공
+                    track_id, best_sim, best_candidate, source = obj_assignments[obj_idx]
+                else:
+                    # 매칭 실패 → 새 ID
+                    track_id = self.next_id
+                    self.next_id += 1
+                    best_sim = 0.0
+                    best_candidate = None
+                    source = None
+                
+                obj['track_id'] = track_id
+                track_ids.append(track_id)
+                
+                # ⭐ 로그 생성 (모든 후보와의 비교 기록)
+                log_entry = {
+                    'pan': pan,
+                    'tilt': tilt,
+                    'timestamp': timestamp,
+                    'obj_idx': obj_idx,
+                    'unique_id': obj['unique_id'],
+                    'comparisons': []
+                }
+                
+                for candidate in all_candidates:
+                    sim = calc_cosine_similarity(obj['vec'], candidate['vec'])
+                    log_entry['comparisons'].append({
+                        'candidate_id': candidate['track_id'],
+                        'candidate_unique_id': candidate.get('unique_id', 'N/A'),
+                        'candidate_pan': candidate['frame_pan'],
+                        'candidate_tilt': candidate['frame_tilt'],
+                        'candidate_timestamp': candidate['frame_timestamp'],
+                        'similarity': float(sim)
+                    })
+                
+                log_entry['assigned_id'] = track_id
+                log_entry['best_similarity'] = float(best_sim)
+                log_entry['is_new_object'] = (best_candidate is None)
+                log_entry['match_source'] = source  # 'direct', 'skip', or None
+                
+                self.similarity_log.append(log_entry)
         
         # 현재 프레임 저장
         self.frames.append({
@@ -723,7 +743,7 @@ class ObjectTracker:
             result[key] = frame['objects']
         return result
     
-    def save_similarity_log(self, output_path="./mot_output/similarity_log.txt"):
+    def save_similarity_log(self, output_path="./mot_output_hungarian/similarity_log.txt"):
         """유사도 로그를 텍스트 파일로 저장"""
         os.makedirs(os.path.dirname(output_path), exist_ok=True)
         
