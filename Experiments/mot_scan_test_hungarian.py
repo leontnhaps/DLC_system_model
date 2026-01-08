@@ -296,6 +296,7 @@ class ObjectTracker:
             unique_id = str(self.unique_id_counter)
             self.unique_id_counter += 1
             obj['unique_id'] = unique_id
+        
         # 2. 유사도 매트릭스 생성 및 헝가리안 알고리즘 적용
         # ⭐ HUNGARIAN ALGORITHM (최적 매칭)
         all_candidates = direct_candidates + skip_candidates
@@ -622,53 +623,81 @@ class ObjectTracker:
                     tracks[track_id] = []
                 tracks[track_id].append(obj)
         
-        # 2. 검출 개수가 min_detections 미만인 track 필터링
+        # 2. 모든 Track 처리 (1개 이상)
+        all_track_ids = list(tracks.keys())
         valid_tracks = {tid: objs for tid, objs in tracks.items() if len(objs) >= min_detections}
-        excluded_tracks = {tid: len(objs) for tid, objs in tracks.items() if len(objs) < min_detections}
+        small_tracks = {tid: objs for tid, objs in tracks.items() if 1 <= len(objs) < min_detections}
         
         print(f"  총 Track 수: {len(tracks)}개")
-        print(f"  유효 Track (>= {min_detections}개): {len(valid_tracks)}개")
-        print(f"  제외 Track (< {min_detections}개): {len(excluded_tracks)}개")
-        if excluded_tracks:
-            print(f"    제외된 Track IDs: {list(excluded_tracks.keys())}")
+        print(f"  큰 Track (>= {min_detections}개): {len(valid_tracks)}개")
+        print(f"  작은 Track (1~{min_detections-1}개): {len(small_tracks)}개")
+        if small_tracks:
+            print(f"    작은 Track IDs: {list(small_tracks.keys())}")
         
-        # 3. 각 track에서 대표 샘플 3개 선택 (균등 분포)
-        track_representatives = {}
-        for track_id, objs in valid_tracks.items():
-            n = len(objs)
-            if n >= 3:
-                # 균등하게 3개 선택 (시작, 중간, 끝)
-                indices = [0, n // 2, n - 1]
-            else:
-                # 3개 미만이면 전부 사용
-                indices = list(range(n))
+       # 3. 적응형 샘플링 함수
+        def get_adaptive_samples(objs_a, objs_b):
+            """
+            두 Track의 크기에 맞춰 적응형 샘플링
+            작은 쪽 크기에 맞춰 큰 쪽도 샘플링
+            """
+            n_a = len(objs_a)
+            n_b = len(objs_b)
+            n_samples = min(n_a, n_b, 3)  # 최대 3개
             
-            track_representatives[track_id] = [objs[i] for i in indices]
+            # Track A 샘플링
+            if n_a >= 3 and n_samples == 3:
+                idx_a = [0, n_a // 2, n_a - 1]
+            elif n_a == 2 and n_samples == 2:
+                idx_a = [0, 1]
+            elif n_a == 1 or n_samples == 1:
+                idx_a = [0]
+            else:
+                idx_a = list(range(min(n_a, n_samples)))
+            
+            # Track B 샘플링
+            if n_b >= 3 and n_samples == 3:
+                idx_b = [0, n_b // 2, n_b - 1]
+            elif n_b == 2 and n_samples == 2:
+                idx_b = [0, 1]
+            elif n_b == 1 or n_samples == 1:
+                idx_b = [0]
+            else:
+                idx_b = list(range(min(n_b, n_samples)))
+            
+            samples_a = [objs_a[i] for i in idx_a]
+            samples_b = [objs_b[i] for i in idx_b]
+            
+            return samples_a, samples_b, n_samples
         
         # 4. Track 간 유사도 계산 및 병합 그룹 생성
-        track_ids = list(valid_tracks.keys())
         merge_groups = []  # [[tid1, tid2, ...], ...]
         visited = set()
         
         # ⭐ 병합 비교 로그
         comparison_log = []
         
-        for i, tid_a in enumerate(track_ids):
+        for i, tid_a in enumerate(all_track_ids):
             if tid_a in visited:
                 continue
             
             group = [tid_a]
             visited.add(tid_a)
+            objs_a = tracks[tid_a]
             
-            for j in range(i + 1, len(track_ids)):
-                tid_b = track_ids[j]
+            for j in range(i + 1, len(all_track_ids)):
+                tid_b = all_track_ids[j]
                 if tid_b in visited:
                     continue
                 
+                objs_b = tracks[tid_b]
+                
+                # ⭐ 적응형 샘플링
+                samples_a, samples_b, n_samples = get_adaptive_samples(objs_a, objs_b)
+                
                 # 대표 샘플들 간의 평균 유사도 계산
                 similarities = []
-                for obj_a in track_representatives[tid_a]:
-                    for obj_b in track_representatives[tid_b]:
+                for obj_a in samples_a:
+                    for obj_b in samples_b:
                         sim = calc_cosine_similarity(obj_a['vec'], obj_b['vec'])
                         similarities.append(sim)
                 
@@ -679,7 +708,10 @@ class ObjectTracker:
                 # ⭐ 비교 로그 기록
                 comparison_log.append({
                     'track_a': tid_a,
+                    'track_a_count': len(objs_a),
                     'track_b': tid_b,
+                    'track_b_count': len(objs_b),
+                    'samples_used': n_samples,
                     'avg_similarity': float(avg_sim),
                     'min_similarity': float(min_sim),
                     'max_similarity': float(max_sim),
@@ -690,7 +722,8 @@ class ObjectTracker:
                 
                 # ⭐ 임계값 이상이면 같은 그룹으로 병합
                 if avg_sim >= merge_threshold:
-                    print(f"  ✅ Track {tid_a} ↔ Track {tid_b}: 유사도 {avg_sim:.4f} → 병합!")
+                    print(f"  ✅ Track {tid_a}({len(objs_a)}개) ↔ Track {tid_b}({len(objs_b)}개): "
+                          f"유사도 {avg_sim:.4f} (샘플 {n_samples}개) → 병합!")
                     group.append(tid_b)
                     visited.add(tid_b)
             
@@ -725,7 +758,7 @@ class ObjectTracker:
             'min_detections': min_detections,
             'total_tracks': len(tracks),
             'valid_tracks': len(valid_tracks),
-            'excluded_tracks': excluded_tracks,
+            'excluded_tracks': {tid: len(objs) for tid, objs in small_tracks.items()},  # ⭐ small_tracks로 변경
             'final_tracks': len(merge_groups),
             'merged_count': merged_count,
             'comparisons': comparison_log,
@@ -812,10 +845,11 @@ class ObjectTracker:
                 if merged_comparisons:
                     f.write("✅ 병합된 Track 쌍:\n\n")
                     for comp in merged_comparisons:
-                        f.write(f"  Track {comp['track_a']} ↔ Track {comp['track_b']}\n")
+                        f.write(f"  Track {comp['track_a']}({comp['track_a_count']}개) ↔ "
+                               f"Track {comp['track_b']}({comp['track_b_count']}개)\n")
                         f.write(f"    평균 유사도: {comp['avg_similarity']:.4f}\n")
                         f.write(f"    범위: {comp['min_similarity']:.4f} ~ {comp['max_similarity']:.4f}\n")
-                        f.write(f"    비교 횟수: {comp['num_comparisons']}회\n")
+                        f.write(f"    비교 횟수: {comp['num_comparisons']}회 (샘플 {comp['samples_used']}개 사용)\n")
                         # ⭐ 개별 유사도 값 출력
                         f.write(f"    개별 값: {', '.join([f'{s:.4f}' for s in comp['similarities']])}\n")
                         f.write("\n")
@@ -827,10 +861,11 @@ class ObjectTracker:
                                               key=lambda x: x['avg_similarity'], 
                                               reverse=True)
                     for comp in not_merged_sorted:
-                        f.write(f"  Track {comp['track_a']} ↔ Track {comp['track_b']}\n")
+                        f.write(f"  Track {comp['track_a']}({comp['track_a_count']}개) ↔ "
+                               f"Track {comp['track_b']}({comp['track_b_count']}개)\n")
                         f.write(f"    평균 유사도: {comp['avg_similarity']:.4f} (임계값 미달)\n")
                         f.write(f"    범위: {comp['min_similarity']:.4f} ~ {comp['max_similarity']:.4f}\n")
-                        f.write(f"    비교 횟수: {comp['num_comparisons']}회\n")
+                        f.write(f"    비교 횟수: {comp['num_comparisons']}회 (샘플 {comp['samples_used']}개 사용)\n")
                         # ⭐ 개별 유사도 값 출력
                         f.write(f"    개별 값: {', '.join([f'{s:.4f}' for s in comp['similarities']])}\n")
                         f.write("\n")
@@ -977,17 +1012,17 @@ def main():
     # ⭐ Track 병합 (후처리)
     # merge_threshold: 유사도 임계값 (0.0~1.0, 높을수록 엄격)
     # min_detections: 최소 검출 개수 (이보다 적으면 제외)
-    tracker.merge_similar_tracks(merge_threshold=0.4, min_detections=3)
+    tracker.merge_similar_tracks(merge_threshold=0.3, min_detections=3)
     
     # ⭐ 유사도 로그 저장
     print("\n💾 유사도 로그 저장 중...")
-    tracker.save_similarity_log("./mot_output/similarity_log.txt")
-    print("✅ 유사도 로그 저장 완료! → ./mot_output/similarity_log.txt")
+    tracker.save_similarity_log("./mot_output_hungarian/similarity_log.txt")
+    print("✅ 유사도 로그 저장 완료! → ./mot_output_hungarian/similarity_log.txt")
     
     # 시각화 저장
     print("\n💾 Track ID별 이미지 저장 중...")
-    save_tracked_objects(tracker, output_folder="./mot_output")
-    print("✅ 저장 완료! → ./mot_output/ 폴더 확인")
+    save_tracked_objects(tracker, output_folder="./mot_output_hungarian")
+    print("✅ 저장 완료! → ./mot_output_hungarian/ 폴더 확인")
 
 if __name__ == "__main__":
     main()
