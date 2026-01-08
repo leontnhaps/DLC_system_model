@@ -34,21 +34,30 @@ SCAN_FOLDER = r"C:\Users\gmlwn\OneDrive\바탕 화면\ICon1학년\OpticalWPT\추
 CONF_THRES = 0.50
 IOU_THRES = 0.45
 # ⭐ 고정 ROI 크기 (중심 기준)
-ROI_SIZE = 200  # 200x200 픽셀
+ROI_SIZE = 300  # 300x300 픽셀
 
 # =========================================================
-# 특징 추출 (Grayscale)
+# 특징 추출 (HSV + Grayscale 결합)
 # =========================================================
-def get_feature_vector(roi_bgr, grid_size=(5, 5)):
+def get_feature_vector(roi_bgr, diff_roi=None, grid_size=(11, 11)):
     """
     격자 기반 히스토그램 추출: 공간적 위치 정보를 포함함
-    grid_size: (rows, cols) - ROI를 나눌 구역 수
+    ⭐ HSV + Grayscale 히스토그램 결합 (Diff 마스크 적용)
+    
+    Args:
+        roi_bgr: BGR 이미지 ROI
+        diff_roi: Diff 이미지 ROI (배경 필터링용)
+        grid_size: (rows, cols) - ROI를 나눌 구역 수
+    
+    Returns:
+        정규화된 특징 벡터 (numpy array)
     """
     if roi_bgr is None or roi_bgr.size == 0:
         return None
     
+    hsv = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2HSV)
     gray = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2GRAY)
-    h, w = gray.shape
+    h, w = hsv.shape[:2]
     rows, cols = grid_size
     
     feature_vector = []
@@ -63,15 +72,44 @@ def get_feature_vector(roi_bgr, grid_size=(5, 5)):
             x_end = int(((c + 1) / cols) * w)
             
             # 구역(Cell) 추출
-            cell = gray[y_start:y_end, x_start:x_end]
+            cell_hsv = hsv[y_start:y_end, x_start:x_end]
+            cell_gray = gray[y_start:y_end, x_start:x_end]
             
-            # 구역 내 히스토그램 (해당 위치의 색상 분포)
-            mask = cv2.inRange(cell, 30, 255)
-            hist = cv2.calcHist([cell], [0], mask, [64], [0, 256])
+            # ⭐ Diff 기반 마스크 생성
+            if diff_roi is not None:
+                # Diff cell 추출
+                diff_cell = diff_roi[y_start:y_end, x_start:x_end]
+                # Grayscale로 변환
+                if len(diff_cell.shape) == 3:
+                    diff_gray = cv2.cvtColor(diff_cell, cv2.COLOR_BGR2GRAY)
+                else:
+                    diff_gray = diff_cell
+                
+                # ⭐ Diff < 20인 부분만 (배경 부분, 객체 필름 제외!)
+                # Diff가 작은 부분 = 변화 없는 배경 → 사용
+                # Diff가 큰 부분 = LED 변화 객체(필름) → 제외
+                diff_mask = (diff_gray < 20).astype(np.uint8) * 255
+                
+                # V > 30 조건과 결합
+                v_mask = cv2.inRange(cell_hsv, (0, 0, 30), (180, 255, 255))
+                mask = cv2.bitwise_and(diff_mask, v_mask)
+            else:
+                # Diff가 없으면 기본 마스크만
+                mask = cv2.inRange(cell_hsv, (0, 0, 30), (180, 255, 255))
             
-            # 각 구역별 정규화 후 리스트에 추가
-            cv2.normalize(hist, hist, 0, 1, cv2.NORM_MINMAX)
-            feature_vector.append(hist.flatten())
+            # ⭐ 1. HSV 히스토그램 (Hue + Saturation)
+            # Hue: 8 bins, Saturation: 4 bins → 32차원
+            hist_hsv = cv2.calcHist([cell_hsv], [0, 1], mask, [8, 4], [0, 180, 0, 256])
+            cv2.normalize(hist_hsv, hist_hsv, 0, 1, cv2.NORM_MINMAX)
+            
+            # ⭐ 2. Grayscale 히스토그램
+            # 16 bins → 16차원
+            hist_gray = cv2.calcHist([cell_gray], [0], mask, [16], [0, 256])
+            cv2.normalize(hist_gray, hist_gray, 0, 1, cv2.NORM_MINMAX)
+            
+            # ⭐ 3. 두 히스토그램 결합 (32 + 16 = 48차원)
+            combined_hist = np.concatenate([hist_hsv.flatten(), hist_gray.flatten()])
+            feature_vector.append(combined_hist)
     
     # 모든 구역의 히스토그램을 하나로 결합 (공간 정보가 순서대로 쌓임)
     final_vector = np.concatenate(feature_vector)
@@ -189,11 +227,22 @@ class ObjectTracker:
         self.similarity_log = []
         self.unique_id_counter = 1
         
-    def add_detections(self, boxes, scores, img_on, pan, tilt, timestamp):
+    def add_detections(self, boxes, scores, img_on, diff, pan, tilt, timestamp):
         """
         타임스탬프 기반 순차 추적:
         1. 직전 프레임 (threshold=0.3)
-        2. 프레임 건너뛰기 (threshold=0.4) - 검출 놓침 대비
+        2. 프레임 건너뛰기 (threshold=0.35) - 검출 놓침 대비
+        
+        Args:
+            boxes: [(x, y, w, h), ...] - YOLO 검출 박스
+            scores: [conf, ...] - 신뢰도
+            img_on: LED ON 이미지
+            diff: Diff 이미지
+            pan, tilt: 현재 프레임 위치
+            timestamp: 타임스탬프
+        
+        Returns:
+            track_ids: [track_id, ...] - 각 박스의 track_id
         """
         # 현재 프레임 특징 추출
         curr_objects = []
@@ -212,10 +261,13 @@ class ObjectTracker:
             y2 = min(H, center_y + half_size)
             
             roi = img_on[y1:y2, x1:x2]
+            diff_roi = diff[y1:y2, x1:x2]  # ⭐ Diff ROI도 추출
+            
             if roi.size == 0:
                 continue
                 
-            vec = get_feature_vector(roi)
+            # ⭐ diff_roi 전달하여 필름 필터링 (grid_size 전달)
+            vec = get_feature_vector(roi, diff_roi=diff_roi, grid_size=(11, 11))
             
             # ⭐ 고유 ID 생성
             curr_objects.append({
@@ -247,7 +299,7 @@ class ObjectTracker:
                 sim = calc_cosine_similarity(obj['vec'], candidate['vec'])
                 direct_matches.append((sim, obj_idx, candidate, 'direct'))
         
-        # 2-2. 건너뛰기 후보 매칭 (threshold = 0.4)
+        # 2-2. 건너뛰기 후보 매칭 (threshold = 0.35)
         skip_matches = []
         for obj_idx, obj in enumerate(curr_objects):
             for candidate in skip_candidates:
@@ -273,12 +325,12 @@ class ObjectTracker:
                 used_objects.add(obj_idx)
                 used_track_ids.add(candidate['track_id'])
         
-        # 4-2. 매칭 실패한 객체는 건너뛰기 후보로 시도 (threshold = 0.4)
+        # 4-2. 매칭 실패한 객체는 건너뛰기 후보로 시도 (threshold = 0.35)
         for sim, obj_idx, candidate, source in skip_matches:
             if obj_idx in used_objects or candidate['track_id'] in used_track_ids:
                 continue
             
-            if sim > 0.4:  # 건너뛰기 후보 threshold (더 엄격)
+            if sim > 0.35:  # 건너뛰기 후보 threshold (더 엄격)
                 obj_assignments[obj_idx] = (candidate['track_id'], sim, candidate, source)
                 used_objects.add(obj_idx)
                 used_track_ids.add(candidate['track_id'])
@@ -434,8 +486,8 @@ class ObjectTracker:
                     'frame_timestamp': prev_tilt_frame['timestamp']
                 })
         
-        # 기본 대각선 fallback (둘 다 없을 때만)
-        if prev_pan_frame is None and prev_tilt_frame is None and prev_diagonal_frame is not None:
+        # ⭐ 대각선 (조건 없이 항상 추가)
+        if prev_diagonal_frame is not None:
             for obj in prev_diagonal_frame['objects']:
                 direct_candidates.append({
                     **obj,
@@ -681,8 +733,8 @@ def main():
             print(f"[Pan={pan:+4d}, Tilt={tilt:+3d}] 검출 없음")
             continue
         
-        # ⭐ 추적 (timestamp 전달)
-        track_ids = tracker.add_detections(boxes, scores, img_on, pan, tilt, timestamp)
+        # ⭐ 추적 (timestamp와 diff 전달)
+        track_ids = tracker.add_detections(boxes, scores, img_on, diff, pan, tilt, timestamp)
         
         # 결과 출력
         print(f"[Pan={pan:+4d}, Tilt={tilt:+3d}] {len(boxes)}개 검출 → track_ids: {track_ids}")
