@@ -655,30 +655,52 @@ class ObjectTracker:
         # ⭐ 병합 비교 로그
         comparison_log = []
         
+        # ⭐ 새로운 방식: frames에서 track별 위치 정보 수집
+        track_by_position = {}  # {track_id: [(pan, tilt, obj), ...]}
+        for frame in self.frames:
+            pan = frame['pan']
+            tilt = frame['tilt']
+            for obj in frame['objects']:
+                tid = obj['track_id']
+                if tid not in track_by_position:
+                    track_by_position[tid] = []
+                track_by_position[tid].append((pan, tilt, obj))
+        
         for i, tid_a in enumerate(all_track_ids):
             if tid_a in visited:
                 continue
             
             group = [tid_a]
             visited.add(tid_a)
-            objs_a = tracks[tid_a]
+            positions_a = track_by_position.get(tid_a, [])
             
             for j in range(i + 1, len(all_track_ids)):
                 tid_b = all_track_ids[j]
                 if tid_b in visited:
                     continue
                 
-                objs_b = tracks[tid_b]
+                positions_b = track_by_position.get(tid_b, [])
                 
-                # ⭐ 적응형 샘플링
-                samples_a, samples_b, n_samples = get_adaptive_samples(objs_a, objs_b)
-                
-                # 대표 샘플들 간의 평균 유사도 계산
+                # ⭐ 공간 기반 샘플링: 같은 Pan 라인 또는 같은 Tilt 라인만 비교
                 similarities = []
-                for obj_a in samples_a:
-                    for obj_b in samples_b:
-                        sim = calc_cosine_similarity(obj_a['vec'], obj_b['vec'])
-                        similarities.append(sim)
+                
+                # 같은 Pan 라인
+                for pan_a, tilt_a, obj_a in positions_a:
+                    for pan_b, tilt_b, obj_b in positions_b:
+                        if pan_a == pan_b:  # 같은 Pan 라인
+                            sim = calc_cosine_similarity(obj_a['vec'], obj_b['vec'])
+                            similarities.append(sim)
+                
+                # 같은 Tilt 라인
+                for pan_a, tilt_a, obj_a in positions_a:
+                    for pan_b, tilt_b, obj_b in positions_b:
+                        if tilt_a == tilt_b:  # 같은 Tilt 라인
+                            sim = calc_cosine_similarity(obj_a['vec'], obj_b['vec'])
+                            similarities.append(sim)
+                
+                if not similarities:
+                    # 겹치는 라인이 없으면 비교 불가
+                    continue
                 
                 avg_sim = np.mean(similarities)
                 min_sim = np.min(similarities)
@@ -687,10 +709,10 @@ class ObjectTracker:
                 # ⭐ 비교 로그 기록
                 comparison_log.append({
                     'track_a': tid_a,
-                    'track_a_count': len(objs_a),
+                    'track_a_count': len(positions_a),
                     'track_b': tid_b,
-                    'track_b_count': len(objs_b),
-                    'samples_used': n_samples,
+                    'track_b_count': len(positions_b),
+                    'samples_used': len(similarities),
                     'avg_similarity': float(avg_sim),
                     'min_similarity': float(min_sim),
                     'max_similarity': float(max_sim),
@@ -701,8 +723,8 @@ class ObjectTracker:
                 
                 # ⭐ 임계값 이상이면 같은 그룹으로 병합
                 if avg_sim >= merge_threshold:
-                    print(f"  ✅ Track {tid_a}({len(objs_a)}개) ↔ Track {tid_b}({len(objs_b)}개): "
-                          f"유사도 {avg_sim:.4f} (샘플 {n_samples}개) → 병합!")
+                    print(f"  ✅ Track {tid_a}({len(positions_a)}개) ↔ Track {tid_b}({len(positions_b)}개): "
+                          f"유사도 {avg_sim:.4f} (비교 {len(similarities)}회) → 병합!")
                     group.append(tid_b)
                     visited.add(tid_b)
             
@@ -991,7 +1013,7 @@ def main():
     # ⭐ Track 병합 (후처리)
     # merge_threshold: 유사도 임계값 (0.0~1.0, 높을수록 엄격)
     # min_detections: 최소 검출 개수 (이보다 적으면 제외)
-    tracker.merge_similar_tracks(merge_threshold=0.3, min_detections=3)
+    tracker.merge_similar_tracks(merge_threshold = 0.4, min_detections=3)
     
     # ⭐ 유사도 로그 저장
     print("\n💾 유사도 로그 저장 중...")
