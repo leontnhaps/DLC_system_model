@@ -329,14 +329,26 @@ PTCamera_waveshare/
 ├── Experiments/            # 실험 및 테스트 스크립트
 │   ├── yolo_utils.py       # YOLO 래핑 (IoMin NMS 포함)
 │   │
-│   ├── # MOT (Multi-Object Tracking) 테스트
-│   ├── mot_scan_hsv.py     # ✅ 최종 검증 완료 - HSV+Grayscale 기반 MOT
-│   │                       # - Skip-frame (n-2) 후보 검색
-│   │                       # - 양방향 대각선 검색 (지그재그 스캔 대응)
-│   │                       # - 2단계 매칭 (threshold 0.3 / 0.35)
-│   ├── mot_scan_test.py    # Grayscale 히스토그램 기반 MOT 테스트
-│   ├── mot_gray_test.py    # Grayscale 단독 특징 추출 테스트
-│   ├── mot_cosin_test.py   # 코사인 유사도 기반 MOT 초기 테스트
+│   ├── # 🎯 MOT (Multi-Object Tracking) 최종 알고리즘
+│   ├── mot_scan_test_hungarian_final.py  # ⭐⭐⭐ 최종 사용 버전
+│   │                       # ✨ 헝가리안 알고리즘 기반 최적 매칭
+│   │                       # - 특징 추출: HSV + Grayscale 히스토그램 (11x11 격자, 5,808차원)
+│   │                       # - Direct 후보 (n-1): 같은 Pan, 같은 Tilt, 대각선
+│   │                       # - Skip 후보 (n-2 + 양방향 대각선):
+│   │                       #   * n-2 프레임: 같은 Pan/Tilt (프레임 건너뛰기 대응)
+│   │                       #   * 양방향 대각선: Pan 증가/감소 각 1개 (지그재그 스캔 대응)
+│   │                       # - Cost Matrix 기반 글로벌 최적 매칭 (임계값 0.5)
+│   │                       # - Track 병합: 평균 유사도 0.4 이상, 최소 3개 검출
+│   │                       # - 출력: track_id별 ROI 그리드 이미지 + 상세 로그
+│   │
+│   ├── mot_scan_test_hungarian.py  # 기본 헝가리안 버전
+│   │                       # - Skip 후보: 양방향 대각선 각 2개씩 수집
+│   │
+│   ├── # 이전 MOT 실험 버전들
+│   ├── mot_scan_hsv.py     # HSV+Grayscale 기반 Greedy 매칭
+│   ├── mot_scan_test.py    # Grayscale 히스토그램 기반
+│   ├── mot_gray_test.py    # Grayscale 단독 특징
+│   ├── mot_cosin_test.py   # 코사인 유사도 초기 테스트
 │   │
 │   ├── # YOLO 추론 테스트
 │   ├── SAHI_yolo_test.py   # Tiling 전략 검증 및 IoMin NMS 테스트
