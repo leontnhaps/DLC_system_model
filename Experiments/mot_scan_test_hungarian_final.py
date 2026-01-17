@@ -351,10 +351,10 @@ class ObjectTracker:
                 # 후보 소스 판단 (direct vs skip)
                 if cand_idx < len(direct_candidates):
                     source = 'direct'
-                    threshold = 0.5  # Direct threshold
+                    threshold = 0.3  # Direct threshold
                 else:
                     source = 'skip'
-                    threshold = 0.5  # Skip threshold
+                    threshold = 0.35  # Skip threshold
                 
                 # ⭐ 임계값 이상일 때만 매칭
                 if sim >= threshold:

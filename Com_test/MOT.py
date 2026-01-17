@@ -149,8 +149,8 @@ class ObjectTracker:
     def add_detections(self, boxes, scores, img_on, diff, pan, tilt, timestamp):
         """
         타임스탬프 기반 순차 추적:
-        1. 직전 프레임 (threshold=0.5)
-        2. 프레임 건너뛰기 (threshold=0.5) - 검출 놓침 대비
+        1. 직전 프레임 (threshold=0.3)
+        2. 프레임 건너뛰기 (threshold=0.35) - 검출 놓침 대비
         ⭐ 헝가리안 알고리즘 (최적 매칭)
         
         Args:
@@ -267,10 +267,10 @@ class ObjectTracker:
                 # 후보 소스 판단 (direct vs skip)
                 if cand_idx < len(direct_candidates):
                     source = 'direct'
-                    threshold = 0.5  # Direct threshold
+                    threshold = 0.3  # Direct threshold
                 else:
                     source = 'skip'
-                    threshold = 0.5  # Skip threshold
+                    threshold = 0.35  # Skip threshold
                 
                 # ⭐ 임계값 이상일 때만 매칭
                 if sim >= threshold:
