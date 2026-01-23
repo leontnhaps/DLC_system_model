@@ -329,14 +329,26 @@ PTCamera_waveshare/
 ├── Experiments/            # 실험 및 테스트 스크립트
 │   ├── yolo_utils.py       # YOLO 래핑 (IoMin NMS 포함)
 │   │
-│   ├── # MOT (Multi-Object Tracking) 테스트
-│   ├── mot_scan_hsv.py     # ✅ 최종 검증 완료 - HSV+Grayscale 기반 MOT
-│   │                       # - Skip-frame (n-2) 후보 검색
-│   │                       # - 양방향 대각선 검색 (지그재그 스캔 대응)
-│   │                       # - 2단계 매칭 (threshold 0.3 / 0.35)
-│   ├── mot_scan_test.py    # Grayscale 히스토그램 기반 MOT 테스트
-│   ├── mot_gray_test.py    # Grayscale 단독 특징 추출 테스트
-│   ├── mot_cosin_test.py   # 코사인 유사도 기반 MOT 초기 테스트
+│   ├── # 🎯 MOT (Multi-Object Tracking) 최종 알고리즘
+│   ├── mot_scan_test_hungarian_final.py  # ⭐⭐⭐ 최종 사용 버전
+│   │                       # ✨ 헝가리안 알고리즘 기반 최적 매칭
+│   │                       # - 특징 추출: HSV + Grayscale 히스토그램 (11x11 격자, 5,808차원)
+│   │                       # - Direct 후보 (n-1): 같은 Pan, 같은 Tilt, 대각선
+│   │                       # - Skip 후보 (n-2 + 양방향 대각선):
+│   │                       #   * n-2 프레임: 같은 Pan/Tilt (프레임 건너뛰기 대응)
+│   │                       #   * 양방향 대각선: Pan 증가/감소 각 1개 (지그재그 스캔 대응)
+│   │                       # - Cost Matrix 기반 글로벌 최적 매칭 (임계값 0.5)
+│   │                       # - Track 병합: 평균 유사도 0.4 이상, 최소 3개 검출
+│   │                       # - 출력: track_id별 ROI 그리드 이미지 + 상세 로그
+│   │
+│   ├── mot_scan_test_hungarian.py  # 기본 헝가리안 버전
+│   │                       # - Skip 후보: 양방향 대각선 각 2개씩 수집
+│   │
+│   ├── # 이전 MOT 실험 버전들
+│   ├── mot_scan_hsv.py     # HSV+Grayscale 기반 Greedy 매칭
+│   ├── mot_scan_test.py    # Grayscale 히스토그램 기반
+│   ├── mot_gray_test.py    # Grayscale 단독 특징
+│   ├── mot_cosin_test.py   # 코사인 유사도 초기 테스트
 │   │
 │   ├── # YOLO 추론 테스트
 │   ├── SAHI_yolo_test.py   # Tiling 전략 검증 및 IoMin NMS 테스트
@@ -372,65 +384,15 @@ PTCamera_waveshare/
 ├── yolov11n_diff.pt        # YOLOv11 Nano 모델
 ├── yolov11m_diff.pt        # YOLOv11 Medium 모델
 └── example.mp4             # 데모 영상
-```
 
 ---
 
-## 🚀 Future Works (진행 중인 개선 사항)
+## 🚀 Future Works
 
-> [!NOTE]
-> 다음 항목들은 `Com_test/` 폴더에서 개발 및 테스트 중이며, 검증 완료 후 `Com/`으로 병합될 예정입니다.
-
-### 1. ✅ ~~Multi-Object Tracking 통합~~ **(완료)**
-
-**목표**: 스캔 중 여러 객체를 자동 추적하고 각 객체별 타겟 위치 계산.
-
-**완료 항목** (`Com_test/`):
-- [x] **MOT.py 모듈 생성**: HSV+Grayscale 히스토그램 기반 ObjectTracker
-    - ✅ 11x11 격자 기반 특징 추출 (5,808차원)
-    - ✅ 2단계 글로벌 매칭 (직전 + 건너뛰기 프레임)
-    - ✅ 코사인 유사도 기반 객체 식별
-- [x] **scan_utils.py 통합**: 스캔 시 track_id 자동 부여
-- [x] **pointing_handler.py 수정**: track_id별 독립 계산 + move_to_target() 메서드
-- [x] **동적 UI 생성**: 각 객체별 "Move to Target" 버튼
-- [x] **CSV 형식 업데이트**: track_id 컬럼 추가
-- [x] **아두이노 코드 제거**: PV Monitor 제거 (Com_1on1_arduino_valtage로 이동)
-
-**다음 단계**:
-- [ ] **자동 스캔 → Pointing 워크플로우**: GUI 실행 시 자동 스캔 및 순차 조준
-- [ ] **Com/ 병합**: 실제 RX 패널 제작 후 검증 완료 시 안정 버전으로 통합
-
-### 2. ✅ ~~YOLOv11n Nested Object Detection 개선~~ **(완료)**
-**문제**: 작은 객체가 큰 객체 내부에서 중복 탐지되는 현상 발생.
-
-**해결 완료**:
-- [x] **IoMin 기반 NMS 구현** (Option 2 선택):
-    - 표준 IoU 기반 NMS에 더해 IoMin(Intersection over Minimum Area) 방식 추가
-    - `IoMin = Intersection / Min(Area1, Area2)` 계산
-    - 2단계 NMS: IoU threshold 0.3 → IoMin threshold 0.5
-    - 작은 박스가 큰 박스에 50% 이상 포함 시 자동 제거
-
-**구현 위치**: `Com/yolo_utils.py` 및 `Experiments/yolo_utils.py`의 `improved_nms()` 함수
-
-### 3. 🔋 배터리 인식 상태 확인
-**목표**: 수신부 배터리 상태를 원격에서도 확인할 수 있도록 개선.
-
-**개선 방안**:
-- [ ] **시각적 피드백 강화**: 카메라로 RGB LED를 감지하여 GUI에 배터리 상태 표시
-- [ ] **통신 기반 모니터링**: 수신부 아두이노에서 무선 통신으로 전압 데이터 전송 (선택사항)
-
-**현재 상태**: 기본 LED 표시 기능 완료 (`Nano_LED.ino`).
-
-### 4. ✅ ~~하드웨어 파라미터 튜닝~~ **(완료)**
-**목표**: 다양한 환경에서 최적의 성능을 위한 파라미터 최적화.
-
-**완료 항목**:
-- [x] LED settle time 최적화
-- [x] Laser threshold 개선
-- [x] Scan grid resolution 조정
-- [x] Pointing feedback gain 미세 조정
-
-
+*   레이저 > 적외선 레이저 교체(850nm, 1W)
+*   카메라도 IR cut camera 로 교체
+*   전체시스템 통합
+*   RX 효율 확인 및 설계
 
 ---
 
