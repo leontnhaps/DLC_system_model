@@ -11,7 +11,7 @@ from ultralytics import YOLO
 sys.path.append(os.path.join(os.path.dirname(__file__), 'Com'))
 
 try:
-    from yolo_utils import predict_with_tiling
+    from ..Detection_test.yolo_utils import predict_with_tiling
     print("✅ 기존 알고리즘(yolo_utils) 로드 성공!")
 except ImportError:
     print("❌ 오류: Com/yolo_utils.py를 찾을 수 없습니다.")

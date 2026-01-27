@@ -1,6 +1,7 @@
 """
-MOT Scan Simulation Test
+MOT Scan Simulation Test - LED OFF 특징 추출 버전
 기존 스캔 이미지 폴더로 전체 추적 알고리즘 테스트
+⭐ LED OFF 이미지에서 특징을 추출하여 배경 패턴으로 추적
 """
 import cv2
 import numpy as np
@@ -17,7 +18,7 @@ from ultralytics import YOLO
 sys.path.append(os.path.join(os.path.dirname(__file__), '..', 'Com'))
 
 try:
-    from yolo_utils import predict_with_tiling
+    from ..Detection_test.yolo_utils import predict_with_tiling
     print("✅ yolo_utils 로드 성공!")
 except ImportError:
     print("❌ 오류: Com/yolo_utils.py를 찾을 수 없습니다.")
@@ -129,7 +130,7 @@ def calc_cosine_similarity(vec_a, vec_b):
         return 0.0
     return dot / (n_a * n_b)
 
-def save_tracked_objects(tracker, output_folder="./mot_output"):
+def save_tracked_objects(tracker, output_folder="./mot_output_off"):
     """
     각 track_id별로 검출된 모든 ROI를 그리드로 저장
     """
@@ -220,17 +221,14 @@ class ObjectTracker:
         self.similarity_log = []  # 모든 비교 기록
         # ⭐ 고유 ID 카운터 (1부터 시작)
         self.unique_id_counter = 1
-        # ⭐ 병합 로그
-        self.merge_log = []  # Track 병합 정보
         
     def reset(self):
         self.next_id = 0
         self.frames = []
         self.similarity_log = []
         self.unique_id_counter = 1
-        self.merge_log = []
         
-    def add_detections(self, boxes, scores, img_on, diff, pan, tilt, timestamp):
+    def add_detections(self, boxes, scores, img_off, diff, pan, tilt, timestamp):
         """
         타임스탬프 기반 순차 추적:
         1. 직전 프레임 (threshold=0.3)
@@ -239,7 +237,7 @@ class ObjectTracker:
         Args:
             boxes: [(x, y, w, h), ...] - YOLO 검출 박스
             scores: [conf, ...] - 신뢰도
-            img_on: LED ON 이미지
+            img_off: ⭐ LED OFF 이미지 (배경 패턴 추출용)
             diff: Diff 이미지
             pan, tilt: 현재 프레임 위치
             timestamp: 타임스탬프
@@ -249,7 +247,7 @@ class ObjectTracker:
         """
         # 현재 프레임 특징 추출
         curr_objects = []
-        H, W = img_on.shape[:2]
+        H, W = img_off.shape[:2]
         
         for i, (x, y, w, h) in enumerate(boxes):
             # ⭐ 객체 중심 계산
@@ -263,7 +261,8 @@ class ObjectTracker:
             x2 = min(W, center_x + half_size)
             y2 = min(H, center_y + half_size)
             
-            roi = img_on[y1:y2, x1:x2]
+            # ⭐ LED OFF 이미지에서 ROI 추출
+            roi = img_off[y1:y2, x1:x2]
             diff_roi = diff[y1:y2, x1:x2]  # ⭐ Diff ROI도 추출
             
             if roi.size == 0:
@@ -323,7 +322,7 @@ class ObjectTracker:
             if obj_idx in used_objects or candidate['track_id'] in used_track_ids:
                 continue
             
-            if sim > 0.5:  # 직접 후보 threshold
+            if sim > 0.3:  # 직접 후보 threshold
                 obj_assignments[obj_idx] = (candidate['track_id'], sim, candidate, source)
                 used_objects.add(obj_idx)
                 used_track_ids.add(candidate['track_id'])
@@ -333,7 +332,7 @@ class ObjectTracker:
             if obj_idx in used_objects or candidate['track_id'] in used_track_ids:
                 continue
             
-            if sim > 0.5:  # 건너뛰기 후보 threshold (더 엄격)
+            if sim > 0.35:  # 건너뛰기 후보 threshold (더 엄격)
                 obj_assignments[obj_idx] = (candidate['track_id'], sim, candidate, source)
                 used_objects.add(obj_idx)
                 used_track_ids.add(candidate['track_id'])
@@ -534,240 +533,6 @@ class ObjectTracker:
         
         return {'direct': direct_candidates, 'skip': skip_candidates}
     
-    def _match_object_with_log(self, curr_obj, candidates, pan, tilt, timestamp, obj_idx, unique_id):
-        """후보들과 비교하여 최적 매칭 (⭐ 로그 포함)"""
-        best_match_id = None
-        best_sim = 0.3  # 임계값
-        
-        # ⭐ 로그 엔트리
-        log_entry = {
-            'pan': pan,
-            'tilt': tilt,
-            'timestamp': timestamp,
-            'obj_idx': obj_idx,
-            'unique_id': unique_id,  # ⭐ 고유 ID 추가
-            'comparisons': []
-        }
-        
-        for candidate in candidates:
-            sim = calc_cosine_similarity(curr_obj['vec'], candidate['vec'])
-            
-            # ⭐ 각 비교 기록
-            log_entry['comparisons'].append({
-                'candidate_id': candidate['track_id'],
-                'candidate_unique_id': candidate.get('unique_id', 'N/A'),  # ⭐ 후보 고유 ID
-                'candidate_pan': candidate['frame_pan'],
-                'candidate_tilt': candidate['frame_tilt'],
-                'candidate_timestamp': candidate['frame_timestamp'],
-                'similarity': float(sim)
-            })
-            
-            if sim > best_sim:
-                best_sim = sim
-                best_match_id = candidate['track_id']
-        
-        # 매칭 실패 시 새 ID 부여
-        if best_match_id is None:
-            best_match_id = self.next_id
-            self.next_id += 1
-        
-        # ⭐ 로그에 최종 결과 추가
-        log_entry['assigned_id'] = best_match_id
-        log_entry['best_similarity'] = float(best_sim)
-        log_entry['is_new_object'] = (best_sim <= 0.5)
-        
-        return best_match_id, log_entry
-    
-    def merge_similar_tracks(self, merge_threshold=0.4, min_detections=3):
-        """
-        추적 완료 후 유사한 track들을 병합하는 후처리 단계
-        
-        Args:
-            merge_threshold: Track 병합 임계값 (⭐ 사용자 조정 가능)
-            min_detections: 최소 검출 개수 (이보다 적으면 제외)
-        
-        Returns:
-            merge_map: {old_track_id: new_track_id} 매핑
-        """
-        print(f"\n{'='*60}")
-        print(f"🔄 Track 병합 시작 (threshold={merge_threshold}, min={min_detections})")
-        print(f"{'='*60}")
-        
-        # 1. 각 track별 검출 수집
-        tracks = {}  # {track_id: [obj1, obj2, ...]}
-        for frame in self.frames:
-            for obj in frame['objects']:
-                track_id = obj['track_id']
-                if track_id not in tracks:
-                    tracks[track_id] = []
-                tracks[track_id].append(obj)
-        
-        # 2. 모든 Track 처리 (1개 이상)
-        all_track_ids = list(tracks.keys())
-        valid_tracks = {tid: objs for tid, objs in tracks.items() if len(objs) >= min_detections}
-        small_tracks = {tid: objs for tid, objs in tracks.items() if 1 <= len(objs) < min_detections}
-        
-        print(f"  총 Track 수: {len(tracks)}개")
-        print(f"  큰 Track (>= {min_detections}개): {len(valid_tracks)}개")
-        print(f"  작은 Track (1~{min_detections-1}개): {len(small_tracks)}개")
-        if small_tracks:
-            print(f"    작은 Track IDs: {list(small_tracks.keys())}")
-        
-       # 3. 적응형 샘플링 함수
-        def get_adaptive_samples(objs_a, objs_b):
-            """
-            두 Track의 크기에 맞춰 적응형 샘플링
-            작은 쪽 크기에 맞춰 큰 쪽도 샘플링
-            """
-            n_a = len(objs_a)
-            n_b = len(objs_b)
-            n_samples = min(n_a, n_b, 3)  # 최대 3개
-            
-            # Track A 샘플링
-            if n_a >= 3 and n_samples == 3:
-                idx_a = [0, n_a // 2, n_a - 1]
-            elif n_a == 2 and n_samples == 2:
-                idx_a = [0, 1]
-            elif n_a == 1 or n_samples == 1:
-                idx_a = [0]
-            else:
-                idx_a = list(range(min(n_a, n_samples)))
-            
-            # Track B 샘플링
-            if n_b >= 3 and n_samples == 3:
-                idx_b = [0, n_b // 2, n_b - 1]
-            elif n_b == 2 and n_samples == 2:
-                idx_b = [0, 1]
-            elif n_b == 1 or n_samples == 1:
-                idx_b = [0]
-            else:
-                idx_b = list(range(min(n_b, n_samples)))
-            
-            samples_a = [objs_a[i] for i in idx_a]
-            samples_b = [objs_b[i] for i in idx_b]
-            
-            return samples_a, samples_b, n_samples
-        
-        # 4. Track 간 유사도 계산 및 병합 그룹 생성
-        merge_groups = []  # [[tid1, tid2, ...], ...]
-        visited = set()
-        
-        # ⭐ 병합 비교 로그
-        comparison_log = []
-        
-        # ⭐ 새로운 방식: frames에서 track별 위치 정보 수집
-        track_by_position = {}  # {track_id: [(pan, tilt, obj), ...]}
-        for frame in self.frames:
-            pan = frame['pan']
-            tilt = frame['tilt']
-            for obj in frame['objects']:
-                tid = obj['track_id']
-                if tid not in track_by_position:
-                    track_by_position[tid] = []
-                track_by_position[tid].append((pan, tilt, obj))
-        
-        for i, tid_a in enumerate(all_track_ids):
-            if tid_a in visited:
-                continue
-            
-            group = [tid_a]
-            visited.add(tid_a)
-            positions_a = track_by_position.get(tid_a, [])
-            
-            for j in range(i + 1, len(all_track_ids)):
-                tid_b = all_track_ids[j]
-                if tid_b in visited:
-                    continue
-                
-                positions_b = track_by_position.get(tid_b, [])
-                
-                # ⭐ 공간 기반 샘플링: 같은 Pan 라인 또는 같은 Tilt 라인만 비교
-                similarities = []
-                
-                # 같은 Pan 라인
-                for pan_a, tilt_a, obj_a in positions_a:
-                    for pan_b, tilt_b, obj_b in positions_b:
-                        if pan_a == pan_b:  # 같은 Pan 라인
-                            sim = calc_cosine_similarity(obj_a['vec'], obj_b['vec'])
-                            similarities.append(sim)
-                
-                # 같은 Tilt 라인
-                for pan_a, tilt_a, obj_a in positions_a:
-                    for pan_b, tilt_b, obj_b in positions_b:
-                        if tilt_a == tilt_b:  # 같은 Tilt 라인
-                            sim = calc_cosine_similarity(obj_a['vec'], obj_b['vec'])
-                            similarities.append(sim)
-                
-                if not similarities:
-                    # 겹치는 라인이 없으면 비교 불가
-                    continue
-                
-                avg_sim = np.mean(similarities)
-                min_sim = np.min(similarities)
-                max_sim = np.max(similarities)
-                
-                # ⭐ 비교 로그 기록
-                comparison_log.append({
-                    'track_a': tid_a,
-                    'track_a_count': len(positions_a),
-                    'track_b': tid_b,
-                    'track_b_count': len(positions_b),
-                    'samples_used': len(similarities),
-                    'avg_similarity': float(avg_sim),
-                    'min_similarity': float(min_sim),
-                    'max_similarity': float(max_sim),
-                    'num_comparisons': len(similarities),
-                    'similarities': [float(s) for s in similarities],  # ⭐ 개별 값 저장
-                    'merged': avg_sim >= merge_threshold
-                })
-                
-                # ⭐ 임계값 이상이면 같은 그룹으로 병합
-                if avg_sim >= merge_threshold:
-                    print(f"  ✅ Track {tid_a}({len(positions_a)}개) ↔ Track {tid_b}({len(positions_b)}개): "
-                          f"유사도 {avg_sim:.4f} (비교 {len(similarities)}회) → 병합!")
-                    group.append(tid_b)
-                    visited.add(tid_b)
-            
-            merge_groups.append(group)
-        
-        # 5. 병합 맵 생성 (가장 작은 ID를 대표로 사용)
-        merge_map = {}
-        for group in merge_groups:
-            representative_id = min(group)  # 가장 작은 ID를 대표로
-            for tid in group:
-                merge_map[tid] = representative_id
-        
-        # 6. 모든 프레임의 track_id 업데이트
-        merged_count = 0
-        for frame in self.frames:
-            for obj in frame['objects']:
-                old_id = obj['track_id']
-                if old_id in merge_map:
-                    new_id = merge_map[old_id]
-                    if old_id != new_id:
-                        merged_count += 1
-                    obj['track_id'] = new_id
-        
-        print(f"\n  병합 결과:")
-        print(f"    최종 Track 수: {len(merge_groups)}개 (유효 Track 중)")
-        print(f"    병합된 검출: {merged_count}개")
-        print(f"{'='*60}\n")
-        
-        # 7. 병합 로그 저장
-        self.merge_log = {
-            'threshold': merge_threshold,
-            'min_detections': min_detections,
-            'total_tracks': len(tracks),
-            'valid_tracks': len(valid_tracks),
-            'excluded_tracks': {tid: len(objs) for tid, objs in small_tracks.items()},  # ⭐ small_tracks로 변경
-            'final_tracks': len(merge_groups),
-            'merged_count': merged_count,
-            'comparisons': comparison_log,
-            'merge_groups': merge_groups
-        }
-        
-        return merge_map
-    
     @property
     def frame_objects(self):
         """시각화를 위한 호환성 속성"""
@@ -777,13 +542,13 @@ class ObjectTracker:
             result[key] = frame['objects']
         return result
     
-    def save_similarity_log(self, output_path="./mot_output/similarity_log.txt"):
+    def save_similarity_log(self, output_path="./mot_output_off/similarity_log.txt"):
         """유사도 로그를 텍스트 파일로 저장"""
         os.makedirs(os.path.dirname(output_path), exist_ok=True)
         
         with open(output_path, 'w', encoding='utf-8') as f:
             f.write("=" * 80 + "\n")
-            f.write("MOT Similarity Log\n")
+            f.write("MOT Similarity Log (LED OFF Features)\n")
             f.write("=" * 80 + "\n\n")
             
             for entry in self.similarity_log:
@@ -811,77 +576,6 @@ class ObjectTracker:
                     f.write(f"  ℹ️  No candidates (first detection)\n")
                 
                 f.write("-" * 80 + "\n")
-            
-            # ⭐ 병합 로그 추가
-            if self.merge_log:
-                f.write("\n" + "=" * 80 + "\n")
-                f.write("🔄 Track 병합 정보 (Post-Processing)\n")
-                f.write("=" * 80 + "\n\n")
-                
-                f.write(f"병합 설정:\n")
-                f.write(f"  - Threshold: {self.merge_log['threshold']}\n")
-                f.write(f"  - Min Detections: {self.merge_log['min_detections']}\n\n")
-                
-                f.write(f"통계:\n")
-                f.write(f"  - 총 Track 수: {self.merge_log['total_tracks']}개\n")
-                f.write(f"  - 유효 Track: {self.merge_log['valid_tracks']}개\n")
-                f.write(f"  - 제외 Track: {len(self.merge_log['excluded_tracks'])}개\n")
-                f.write(f"  - 최종 Track: {self.merge_log['final_tracks']}개\n")
-                f.write(f"  - 병합된 검출: {self.merge_log['merged_count']}개\n\n")
-                
-                if self.merge_log['excluded_tracks']:
-                    f.write(f"제외된 Track IDs (검출 < {self.merge_log['min_detections']}):\n")
-                    for tid, count in self.merge_log['excluded_tracks'].items():
-                        f.write(f"  - Track {tid}: {count}개\n")
-                    f.write("\n")
-                
-                f.write("=" * 80 + "\n")
-                f.write("Track 간 유사도 비교 결과\n")
-                f.write("=" * 80 + "\n\n")
-                
-                # 병합된 것과 안된 것을 분리해서 표시
-                merged_comparisons = [c for c in self.merge_log['comparisons'] if c['merged']]
-                not_merged_comparisons = [c for c in self.merge_log['comparisons'] if not c['merged']]
-                
-                if merged_comparisons:
-                    f.write("✅ 병합된 Track 쌍:\n\n")
-                    for comp in merged_comparisons:
-                        f.write(f"  Track {comp['track_a']}({comp['track_a_count']}개) ↔ "
-                               f"Track {comp['track_b']}({comp['track_b_count']}개)\n")
-                        f.write(f"    평균 유사도: {comp['avg_similarity']:.4f}\n")
-                        f.write(f"    범위: {comp['min_similarity']:.4f} ~ {comp['max_similarity']:.4f}\n")
-                        f.write(f"    비교 횟수: {comp['num_comparisons']}회 (샘플 {comp['samples_used']}개 사용)\n")
-                        # ⭐ 개별 유사도 값 출력
-                        f.write(f"    개별 값: {', '.join([f'{s:.4f}' for s in comp['similarities']])}\n")
-                        f.write("\n")
-                
-                if not_merged_comparisons:
-                    f.write("❌ 병합되지 않은 Track 쌍 (유사도 높은 순):\n\n")
-                    # 유사도 높은 순으로 정렬
-                    not_merged_sorted = sorted(not_merged_comparisons, 
-                                              key=lambda x: x['avg_similarity'], 
-                                              reverse=True)
-                    for comp in not_merged_sorted:
-                        f.write(f"  Track {comp['track_a']}({comp['track_a_count']}개) ↔ "
-                               f"Track {comp['track_b']}({comp['track_b_count']}개)\n")
-                        f.write(f"    평균 유사도: {comp['avg_similarity']:.4f} (임계값 미달)\n")
-                        f.write(f"    범위: {comp['min_similarity']:.4f} ~ {comp['max_similarity']:.4f}\n")
-                        f.write(f"    비교 횟수: {comp['num_comparisons']}회 (샘플 {comp['samples_used']}개 사용)\n")
-                        # ⭐ 개별 유사도 값 출력
-                        f.write(f"    개별 값: {', '.join([f'{s:.4f}' for s in comp['similarities']])}\n")
-                        f.write("\n")
-                
-                f.write("=" * 80 + "\n")
-                f.write("최종 병합 그룹\n")
-                f.write("=" * 80 + "\n\n")
-                
-                for group in self.merge_log['merge_groups']:
-                    if len(group) > 1:
-                        f.write(f"  그룹 (대표 ID: {min(group)}): {group}\n")
-                    else:
-                        f.write(f"  단독 Track: {group[0]}\n")
-                
-                f.write("\n" + "=" * 80 + "\n")
 
 # =========================================================
 # 스캔 이미지 파싱 및 정렬
@@ -966,7 +660,7 @@ def main():
     sorted_keys = sorted(complete_pairs, key=lambda x: pairs[x]['on']['timestamp'])
     
     print("="*60)
-    print("🚀 추적 시작!")
+    print("🚀 추적 시작! (⭐ LED OFF 특징 추출 모드)")
     print("="*60)
     
     total_detections = 0
@@ -997,8 +691,8 @@ def main():
             print(f"[Pan={pan:+4d}, Tilt={tilt:+3d}] 검출 없음")
             continue
         
-        # ⭐ 추적 (timestamp와 diff 전달)
-        track_ids = tracker.add_detections(boxes, scores, img_on, diff, pan, tilt, timestamp)
+        # ⭐ 추적 (img_off와 diff 전달)
+        track_ids = tracker.add_detections(boxes, scores, img_off, diff, pan, tilt, timestamp)
         
         # 결과 출력
         print(f"[Pan={pan:+4d}, Tilt={tilt:+3d}] {len(boxes)}개 검출 → track_ids: {track_ids}")
@@ -1010,20 +704,15 @@ def main():
     print(f"부여된 고유 ID: 0 ~ {tracker.next_id - 1} ({tracker.next_id}개)")
     print("="*60)
     
-    # ⭐ Track 병합 (후처리)
-    # merge_threshold: 유사도 임계값 (0.0~1.0, 높을수록 엄격)
-    # min_detections: 최소 검출 개수 (이보다 적으면 제외)
-    tracker.merge_similar_tracks(merge_threshold = 0.4, min_detections=3)
-    
     # ⭐ 유사도 로그 저장
     print("\n💾 유사도 로그 저장 중...")
-    tracker.save_similarity_log("./mot_output/similarity_log.txt")
-    print("✅ 유사도 로그 저장 완료! → ./mot_output/similarity_log.txt")
+    tracker.save_similarity_log("./mot_output_off/similarity_log.txt")
+    print("✅ 유사도 로그 저장 완료! → ./mot_output_off/similarity_log.txt")
     
     # 시각화 저장
     print("\n💾 Track ID별 이미지 저장 중...")
-    save_tracked_objects(tracker, output_folder="./mot_output")
-    print("✅ 저장 완료! → ./mot_output/ 폴더 확인")
+    save_tracked_objects(tracker, output_folder="./mot_output_off")
+    print("✅ 저장 완료! → ./mot_output_off/ 폴더 확인")
 
 if __name__ == "__main__":
     main()

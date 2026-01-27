@@ -326,58 +326,58 @@ PTCamera_waveshare/
 │   ├── Target.3mf          # 3D 프린팅 프로젝트 파일
 │   └── Target.gcode.3mf    # G-code 포함 프린트 파일
 │
-├── Experiments/            # 실험 및 테스트 스크립트
-│   ├── yolo_utils.py       # YOLO 래핑 (IoMin NMS 포함)
+├── Experiments/            # 실험 및 테스트 스크립트 (4개 카테고리로 구성)
 │   │
-│   ├── # 🎯 MOT (Multi-Object Tracking) 최종 알고리즘
-│   ├── mot_scan_test_hungarian_final.py  # ⭐⭐⭐ 최종 사용 버전
-│   │                       # ✨ 헝가리안 알고리즘 기반 최적 매칭
-│   │                       # - 특징 추출: HSV + Grayscale 히스토그램 (11x11 격자, 5,808차원)
-│   │                       # - Direct 후보 (n-1): 같은 Pan, 같은 Tilt, 대각선
-│   │                       # - Skip 후보 (n-2 + 양방향 대각선):
-│   │                       #   * n-2 프레임: 같은 Pan/Tilt (프레임 건너뛰기 대응)
-│   │                       #   * 양방향 대각선: Pan 증가/감소 각 1개 (지그재그 스캔 대응)
-│   │                       # - Cost Matrix 기반 글로벌 최적 매칭 (임계값 0.5)
-│   │                       # - Track 병합: 평균 유사도 0.4 이상, 최소 3개 검출
-│   │                       # - 출력: track_id별 ROI 그리드 이미지 + 상세 로그
+│   ├── MOT_test/          # 🎯 Multi-Object Tracking (8개 파일)
+│   │   ├── mot_scan_test_hungarian_final.py  # ⭐⭐⭐ 최종 사용 버전
+│   │   │                   # ✨ 헝가리안 알고리즘 기반 최적 매칭
+│   │   │                   # - 특징 추출: HSV + Grayscale 히스토그램 (11x11 격자, 5,808차원)
+│   │   │                   # - Direct 후보 (n-1): 같은 Pan, 같은 Tilt, 대각선
+│   │   │                   # - Skip 후보 (n-2 + 양방향 대각선)
+│   │   │                   # - Cost Matrix 기반 글로벌 최적 매칭 (임계값 0.5)
+│   │   │                   # - Track 병합: 평균 유사도 0.4 이상, 최소 3개 검출
+│   │   │                   # - 출력: track_id별 ROI 그리드 이미지 + 상세 로그
+│   │   │
+│   │   ├── mot_scan_test_hungarian.py  # 기본 헝가리안 버전
+│   │   ├── mot_scan_test.py    # Greedy 알고리즘 버전
+│   │   ├── mot_scan_test_off.py # OFF 이미지 기반 테스트
+│   │   ├── mot_scan_hsv.py     # HSV+Grayscale 기반 Greedy 매칭
+│   │   ├── mot_gray_test.py    # Grayscale 단독 특징
+│   │   ├── mot_cosin_test.py   # 코사인 유사도 초기 테스트
+│   │   └── visualize_grid_roi.py # 11x11 격자 ROI 시각화 (발표 자료용)
 │   │
-│   ├── mot_scan_test_hungarian.py  # 기본 헝가리안 버전
-│   │                       # - Skip 후보: 양방향 대각선 각 2개씩 수집
+│   ├── Detection_test/    # 🔍 YOLO 객체 탐지 (5개 파일)
+│   │   ├── yolo_utils.py       # YOLO 래핑 (IoMin NMS 포함)
+│   │   │                       # - Tiling 전략 (2x3 그리드)
+│   │   │                       # - IoMin NMS: 중첩 박스 제거
+│   │   │                       # - Full Image 추론과 병합
+│   │   ├── SAHI_yolo_test.py   # Tiling 전략 검증 및 IoMin NMS 테스트
+│   │   ├── yolo_test.py        # YOLO 기본 추론 테스트
+│   │   ├── sahi_tiling_visualizer.py # 타일링 시각화 도구
+│   │   └── undistort_gui.py    # 왜곡 보정 GUI 도구
 │   │
-│   ├── # 이전 MOT 실험 버전들
-│   ├── mot_scan_hsv.py     # HSV+Grayscale 기반 Greedy 매칭
-│   ├── mot_scan_test.py    # Grayscale 히스토그램 기반
-│   ├── mot_gray_test.py    # Grayscale 단독 특징
-│   ├── mot_cosin_test.py   # 코사인 유사도 초기 테스트
+│   ├── Filter_test/       # 🎨 Diff 이미지 필터링 (12개 파일)
+│   │   ├── diff_filter_hsv.py  # ⭐ HSV 색공간 + 밝기 증폭 필터링
+│   │   ├── diff_filter_rgb.py  # RGB 색공간 필터링
+│   │   ├── diff_filter_red.py  # 빨간색 채널 강조
+│   │   ├── diff_filter_yellow.py # 노란색 채널 강조
+│   │   ├── diff_filter_red_yellow.py # 빨강+노랑 복합
+│   │   ├── diff_filter_1_2.py  # 비율 필터링 (1:2)
+│   │   ├── diff_laser.py       # Diff 기반 레이저 중심 감지
+│   │   ├── diff_laser_hsv.py   # HSV + Diff 레이저 감지
+│   │   ├── led_filter_test.py  # 🔵 대화형 LED 필터 테스트 GUI
+│   │   │                       # - 파일 다이얼로그로 이미지 선택
+│   │   │                       # - 클릭으로 100x100 ROI 설정
+│   │   │                       # - 트랙바로 HSV 파라미터 실시간 조절
+│   │   ├── generate_diff_dataset.py # Diff 학습 데이터셋 생성
+│   │   ├── view_diff.py        # Diff 이미지 시각화
+│   │   └── rate_image.py       # 이미지 품질 평가
 │   │
-│   ├── # YOLO 추론 테스트
-│   ├── SAHI_yolo_test.py   # Tiling 전략 검증 및 IoMin NMS 테스트
-│   ├── yolo_test.py        # YOLO 기본 추론 테스트
-│   ├── sahi_tiling_visualizer.py  # 타일링 시각화 도구
-│   │
-│   ├── # Diff 이미지 필터링 실험
-│   ├── diff_filter_hsv.py  # HSV 색공간 필터링
-│   ├── diff_filter_rgb.py  # RGB 색공간 필터링
-│   ├── diff_filter_red.py  # 빨간색 채널 강조
-│   ├── diff_filter_yellow.py  # 노란색 채널 강조
-│   ├── diff_filter_red_yellow.py  # 빨강+노랑 복합
-│   ├── diff_filter_1_2.py  # 비율 필터링 (1:2)
-│   │
-│   ├── # 레이저 및 LED 감지 실험
-│   ├── diff_laser.py       # Diff 기반 레이저 중심 감지
-│   ├── diff_laser_hsv.py   # HSV + Diff 레이저 감지
-│   ├── led_filter_test.py  # 🔵 대화형 LED 필터 테스트 도구
-│   │                       # - 파일 다이얼로그로 이미지 선택
-│   │                       # - 클릭으로 100x100 ROI 설정
-│   │                       # - 트랙바로 HSV 파라미터 실시간 조절
-│   │                       # - 파란색 LED 검출 및 중심 좌표 계산
-│   ├── Laser_GPIO.py       # 라즈베리파이 레이저 GPIO 제어
-│   │
-│   ├── # 유틸리티
-│   ├── generate_diff_dataset.py  # Diff 학습 데이터셋 생성
-│   ├── view_diff.py        # Diff 이미지 시각화
-│   ├── rate_image.py       # 이미지 품질 평가
-│   └── undistort_gui.py    # 왜곡 보정 GUI 도구
+│   └── Hardware_test/     # 🔌 하드웨어 제어 (2개 파일)
+│       ├── ircamera_test.py    # IR 카메라 Flask 웹 서버
+│       │                       # - GPIO로 IR 필터 제어
+│       │                       # - 웹 스트리밍 지원
+│       └── Laser_GPIO.py       # 라즈베리파이 레이저 GPIO 제어
 │
 ├── Docs/                   # 문서
 ├── calib.npz               # 카메라 보정 파일
