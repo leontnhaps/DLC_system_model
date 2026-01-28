@@ -1,9 +1,10 @@
 """
 MOT 알고리즘 비교 실험 스크립트
-3가지 버전 비교:
+4가지 버전 비교:
 1. Original: Grid 11x11 + 5개 프레임 타입 후보 (공간 기반 후보 선택)
 2. No Grid: 전체 ROI 히스토그램 + 5개 프레임 타입 후보
 3. Temporal n=5: Grid 11x11 + 시간 순서로 최근 5개 프레임의 모든 객체를 후보로
+4. NoGrid Temporal n=5: 전체 ROI 히스토그램 + 시간 순서로 최근 5개 프레임의 모든 객체를 후보로
 """
 import cv2
 import numpy as np
@@ -610,6 +611,125 @@ class ObjectTrackerTemporal(ObjectTrackerBase):
         return track_ids
 
 
+class ObjectTrackerNoGridTemporal(ObjectTrackerBase):
+    """버전 4: No Grid + 시간 순서 최근 5개 프레임"""
+    def __init__(self, n_frames=5):
+        super().__init__(f"V4_NoGrid_Temporal_n{n_frames}")
+        self.n_frames = n_frames
+        
+    def add_detections(self, boxes, scores, img_on, diff, pan, tilt, timestamp):
+        curr_objects = []
+        H, W = img_on.shape[:2]
+        
+        for i, (x, y, w, h) in enumerate(boxes):
+            center_x = int(x + w / 2)
+            center_y = int(y + h / 2)
+            
+            half_size = ROI_SIZE // 2
+            x1 = max(0, center_x - half_size)
+            y1 = max(0, center_y - half_size)
+            x2 = min(W, center_x + half_size)
+            y2 = min(H, center_y + half_size)
+            
+            roi = img_on[y1:y2, x1:x2]
+            diff_roi = diff[y1:y2, x1:x2]
+            
+            if roi.size == 0:
+                continue
+                
+            # ⭐ No Grid 특징
+            vec = get_feature_vector_no_grid(roi, diff_roi=diff_roi)
+            
+            unique_id = str(self.unique_id_counter)
+            self.unique_id_counter += 1
+            
+            curr_objects.append({
+                'box': (x, y, w, h),
+                'vec': vec,
+                'idx': i,
+                'unique_id': unique_id,
+                'roi_img': roi.copy()
+            })
+        
+        # ⭐ 시간 순서로 최근 n개 프레임의 모든 객체
+        all_candidates = self._find_temporal_candidates()
+        
+        track_ids = self._hungarian_matching(curr_objects, all_candidates)
+        
+        self.frames.append({
+            'pan': pan,
+            'tilt': tilt,
+            'timestamp': timestamp,
+            'objects': curr_objects
+        })
+        
+        return track_ids
+    
+    def _find_temporal_candidates(self):
+        """시간 순서로 최근 n개 프레임의 모든 객체"""
+        candidates = []
+        
+        # 최근 n개 프레임
+        for i in range(min(self.n_frames, len(self.frames))):
+            frame = self.frames[-(i+1)]
+            for obj in frame['objects']:
+                candidates.append({
+                    **obj,
+                    'frame_pan': frame['pan'],
+                    'frame_tilt': frame['tilt'],
+                    'frame_timestamp': frame['timestamp']
+                })
+        
+        return candidates
+    
+    def _hungarian_matching(self, curr_objects, all_candidates):
+        """헝가리안 알고리즘 매칭"""
+        if not all_candidates:
+            track_ids = []
+            for obj in curr_objects:
+                track_id = self.next_id
+                self.next_id += 1
+                obj['track_id'] = track_id
+                track_ids.append(track_id)
+            return track_ids
+        
+        n_objects = len(curr_objects)
+        n_candidates = len(all_candidates)
+        
+        cost_matrix = np.ones((n_objects, n_candidates))
+        similarity_matrix = np.zeros((n_objects, n_candidates))
+        
+        for i, obj in enumerate(curr_objects):
+            for j, candidate in enumerate(all_candidates):
+                sim = calc_cosine_similarity(obj['vec'], candidate['vec'])
+                similarity_matrix[i, j] = sim
+                cost_matrix[i, j] = 1.0 - sim
+        
+        row_ind, col_ind = linear_sum_assignment(cost_matrix)
+        
+        obj_assignments = {}
+        for obj_idx, cand_idx in zip(row_ind, col_ind):
+            candidate = all_candidates[cand_idx]
+            sim = similarity_matrix[obj_idx, cand_idx]
+            
+            threshold = 0.5
+            if sim >= threshold:
+                obj_assignments[obj_idx] = (candidate['track_id'], sim)
+        
+        track_ids = []
+        for obj_idx, obj in enumerate(curr_objects):
+            if obj_idx in obj_assignments:
+                track_id, _ = obj_assignments[obj_idx]
+            else:
+                track_id = self.next_id
+                self.next_id += 1
+            
+            obj['track_id'] = track_id
+            track_ids.append(track_id)
+        
+        return track_ids
+
+
 # =========================================================
 # 스캔 이미지 파싱
 # =========================================================
@@ -711,19 +831,21 @@ def main():
     
     model = YOLO(MODEL_PATH)
     
-    # 3가지 Tracker 생성
+    # 4가지 Tracker 생성
     trackers = {
         'v1_grid_spatial': ObjectTrackerOriginal(),
         'v2_nogrid_spatial': ObjectTrackerNoGrid(),
-        'v3_grid_temporal': ObjectTrackerTemporal(n_frames=5)
+        'v3_grid_temporal': ObjectTrackerTemporal(n_frames=5),
+        'v4_nogrid_temporal': ObjectTrackerNoGridTemporal(n_frames=5)
     }
     
     print("=" * 80)
-    print("🎯 MOT 알고리즘 비교 실험 시작 (3가지 버전)")
+    print("🎯 MOT 알고리즘 비교 실험 시작 (4가지 버전)")
     print("=" * 80)
     print(f"버전 1: {trackers['v1_grid_spatial'].version_name}")
     print(f"버전 2: {trackers['v2_nogrid_spatial'].version_name}")
-    print(f"버전 3: {trackers['v3_grid_temporal'].version_name}\n")
+    print(f"버전 3: {trackers['v3_grid_temporal'].version_name}")
+    print(f"버전 4: {trackers['v4_nogrid_temporal'].version_name}\n")
     
     # 스캔 이미지 파싱
     images = parse_scan_images(SCAN_FOLDER)

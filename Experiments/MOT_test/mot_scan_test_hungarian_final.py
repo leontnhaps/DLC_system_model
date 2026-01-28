@@ -39,11 +39,12 @@ CONF_THRES = 0.50
 IOU_THRES = 0.45
 # ⭐ 고정 ROI 크기 (중심 기준)
 ROI_SIZE = 300  # 300x300 픽셀
+GRID_SIZE = (5, 5)  # Grid 분할 크기 (rows, cols)
 
 # =========================================================
 # 특징 추출 (HSV + Grayscale 결합)
 # =========================================================
-def get_feature_vector(roi_bgr, diff_roi=None, grid_size=(11, 11)):
+def get_feature_vector(roi_bgr, diff_roi=None, grid_size=None):
     """
     격자 기반 히스토그램 추출: 공간적 위치 정보를 포함함
     ⭐ HSV + Grayscale 히스토그램 결합 (Diff 마스크 적용)
@@ -56,6 +57,9 @@ def get_feature_vector(roi_bgr, diff_roi=None, grid_size=(11, 11)):
     Returns:
         정규화된 특징 벡터 (numpy array)
     """
+    if grid_size is None:
+        grid_size = GRID_SIZE
+    
     if roi_bgr is None or roi_bgr.size == 0:
         return None
     
@@ -273,8 +277,8 @@ class ObjectTracker:
             if roi.size == 0:
                 continue
                 
-            # ⭐ diff_roi 전달하여 필름 필터링 (grid_size 전달)
-            vec = get_feature_vector(roi, diff_roi=diff_roi, grid_size=(11, 11))
+            # ⭐ diff_roi 전달하여 필름 필터링
+            vec = get_feature_vector(roi, diff_roi=diff_roi)
             
             # ⭐ 고유 ID 생성
             curr_objects.append({
