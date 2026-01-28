@@ -163,6 +163,115 @@ class ObjectTrackerBase:
             key = (frame['pan'], frame['tilt'])
             result[key] = frame['objects']
         return result
+    
+    def merge_similar_tracks(self, merge_threshold=0.4, min_detections=3):
+        """유사한 Track들을 병합 (hungarian_final과 동일)"""
+        print(f"\n{'='*60}")
+        print(f"🔄 Track 병합 시작 (threshold={merge_threshold}, min={min_detections})")
+        print(f"{'='*60}")
+        
+        # 1. 각 track별 검출 수집
+        tracks = {}
+        for frame in self.frames:
+            for obj in frame['objects']:
+                track_id = obj['track_id']
+                if track_id not in tracks:
+                    tracks[track_id] = []
+                tracks[track_id].append(obj)
+        
+        # 2. 모든 Track 처리
+        all_track_ids = list(tracks.keys())
+        valid_tracks = {tid: objs for tid, objs in tracks.items() if len(objs) >= min_detections}
+        small_tracks = {tid: objs for tid, objs in tracks.items() if 1 <= len(objs) < min_detections}
+        
+        print(f"  총 Track 수: {len(tracks)}개")
+        print(f"  큰 Track (>= {min_detections}개): {len(valid_tracks)}개")
+        print(f"  작은 Track (1~{min_detections-1}개): {len(small_tracks)}개")
+        
+        # 3. Track별 위치 정보 수집
+        track_by_position = {}
+        for frame in self.frames:
+            pan = frame['pan']
+            tilt = frame['tilt']
+            for obj in frame['objects']:
+                tid = obj['track_id']
+                if tid not in track_by_position:
+                    track_by_position[tid] = []
+                track_by_position[tid].append((pan, tilt, obj))
+        
+        # 4. Track 간 유사도 계산 및 병합
+        merge_groups = []
+        visited = set()
+        
+        for i, tid_a in enumerate(all_track_ids):
+            if tid_a in visited:
+                continue
+            
+            group = [tid_a]
+            visited.add(tid_a)
+            positions_a = track_by_position.get(tid_a, [])
+            
+            for j in range(i + 1, len(all_track_ids)):
+                tid_b = all_track_ids[j]
+                if tid_b in visited:
+                    continue
+                
+                positions_b = track_by_position.get(tid_b, [])
+                
+                # 공간 기반 샘플링: 같은 Pan 라인 또는 같은 Tilt 라인만 비교
+                similarities = []
+                
+                # 같은 Pan 라인
+                for pan_a, tilt_a, obj_a in positions_a:
+                    for pan_b, tilt_b, obj_b in positions_b:
+                        if pan_a == pan_b:
+                            sim = calc_cosine_similarity(obj_a['vec'], obj_b['vec'])
+                            similarities.append(sim)
+                
+                # 같은 Tilt 라인
+                for pan_a, tilt_a, obj_a in positions_a:
+                    for pan_b, tilt_b, obj_b in positions_b:
+                        if tilt_a == tilt_b:
+                            sim = calc_cosine_similarity(obj_a['vec'], obj_b['vec'])
+                            similarities.append(sim)
+                
+                if not similarities:
+                    continue
+                
+                avg_sim = np.mean(similarities)
+                
+                if avg_sim >= merge_threshold:
+                    print(f"  ✅ Track {tid_a}({len(positions_a)}개) ↔ Track {tid_b}({len(positions_b)}개): "
+                          f"유사도 {avg_sim:.4f} → 병합!")
+                    group.append(tid_b)
+                    visited.add(tid_b)
+            
+            merge_groups.append(group)
+        
+        # 5. 병합 맵 생성
+        merge_map = {}
+        for group in merge_groups:
+            representative_id = min(group)
+            for tid in group:
+                merge_map[tid] = representative_id
+        
+        # 6. 모든 프레임의 track_id 업데이트
+        merged_count = 0
+        for frame in self.frames:
+            for obj in frame['objects']:
+                old_id = obj['track_id']
+                if old_id in merge_map:
+                    new_id = merge_map[old_id]
+                    if old_id != new_id:
+                        merged_count += 1
+                    obj['track_id'] = new_id
+        
+        print(f"\n  병합 결과:")
+        print(f"    최종 Track 수: {len(merge_groups)}개")
+        print(f"    병합된 검출: {merged_count}개")
+        print(f"{'='*60}\n")
+        
+        return merge_map
 
 
 class ObjectTrackerOriginal(ObjectTrackerBase):
@@ -662,9 +771,18 @@ def main():
         # 진행 상황 출력 (hungarian_final 스타일)
         print(f"[Pan={pan:+4d}, Tilt={tilt:+3d}] {len(boxes)}개 검출")
     
+    # ⭐ Track 병합 (hungarian_final과 동일)
+    print("\n" + "="*80)
+    print("✅ 추적 완료! Track 병합 중...")
+    print("="*80 + "\n")
+    
+    for tracker_name, tracker in trackers.items():
+        print(f"\n[{tracker.version_name}] Track 병합")
+        tracker.merge_similar_tracks(merge_threshold=0.4, min_detections=3)
+    
     # 각 Tracker별 요약 출력
     print("\n" + "="*80)
-    print("✅ 추적 완료!")
+    print("✅ 병합 완료! 최종 통계")
     print("="*80)
     
     for tracker_name, tracker in trackers.items():
