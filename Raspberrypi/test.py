@@ -1,22 +1,23 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Pi Agent — 라즈베리파이 카메라 제어 + PC 브로커(pc_server.py)와 소켓 통신
-- 프리뷰(연속 전송), 스캔(팬틸트 그리드 캡처), 한장 캡처(snap) 지원
-- 프리뷰/스캔/스냅 모두 Picamera2의 JPEG 경로 사용 → 색상/노출 일관
+Pi Agent (NEW IR-CUT Camera) — cv2.VideoCapture 기반 카메라 제어
+- 새 RPi IR-CUT Camera (B) 전용
+- cv2.VideoCapture (V4L2) 사용으로 빠른 캡처
+- 프리뷰/스캔/스냅 통합
 """
 
 import os, io, json, time, glob, threading, datetime, socket, struct
 import serial
-from picamera2 import Picamera2
+import cv2
+import numpy as np
 import RPi.GPIO as GPIO
 
-# ===================== GPIO 설정 (레이저 제어) =====================
+# ===================== GPIO 설정 =====================
 LASER_PIN = 15  # BCM 15번 핀 (물리적 핀 10번)
-# GPIO Setup moved to main execution block
+IR_CUT_PIN = 17  # BCM 17번 핀 (IR-CUT 필터 제어, 예시)
 
 # ===================== 환경 설정 =====================
-# 서버 IP 목록 (환경별)
 SERVER_OPTIONS = {
     "1": ("192.168.0.9", "711a"),
     "2": ("172.30.1.13", "602a"),
@@ -34,7 +35,7 @@ def select_server():
     
     while True:
         choice = input("서버 번호를 선택하세요 (1/2/3) [기본값: 2]: ").strip()
-        if not choice:  # Enter만 누르면 기본값
+        if not choice:
             choice = "2"
         if choice in SERVER_OPTIONS:
             ip, name = SERVER_OPTIONS[choice]
@@ -43,13 +44,12 @@ def select_server():
         else:
             print("❌ 잘못된 입력입니다. 1, 2, 3 중에서 선택하세요.")
 
-# 서버 IP 설정 (환경 변수 우선, 없으면 선택 메뉴)
 SERVER_HOST = os.getenv("SERVER_HOST") or select_server()
-CTRL_PORT   = int(os.getenv("CTRL_PORT", "7500"))
-IMG_PORT    = int(os.getenv("IMG_PORT",  "7501"))
-BAUD        = 115200
+CTRL_PORT = int(os.getenv("CTRL_PORT", "7500"))
+IMG_PORT = int(os.getenv("IMG_PORT", "7501"))
+BAUD = 115200
 
-MAX_W, MAX_H = 2592, 1944  # 센서 최대(모듈에 따라 조정)
+MAX_W, MAX_H = 2592, 1944  # 센서 최대
 
 # ===================== 시리얼(ESP32) =====================
 def open_serial():
@@ -69,29 +69,48 @@ ser = open_serial()
 def send_to_slave(obj: dict):
     ser.write((json.dumps(obj) + "\n").encode()); ser.flush()
 
-# ===================== 카메라 =====================
-picam = Picamera2()
+# ===================== 카메라 (cv2.VideoCapture) =====================
+camera = None
 cam_lock = threading.Lock()
+current_width = 640
+current_height = 480
 
-def to_still(w,h,q):
-    """정지 촬영용 모드로 전환 + 3A 수렴 대기"""
+def init_camera(w=640, h=480):
+    """카메라 초기화 또는 해상도 변경"""
+    global camera, current_width, current_height
+    
     with cam_lock:
-        picam.stop()
-        cfg = picam.create_still_configuration(main={"size": (w, h)})
-        picam.configure(cfg)
-        picam.options["quality"] = int(q)
-        picam.start()
-        time.sleep(0.6)  # AE/AWB 수렴 대기 (환경 따라 0.4~0.8 조절)
+        if camera is not None:
+            camera.release()
+        
+        camera = cv2.VideoCapture(0, cv2.CAP_V4L2)
+        camera.set(cv2.CAP_PROP_FRAME_WIDTH, w)
+        camera.set(cv2.CAP_PROP_FRAME_HEIGHT, h)
+        camera.set(cv2.CAP_PROP_FPS, 30)
+        
+        current_width = w
+        current_height = h
+        
+        # 워밍업 (첫 프레임 버리기)
+        for _ in range(3):
+            camera.read()
+        
+        print(f"[CAMERA] Initialized: {w}x{h}")
 
-def to_preview(w,h,q):
-    """프리뷰 모드로 전환"""
+def capture_frame(quality=90):
+    """현재 설정으로 프레임 캡처 → JPEG bytes 반환"""
     with cam_lock:
-        picam.stop()
-        cfg = picam.create_video_configuration(main={"size": (w, h)})
-        picam.configure(cfg)
-        picam.options["quality"] = int(q)
-        picam.start()
-        time.sleep(0.10)
+        ret, frame = camera.read()
+        if not ret or frame is None:
+            raise RuntimeError("Camera read failed")
+        
+        # JPEG 인코딩
+        encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), quality]
+        ret, jpeg = cv2.imencode('.jpg', frame, encode_param)
+        if not ret:
+            raise RuntimeError("JPEG encoding failed")
+        
+        return jpeg.tobytes()
 
 # ===================== 공통 유틸 =====================
 def irange(a,b,s):
@@ -113,25 +132,29 @@ preview_thread = None
 preview_stop = threading.Event()
 preview_running = threading.Event()
 
-def preview_worker(img_sock: socket.socket, w=640, h=360, fps=5, q=70):
+def preview_worker(img_sock: socket.socket, w=640, h=480, fps=5, q=70):
     try:
-        to_preview(w,h,q)
+        # 프리뷰용 해상도 설정
+        init_camera(w, h)
         preview_running.set()
         interval = 1.0/max(1,fps)
+        
         while not preview_stop.is_set():
-            bio = io.BytesIO()
-            with cam_lock:
-                picam.capture_file(bio, format="jpeg")
-            push_image(img_sock, f"_preview_{int(time.time()*1000)}.jpg", bio.getvalue())
+            try:
+                jpeg_bytes = capture_frame(quality=q)
+                push_image(img_sock, f"_preview_{int(time.time()*1000)}.jpg", jpeg_bytes)
+            except Exception as e:
+                print(f"[PREVIEW] capture err: {e}")
+            
             time.sleep(interval)
     except Exception as e:
-        print("[PREVIEW] err:", e)
+        print(f"[PREVIEW] err: {e}")
     finally:
         preview_running.clear()
 
-def preview_start(img_sock, w=640, h=360, fps=5, q=70):
+def preview_start(img_sock, w=640, h=480, fps=5, q=70):
     global preview_thread
-    preview_stop.set()  # 혹시 돌던 스레드 종료 지시
+    preview_stop.set()
     if preview_thread and preview_thread.is_alive():
         preview_thread.join(timeout=0.5)
     preview_stop.clear()
@@ -148,19 +171,21 @@ scan_stop_evt = threading.Event()
 
 def scan_worker(params, ctrl_sock: socket.socket, img_sock: socket.socket):
     try:
-        # 프리뷰 멈춤(자원 경합 방지)
+        # 프리뷰 멈춤
         preview_stop_now()
 
-        w = int(params.get("width",MAX_W))
-        h = int(params.get("height",MAX_H))
-        q = int(params.get("quality",90))
-        to_still(w,h,q)
-
+        w = int(params.get("width", MAX_W))
+        h = int(params.get("height", MAX_H))
+        q = int(params.get("quality", 90))
+        
+        # 스캔용 고해상도 설정
+        init_camera(w, h)
+        time.sleep(0.2)  # 안정화
 
         pans  = irange(int(params["pan_min"]),  int(params["pan_max"]),  int(params["pan_step"]))
         tilts = irange(int(params["tilt_min"]), int(params["tilt_max"]), int(params["tilt_step"]))
         num_positions = len(pans)*len(tilts)
-        total = num_positions * 2  # LED ON + LED OFF = 2장씩
+        total = num_positions * 2
         speed  = int(params.get("speed",100))
         acc    = float(params.get("acc",1.0))
         settle = float(params.get("settle",0.25))
@@ -173,49 +198,44 @@ def scan_worker(params, ctrl_sock: socket.socket, img_sock: socket.socket):
         send_evt({"event":"start","total":total})
         done=0
 
-        # === 스캔 시작 전 첫 위치로 이동 (촬영 안 함) ===
+        # 첫 위치로 이동
         first_pan = pans[0]
         first_tilt = tilts[0]
         send_to_slave({"T":133, "X": float(first_pan), "Y": float(first_tilt), "SPD": 100, "ACC": 1.0})
-        time.sleep(2.0)  # 도착 대기
-        # ===============================================
+        time.sleep(2.0)
 
         for i,t in enumerate(tilts):
             row = pans if i%2==0 else list(reversed(pans))
             for p in row:
                 if scan_stop_evt.is_set():
                     raise InterruptedError
+                
                 # 이동
                 send_to_slave({"T":133, "X": float(p), "Y": float(t), "SPD": speed, "ACC": acc})
                 time.sleep(settle)
 
-
                 # === LED ON → 촬영 ===
-                send_to_slave({"T":132, "IO4": 255, "IO5": 255})  # LED ON
-                time.sleep(led_settle)  # 안정화 대기
+                send_to_slave({"T":132, "IO4": 255, "IO5": 255})
+                time.sleep(led_settle)
                 
-                bio_on = io.BytesIO()
-                with cam_lock:
-                    picam.capture_file(bio_on, format="jpeg")
+                jpeg_on = capture_frame(quality=q)
                 
                 ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
                 name_on = f"img_t{t:+03d}_p{p:+04d}_{ts}_led_on.jpg"
-                push_image(img_sock, name_on, bio_on.getvalue())
+                push_image(img_sock, name_on, jpeg_on)
                 
                 done += 1
                 send_evt({"event":"progress","done":done,"total":total,"name":name_on})
 
                 # === LED OFF → 촬영 ===
-                send_to_slave({"T":132, "IO4": 0, "IO5": 0})  # LED OFF
-                time.sleep(led_settle)  # 안정화 대기
+                send_to_slave({"T":132, "IO4": 0, "IO5": 0})
+                time.sleep(led_settle)
                 
-                bio_off = io.BytesIO()
-                with cam_lock:
-                    picam.capture_file(bio_off, format="jpeg")
+                jpeg_off = capture_frame(quality=q)
                 
                 ts2 = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
                 name_off = f"img_t{t:+03d}_p{p:+04d}_{ts2}_led_off.jpg"
-                push_image(img_sock, name_off, bio_off.getvalue())
+                push_image(img_sock, name_off, jpeg_off)
                 
                 done += 1
                 send_evt({"event":"progress","done":done,"total":total,"name":name_off})
@@ -234,43 +254,31 @@ def scan_worker(params, ctrl_sock: socket.socket, img_sock: socket.socket):
 
 # ===================== 스냅(한 장 캡처) =====================
 def snap_once(cmd: dict, img_sock: socket.socket, ctrl_sock: socket.socket):
-    """
-    {"cmd":"snap","width","height","quality","save"} 처리.
-    스캔과 동일한 경로( ISP JPEG )로 캡처해서 확실히 전송.
-    """
     try:
-        # 프리뷰 완전 정지
+        # 프리뷰 정지
         preview_stop.set()
         global preview_thread
         if preview_thread and preview_thread.is_alive():
             preview_thread.join(timeout=0.8)
 
-        # 파라미터
         W = int(cmd.get("width",  MAX_W))
         H = int(cmd.get("height", MAX_H))
         Q = int(cmd.get("quality", 90))
         fname = cmd.get("save") or datetime.datetime.now().strftime("snap_%Y%m%d_%H%M%S.jpg")
 
-        # 스캔과 동일한 경로: 스틸 모드 전환 + 3A 대기 후 capture_file
-        to_still(W, H, Q)
-
-        # (안정성) 워밍업 1장 버리기 -> 조명/화이트밸런스 과민한 환경에서 유효
-        with cam_lock:
-            _warm = io.BytesIO()
-            picam.capture_file(_warm, format="jpeg")
-        time.sleep(0.05)
+        # 스냅용 해상도 설정
+        init_camera(W, H)
+        time.sleep(0.1)
 
         # 실제 스냅
-        bio = io.BytesIO()
-        with cam_lock:
-            picam.capture_file(bio, format="jpeg")
+        jpeg_bytes = capture_frame(quality=Q)
 
         # IMG 채널로 전송
-        push_image(img_sock, fname, bio.getvalue())
+        push_image(img_sock, fname, jpeg_bytes)
 
-        # 완료 이벤트(옵션)
+        # 완료 이벤트
         try:
-            ctrl_sock.sendall((json.dumps({"event":"snap_done","name":fname,"size":bio.tell()})+"\n").encode())
+            ctrl_sock.sendall((json.dumps({"event":"snap_done","name":fname,"size":len(jpeg_bytes)})+"\n").encode())
         except:
             pass
 
@@ -280,9 +288,11 @@ def snap_once(cmd: dict, img_sock: socket.socket, ctrl_sock: socket.socket):
         except:
             pass
 
-
 # ===================== 메인: PC 서버에 접속 =====================
 def main():
+    # 카메라 초기화
+    init_camera(640, 480)
+    
     # 이미지 소켓
     while True:
         try:
@@ -335,7 +345,7 @@ def main():
             elif c == "preview":
                 enable = bool(cmd.get("enable", True))
                 if enable:
-                    w=int(cmd.get("width",640)); h=int(cmd.get("height",360))
+                    w=int(cmd.get("width",640)); h=int(cmd.get("height",480))
                     fps=int(cmd.get("fps",5)); q=int(cmd.get("quality",70))
                     preview_start(img, w,h,fps,q)
                 else:
@@ -343,33 +353,37 @@ def main():
             elif c == "snap":
                 snap_once(cmd, img, ctrl)
             elif c == "laser":
-                # 레이저 제어 (GPIO 15번 핀)
                 val = int(cmd.get("value", 0))
-                if val == 1:
-                    GPIO.output(LASER_PIN, GPIO.HIGH)
-                    print("[LASER] ON")
-                else:
-                    GPIO.output(LASER_PIN, GPIO.LOW)
-                    print("[LASER] OFF")
+                GPIO.output(LASER_PIN, GPIO.HIGH if val else GPIO.LOW)
+                print(f"[LASER] {'ON' if val else 'OFF'}")
+            elif c == "ir_cut":
+                # IR-CUT 필터 제어 (새 기능)
+                val = int(cmd.get("value", 0))
+                GPIO.output(IR_CUT_PIN, GPIO.HIGH if val else GPIO.LOW)
+                print(f"[IR-CUT] {'Day Mode' if val else 'Night Mode'}")
             else:
-                # 알 수 없는 명령은 무시
                 pass
 
-    # 종료 시 GPIO 정리
+    # 종료 시 정리
+    if camera:
+        camera.release()
     GPIO.cleanup()
-    print("[GPIO] Cleanup done")
+    print("[CLEANUP] Done")
 
 if __name__ == "__main__":
-    # [NEW] Laser Init (Force OFF)
+    # GPIO 초기화
     GPIO.setmode(GPIO.BCM)
     GPIO.setup(LASER_PIN, GPIO.OUT, initial=GPIO.LOW)
-    print("[LASER] Initialized to OFF")
+    GPIO.setup(IR_CUT_PIN, GPIO.OUT, initial=GPIO.LOW)
+    print("[GPIO] Initialized (Laser OFF, IR-CUT Night Mode)")
 
     try:
         main()
     except KeyboardInterrupt:
         print("\n[MAIN] Interrupted by user")
     finally:
+        if camera:
+            camera.release()
         GPIO.output(LASER_PIN, GPIO.LOW)
         GPIO.cleanup()
-        print("[GPIO] Cleanup done (Laser OFF)")
+        print("[GPIO] Cleanup done")
