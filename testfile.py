@@ -1,48 +1,70 @@
-import serial
+#!/usr/bin/env python3
+"""
+카메라 진단 스크립트
+cv2.VideoCapture가 지원하는 해상도 테스트
+"""
+
+import cv2
 import time
 
-import matplotlib.pyplot as plt
+print("=" * 60)
+print("카메라 진단 시작")
+print("=" * 60)
 
+# 테스트할 해상도들
+resolutions = [
+    (640, 480, "VGA"),
+    (800, 600, "SVGA"),
+    (1024, 768, "XGA"),
+    (1280, 720, "HD 720p"),
+    (1280, 1024, "SXGA"),
+    (1920, 1080, "Full HD 1080p"),
+    (2592, 1944, "5MP Max"),
+]
 
-# 포트 설정 (윈도우: 'COM3', 'COM4' 등 / 맥: '/dev/tty...' 확인 필요)
-arduino_port = 'COM8' 
-baud_rate = 9600 
+for w, h, name in resolutions:
+    print(f"\n테스트 중: {name} ({w}x{h})")
+    
+    camera = cv2.VideoCapture(0, cv2.CAP_V4L2)
+    
+    if not camera.isOpened():
+        print(f"  ❌ 카메라 열기 실패")
+        continue
+    
+    # 해상도 설정
+    camera.set(cv2.CAP_PROP_FRAME_WIDTH, w)
+    camera.set(cv2.CAP_PROP_FRAME_HEIGHT, h)
+    
+    # 실제 설정된 값 확인
+    actual_w = int(camera.get(cv2.CAP_PROP_FRAME_WIDTH))
+    actual_h = int(camera.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    
+    print(f"  설정: {w}x{h}")
+    print(f"  실제: {actual_w}x{actual_h}")
+    
+    # 워밍업
+    for _ in range(3):
+        camera.read()
+    time.sleep(0.1)
+    
+    # 실제 캡처 테스트
+    success_count = 0
+    for i in range(5):
+        ret, frame = camera.read()
+        if ret and frame is not None:
+            success_count += 1
+            if i == 0:
+                print(f"  프레임 shape: {frame.shape}")
+        else:
+            print(f"  ❌ 캡처 {i+1} 실패")
+    
+    camera.release()
+    
+    if success_count == 5:
+        print(f"  ✅ 성공! (5/5)")
+    else:
+        print(f"  ⚠️ 부분 성공 ({success_count}/5)")
 
-try:
-    ser = serial.Serial(arduino_port, baud_rate, timeout=1)
-    print(f"아두이노({arduino_port})와 연결되었습니다.")
-    time.sleep(2) # 아두이노가 리셋되고 안정화될 때까지 대기
-
-    while True:
-        if ser.in_waiting > 0:
-            # 1. 데이터 한 줄 읽기
-            line = ser.readline().decode('utf-8').strip()
-            
-            # 2. 쉼표(,)로 데이터 분리
-            data = line.split(',')
-            
-            # 3. 데이터가 3개(전압,전류,전력) 제대로 들어왔는지 확인
-            if len(data) == 3:
-                voltage = data[0]
-                current = data[1]
-                power = data[2]
-                
-                print(f"☀️ 솔라셀 상태 -> 전압: {voltage}V | 전류: {current}mA | 전력: {power}mW")
-                
-                # 데이터를 그래프에 추가
-                plt.plot(voltage, current, 'bo')
-                plt.xlabel('Voltage (V)')
-                plt.ylabel('Current (mA)')
-                plt.title('Solar Panel Current vs Voltage')
-                plt.grid(True)
-                plt.pause(0.1)
-            else:
-                # 가끔 통신 찌꺼기 데이터가 들어오면 무시
-                pass
-
-except serial.SerialException:
-    print(f"포트 {arduino_port}를 열 수 없습니다. 아두이노 IDE 시리얼 모니터가 켜져 있는지 확인하세요.")
-except KeyboardInterrupt:
-    print("프로그램을 종료합니다.")
-    if 'ser' in locals() and ser.is_open:
-        ser.close()
+print("\n" + "=" * 60)
+print("진단 완료")
+print("=" * 60)

@@ -21,7 +21,7 @@ IR_CUT_PIN = 17  # BCM 17번 핀 (IR-CUT 필터 제어, 예시)
 SERVER_OPTIONS = {
     "1": ("192.168.0.9", "711a"),
     "2": ("172.30.1.13", "602a"),
-    "3": ("10.95.38.118", "hotspot")
+    "3": ("10.190.176.118", "hotspot")
 }
 
 def select_server():
@@ -134,7 +134,10 @@ preview_running = threading.Event()
 
 def preview_worker(img_sock: socket.socket, w=640, h=480, fps=5, q=70):
     try:
-        # 프리뷰용 해상도 설정
+        # 프리뷰는 최대 1920x1080로 제한 (V4L2 한계)
+        w = min(w, 1920)
+        h = min(h, 1080)
+        
         init_camera(w, h)
         preview_running.set()
         interval = 1.0/max(1,fps)
@@ -145,6 +148,7 @@ def preview_worker(img_sock: socket.socket, w=640, h=480, fps=5, q=70):
                 push_image(img_sock, f"_preview_{int(time.time()*1000)}.jpg", jpeg_bytes)
             except Exception as e:
                 print(f"[PREVIEW] capture err: {e}")
+                break  # 에러 시 루프 종료
             
             time.sleep(interval)
     except Exception as e:
@@ -158,6 +162,11 @@ def preview_start(img_sock, w=640, h=480, fps=5, q=70):
     if preview_thread and preview_thread.is_alive():
         preview_thread.join(timeout=0.5)
     preview_stop.clear()
+    
+    # 프리뷰 해상도 제한
+    w = min(w, 1920)
+    h = min(h, 1080)
+    
     preview_thread = threading.Thread(target=preview_worker, args=(img_sock,w,h,fps,q), daemon=True)
     preview_thread.start()
 
@@ -178,9 +187,15 @@ def scan_worker(params, ctrl_sock: socket.socket, img_sock: socket.socket):
         h = int(params.get("height", MAX_H))
         q = int(params.get("quality", 90))
         
-        # 스캔용 고해상도 설정
-        init_camera(w, h)
-        time.sleep(0.2)  # 안정화
+        # 고해상도 캡처 방식 결정
+        use_libcamera = (w > 1920 or h > 1080)
+        
+        if not use_libcamera:
+            # cv2로 가능한 해상도
+            init_camera(w, h)
+            time.sleep(0.2)
+        else:
+            print(f"[SCAN] Using libcamera-still for {w}x{h}")
 
         pans  = irange(int(params["pan_min"]),  int(params["pan_max"]),  int(params["pan_step"]))
         tilts = irange(int(params["tilt_min"]), int(params["tilt_max"]), int(params["tilt_step"]))
@@ -194,6 +209,38 @@ def scan_worker(params, ctrl_sock: socket.socket, img_sock: socket.socket):
         def send_evt(obj):
             try: ctrl_sock.sendall((json.dumps(obj,separators=(",",":"))+"\n").encode())
             except: pass
+        
+        def capture_scan_image():
+            """스캔용 이미지 캡처 (해상도에 따라 방식 선택)"""
+            if use_libcamera:
+                # libcamera-still 사용
+                import subprocess
+                import tempfile
+                with tempfile.NamedTemporaryFile(suffix='.jpg', delete=False) as tmp:
+                    tmp_path = tmp.name
+                try:
+                    subprocess.run([
+                        "libcamera-still",
+                        "-o", tmp_path,
+                        "--width", str(w),
+                        "--height", str(h),
+                        "-q", str(q),
+                        "-t", "1",
+                        "-n"  # no preview
+                    ], check=True, capture_output=True)
+                    
+                    with open(tmp_path, 'rb') as f:
+                        jpeg_bytes = f.read()
+                    os.unlink(tmp_path)
+                    return jpeg_bytes
+                except Exception as e:
+                    print(f"[SCAN] libcamera-still error: {e}")
+                    if os.path.exists(tmp_path):
+                        os.unlink(tmp_path)
+                    raise
+            else:
+                # cv2 사용
+                return capture_frame(quality=q)
 
         send_evt({"event":"start","total":total})
         done=0
