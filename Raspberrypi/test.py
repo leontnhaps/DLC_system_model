@@ -1,14 +1,19 @@
 #!/usr/bin/env python3
 """
-Step 4: IR-CUT 필터 제어 추가
-- GPIO 17: IR-CUT 제어
-- Day Mode / Night Mode 전환
+Raspberrypi Agent - Complete with Manual Control
+- ESP32 serial communication (Pan/Tilt)
+- Manual control (move, LED, laser)
+- Preview streaming
+- Snap capture
+- IR-CUT control
 """
-import socket, struct, io, time, json, threading
+import socket, struct, io, time, json, threading, glob
 from picamera2 import Picamera2
 import RPi.GPIO as GPIO
+import serial
 # ==================== GPIO 설정 ====================
-IR_CUT_PIN = 17  # BCM 17번 (물리 11번 핀)
+IR_CUT_PIN = 17  # BCM 17번
+LASER_PIN = 15   # BCM 15번
 # ==================== 서버 설정 ====================
 SERVER_OPTIONS = {
     "1": ("192.168.0.9", "711a"),
@@ -33,6 +38,25 @@ def select_server():
 SERVER_HOST = select_server()
 CTRL_PORT = 7500
 IMG_PORT = 7501
+BAUD = 115200
+# ==================== 시리얼 (ESP32) ====================
+def open_serial():
+    """ESP32 시리얼 연결"""
+    cands = ['/dev/ttyUSB0', '/dev/ttyUSB1', '/dev/ttyAMA0', '/dev/ttyS0'] + glob.glob('/dev/ttyUSB*')
+    last_err = None
+    for dev in cands:
+        try:
+            s = serial.Serial(dev, BAUD, timeout=0.2)
+            print(f"[SERIAL] 연결: {dev}")
+            return s
+        except Exception as e:
+            last_err = e
+    raise RuntimeError(f"시리얼 연결 실패: {last_err}")
+ser = open_serial()
+def send_to_slave(obj: dict):
+    """ESP32로 JSON 명령 전송"""
+    ser.write((json.dumps(obj) + "\n").encode())
+    ser.flush()
 # ==================== 전역 변수 ====================
 picam = None
 preview_stop = threading.Event()
@@ -68,6 +92,37 @@ def preview_worker(img_sock, w=640, h=480, fps=5, q=70):
         print("[PREVIEW] 중지됨")
     except Exception as e:
         print(f"[PREVIEW] 오류: {e}")
+# ==================== 스냅 캡처 ====================
+def snap_capture(img_sock, w, h, q, name):
+    """고해상도 스틸 이미지 캡처"""
+    global picam
+    try:
+        print(f"[SNAP] 캡처 중: {w}x{h}, quality={q}")
+        
+        # 프리뷰 중지
+        preview_stop.set()
+        if preview_thread and preview_thread.is_alive():
+            preview_thread.join(timeout=0.7)
+        
+        # Still 모드로 전환
+        picam.stop()
+        config = picam.create_still_configuration(main={"size": (w, h)})
+        picam.configure(config)
+        picam.options["quality"] = int(q)
+        picam.start()
+        time.sleep(0.2)
+        
+        # 캡처
+        bio = io.BytesIO()
+        picam.capture_file(bio, format="jpeg")
+        jpeg_data = bio.getvalue()
+        
+        # 전송
+        push_image(img_sock, name, jpeg_data)
+        print(f"[SNAP] 완료: {name} ({len(jpeg_data)} bytes)")
+        
+    except Exception as e:
+        print(f"[SNAP] 오류: {e}")
 # ==================== 메인 ====================
 def main():
     global picam, preview_thread
@@ -75,7 +130,8 @@ def main():
     # GPIO 초기화
     GPIO.setmode(GPIO.BCM)
     GPIO.setup(IR_CUT_PIN, GPIO.OUT, initial=GPIO.LOW)
-    print("[GPIO] IR-CUT 초기화: Night Mode (GPIO 17)")
+    GPIO.setup(LASER_PIN, GPIO.OUT, initial=GPIO.LOW)
+    print("[GPIO] 초기화 완료 (IR-CUT: GPIO 17, Laser: GPIO 15)")
     
     # 카메라 초기화
     print("=" * 60)
@@ -109,7 +165,7 @@ def main():
             time.sleep(1.0)
     
     print("\n" + "=" * 60)
-    print("Step 4: 명령 대기 중...")
+    print("명령 대기 중...")
     print("=" * 60)
     
     # 명령 수신 루프
@@ -160,9 +216,54 @@ def main():
                             preview_thread.join(timeout=0.7)
                         print("[CMD] 프리뷰 중지")
                 
+                elif c == "snap":
+                    w = int(cmd.get("width", 2592))
+                    h = int(cmd.get("height", 1944))
+                    q = int(cmd.get("quality", 95))
+                    name = cmd.get("save", "snap.jpg")
+                    
+                    threading.Thread(
+                        target=snap_capture,
+                        args=(img_sock, w, h, q, name),
+                        daemon=True
+                    ).start()
+                    print(f"[CMD] Snap 요청: {w}x{h}")
+                
+                elif c == "move":
+                    # Pan/Tilt 이동
+                    pan = float(cmd.get("pan", 0.0))
+                    tilt = float(cmd.get("tilt", 0.0))
+                    speed = int(cmd.get("speed", 100))
+                    acc = float(cmd.get("acc", 1.0))
+                    
+                    send_to_slave({
+                        "T": 133,
+                        "X": pan,
+                        "Y": tilt,
+                        "SPD": speed,
+                        "ACC": acc
+                    })
+                    print(f"[MOVE] Pan={pan}, Tilt={tilt}, Speed={speed}, Acc={acc}")
+                
+                elif c == "led":
+                    # LED 제어
+                    val = int(cmd.get("value", 0))
+                    send_to_slave({
+                        "T": 132,
+                        "IO4": val,
+                        "IO5": val
+                    })
+                    print(f"[LED] Value={val}")
+                
+                elif c == "laser":
+                    # 레이저 제어
+                    val = int(cmd.get("value", 0))
+                    GPIO.output(LASER_PIN, GPIO.HIGH if val else GPIO.LOW)
+                    print(f"[LASER] {'ON' if val else 'OFF'}")
+                
                 elif c == "ir_cut":
                     # IR-CUT 제어
-                    mode = cmd.get("mode", "day")  # "day" or "night"
+                    mode = cmd.get("mode", "day")
                     if mode == "day":
                         GPIO.output(IR_CUT_PIN, GPIO.HIGH)
                         print("[IR-CUT] Day Mode (IR 필터 ON)")

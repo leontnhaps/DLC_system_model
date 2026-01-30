@@ -1,31 +1,20 @@
 #!/usr/bin/env python3
-"""
-Step 1: 카메라 기본 캡처 테스트
-- Picamera2 초기화
-- 이미지 캡처
-- 파일 저장
-"""
 from picamera2 import Picamera2
-import time
-print("=" * 60)
-print("카메라 초기화 중...")
-print("=" * 60)
-# 카메라 초기화
 picam = Picamera2()
-# Still 모드 설정 (고해상도)
-config = picam.create_still_configuration(main={"size": (2592, 1944)})
-picam.configure(config)
-picam.start()
-print("✅ 카메라 준비 완료")
-print("   해상도: 2592x1944")
-# 3A 수렴 대기 (Auto Exposure, Auto White Balance)
-print("\n⏳ 노출/화이트밸런스 안정화 중...")
-time.sleep(2.0)
-# 캡처
-print("📸 사진 촬영 중...")
-picam.capture_file("test_capture.jpg")
-print("✅ 저장 완료: test_capture.jpg")
-print("\n" + "=" * 60)
-print("테스트 성공!")
 print("=" * 60)
-picam.stop()
+print("카메라 센서 모드 정보")
+print("=" * 60)
+for i, mode in enumerate(picam.sensor_modes):
+    print(f"\n모드 {i}:")
+    print(f"  해상도: {mode['size']}")
+    print(f"  비트: {mode.get('bit_depth', 'N/A')}")
+    print(f"  포맷: {mode.get('format', 'N/A')}")
+print("\n" + "=" * 60)
+print("권장 설정")
+print("=" * 60)
+# 최대 해상도 찾기
+max_mode = max(picam.sensor_modes, key=lambda m: m['size'][0] * m['size'][1])
+max_w, max_h = max_mode['size']
+max_mp = (max_w * max_h) / 1_000_000
+print(f"최대 해상도: {max_w} x {max_h} ({max_mp:.1f}MP)")
+picam.close()
