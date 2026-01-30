@@ -111,8 +111,8 @@ class ScanTab:
         if self.callbacks.get('stop_scan'):
             self.callbacks['stop_scan']()
 
-class ManualTab:
-    """수동 제어 탭 UI"""
+class TestSettingsTab:
+    """Test & Settings 탭 - Manual + Preview 통합"""
     def __init__(self, parent, callbacks):
         self.callbacks = callbacks
         self.frame = parent
@@ -125,28 +125,105 @@ class ManualTab:
         self.mv_speed = IntVar(value=100)
         self.mv_acc = DoubleVar(value=1.0)
         self.led = IntVar(value=0)
+        self.preview_enable = BooleanVar(value=False)
+        self.preview_w = IntVar(value=640)
+        self.preview_h = IntVar(value=480)
+        self.preview_fps = IntVar(value=5)
+        self.preview_q = IntVar(value=70)
         
-        self._slider(0, "Pan", -180, 180, self.mv_pan, 0.5)
-        ttk.Entry(self.frame, textvariable=self.mv_pan, width=8).grid(row=0, column=2, sticky="w", padx=5)
+        row = 0
         
-        self._slider(1, "Tilt", -30, 90, self.mv_tilt, 0.5)
-        ttk.Entry(self.frame, textvariable=self.mv_tilt, width=8).grid(row=1, column=2, sticky="w", padx=5)
+        # ========== Pan/Tilt Control ==========
+        Label(self.frame, text="🎮 Pan/Tilt Control", font=("", 11, "bold")).grid(
+            row=row, column=0, columnspan=3, sticky="w", padx=5, pady=(5, 10)); row += 1
         
-        self._slider(2, "Speed", 0, 100, self.mv_speed, 1)
-        self._slider(3, "Accel", 0, 1, self.mv_acc, 0.1)
+        self._slider(row, "Pan", -180, 180, self.mv_pan, 0.5); row += 1
+        ttk.Entry(self.frame, textvariable=self.mv_pan, width=8).grid(row=row-1, column=2, sticky="w", padx=5)
         
-        Button(self.frame, text="Center (0,0)", command=self._on_center).grid(row=4, column=0, sticky="w", pady=4)
-        Button(self.frame, text="Apply Move", command=self._on_move).grid(row=4, column=1, sticky="e", pady=4)
+        self._slider(row, "Tilt", -30, 90, self.mv_tilt, 0.5); row += 1
+        ttk.Entry(self.frame, textvariable=self.mv_tilt, width=8).grid(row=row-1, column=2, sticky="w", padx=5)
         
-        self._slider(5, "LED", 0, 255, self.led, 1)
-        Button(self.frame, text="Set LED", command=self._on_led).grid(row=6, column=1, sticky="e", pady=4)
-        Button(self.frame, text="Laser ON/OFF", command=self._on_laser).grid(row=6, column=2, sticky="w", padx=4, pady=4)
+        self._slider(row, "Speed", 0, 100, self.mv_speed, 1); row += 1
+        self._slider(row, "Accel", 0, 1, self.mv_acc, 0.1); row += 1
+        
+        btn_frame = Frame(self.frame)
+        btn_frame.grid(row=row, column=0, columnspan=3, sticky="w", pady=4); row += 1
+        Button(btn_frame, text="Center (0,0)", command=self._on_center).pack(side="left", padx=5)
+        Button(btn_frame, text="Apply Move", command=self._on_move, bg="#2196F3", fg="white").pack(side="left", padx=5)
+        
+        ttk.Separator(self.frame, orient="horizontal").grid(row=row, column=0, columnspan=3, sticky="ew", pady=10); row += 1
+        
+        # ========== LED & Laser ==========
+        Label(self.frame, text="💡 LED & Laser", font=("", 11, "bold")).grid(
+            row=row, column=0, columnspan=3, sticky="w", padx=5, pady=(5, 10)); row += 1
+        
+        self._slider(row, "LED", 0, 255, self.led, 1); row += 1
+        
+        led_btn_frame = Frame(self.frame)
+        led_btn_frame.grid(row=row, column=0, columnspan=3, sticky="w", pady=4); row += 1
+        Button(led_btn_frame, text="Set LED", command=self._on_led).pack(side="left", padx=5)
+        Button(led_btn_frame, text="Laser ON/OFF", command=self._on_laser, bg="#FF5722", fg="white").pack(side="left", padx=5)
+        
+        ttk.Separator(self.frame, orient="horizontal").grid(row=row, column=0, columnspan=3, sticky="ew", pady=10); row += 1
+        
+        # ========== Preview Settings ==========
+        Label(self.frame, text="📹 Preview Settings", font=("", 11, "bold")).grid(
+            row=row, column=0, columnspan=3, sticky="w", padx=5, pady=(5, 10)); row += 1
+        
+        Checkbutton(self.frame, text="Live Preview", variable=self.preview_enable,
+                   command=self._on_toggle).grid(row=row, column=0, sticky="w", pady=2); row += 1
+        
+        self._row(row, "Preview w/h", self.preview_w, self.preview_h, None, ("W","H","")); row += 1
+        self._entry(row, "Preview fps", self.preview_fps); row += 1
+        self._entry(row, "Preview quality", self.preview_q); row += 1
+        Button(self.frame, text="Apply Preview Size", command=self._on_apply_size).grid(
+            row=row, column=1, sticky="w", pady=4); row += 1
+        
+        ttk.Separator(self.frame, orient="horizontal").grid(row=row, column=0, columnspan=3, sticky="ew", pady=10); row += 1
+        
+        # ========== Capture ==========
+        Label(self.frame, text="📸 Capture", font=("", 11, "bold")).grid(
+            row=row, column=0, columnspan=3, sticky="w", padx=5, pady=(5, 10)); row += 1
+        
+        Button(self.frame, text="Snap 5MP+3MP", command=self._on_snap,
+               bg="#4CAF50", fg="white", font=("", 10, "bold"), width=20).grid(
+            row=row, column=0, columnspan=2, sticky="w", padx=5, pady=5); row += 1
+        
+        ttk.Separator(self.frame, orient="horizontal").grid(row=row, column=0, columnspan=3, sticky="ew", pady=10); row += 1
+        
+        # ========== IR-CUT Control ==========
+        Label(self.frame, text="🌓 IR-CUT Control", font=("", 11, "bold")).grid(
+            row=row, column=0, columnspan=3, sticky="w", padx=5, pady=(5, 10)); row += 1
+        
+        ir_frame = Frame(self.frame)
+        ir_frame.grid(row=row, column=0, columnspan=3, sticky="w", pady=5); row += 1
+        Button(ir_frame, text="☀️ Day Mode", command=lambda: self._on_ir_cut("day"),
+               bg="#FFE0B2", width=12).pack(side="left", padx=5)
+        Button(ir_frame, text="🌙 Night Mode", command=lambda: self._on_ir_cut("night"),
+               bg="#444", fg="white", width=12).pack(side="left", padx=5)
+        
+        for c in range(3): self.frame.grid_columnconfigure(c, weight=1)
     
     def _slider(self, r, txt, mi, ma, var, res):
         Label(self.frame, text=txt).grid(row=r, column=0, sticky="w", padx=5)
         Scale(self.frame, from_=mi, to=ma, orient=HORIZONTAL, resolution=res, length=250,
               variable=var).grid(row=r, column=1, sticky="w", padx=5)
     
+    def _row(self, r, txt, v1, v2, v3, labels=("Min","Max","Step")):
+        Label(self.frame, text=txt).grid(row=r, column=0, sticky="w", padx=(5,10))
+        ttk.Entry(self.frame, textvariable=v1, width=8).grid(row=r, column=1, sticky="w", padx=2)
+        Label(self.frame, text=labels[0], font=("", 8)).grid(row=r, column=1, sticky="e", padx=2)
+        ttk.Entry(self.frame, textvariable=v2, width=8).grid(row=r, column=2, sticky="w", padx=2)
+        Label(self.frame, text=labels[1], font=("", 8)).grid(row=r, column=2, sticky="e", padx=2)
+        if v3 is not None:
+            ttk.Entry(self.frame, textvariable=v3, width=8).grid(row=r, column=3, sticky="w", padx=2)
+            Label(self.frame, text=labels[2], font=("", 8)).grid(row=r, column=3, sticky="e", padx=2)
+    
+    def _entry(self, r, txt, var):
+        Label(self.frame, text=txt).grid(row=r, column=0, sticky="w", padx=(5,10))
+        ttk.Entry(self.frame, textvariable=var, width=12).grid(row=r, column=1, sticky="w", padx=2)
+    
+    # Pan/Tilt callbacks
     def _on_center(self):
         self.mv_pan.set(0.0)
         self.mv_tilt.set(0.0)
@@ -167,68 +244,8 @@ class ManualTab:
     def _on_laser(self):
         if self.callbacks.get('toggle_laser'):
             self.callbacks['toggle_laser']()
-
-class PreviewTab:
-    """프리뷰 및 설정 탭 UI"""
-    def __init__(self, parent, callbacks):
-        self.callbacks = callbacks
-        self.frame = parent
-        self._build()
     
-    def _build(self):
-        # 변수들
-        self.preview_enable = BooleanVar(value=False)
-        self.preview_w = IntVar(value=640)
-        self.preview_h = IntVar(value=480)
-        self.preview_fps = IntVar(value=5)
-        self.preview_q = IntVar(value=70)
-        
-        row = 0
-        Checkbutton(self.frame, text="Live Preview", variable=self.preview_enable,
-                   command=self._on_toggle).grid(row=row, column=0, sticky="w", pady=2); row += 1
-        
-        self._row(row, "Preview w/h/-", self.preview_w, self.preview_h, None, ("W","H","")); row += 1
-        self._entry(row, "Preview fps", self.preview_fps); row += 1
-        self._entry(row, "Preview quality", self.preview_q); row += 1
-        Button(self.frame, text="Apply Preview Size",
-               command=self._on_apply_size).grid(row=row, column=1, sticky="w", pady=4); row += 1
-        
-        ttk.Separator(self.frame, orient="horizontal").grid(row=row, column=0, columnspan=4, sticky="ew", pady=(8,6)); row += 1
-        
-        # Snap Capture
-        snap_frame = Frame(self.frame)
-        snap_frame.grid(row=row, column=0, columnspan=4, sticky="w", pady=6); row += 1
-        Label(snap_frame, text="📸 Snap Capture:").pack(side="left", padx=3)
-        Button(snap_frame, text="Capture 5MP+3MP", command=self._on_snap,
-               bg="#4CAF50", fg="white", font=("", 10, "bold")).pack(side="left", padx=5)
-        
-        ttk.Separator(self.frame, orient="horizontal").grid(row=row, column=0, columnspan=4, sticky="ew", pady=(8,6)); row += 1
-        
-        # IR-CUT Controls
-        ir_frame = Frame(self.frame)
-        ir_frame.grid(row=row, column=0, columnspan=4, sticky="w", pady=6); row += 1
-        Label(ir_frame, text="IR-CUT:").pack(side="left", padx=3)
-        Button(ir_frame, text="☀️ Day Mode", command=lambda: self._on_ir_cut("day"),
-               bg="#FFE0B2").pack(side="left", padx=2)
-        Button(ir_frame, text="🌙 Night Mode", command=lambda: self._on_ir_cut("night"),
-               bg="#444", fg="white").pack(side="left", padx=2)
-        
-        for c in range(4): self.frame.grid_columnconfigure(c, weight=1)
-    
-    def _row(self, r, txt, v1, v2, v3, labels=("Min","Max","Step")):
-        Label(self.frame, text=txt).grid(row=r, column=0, sticky="w", padx=(5,10))
-        ttk.Entry(self.frame, textvariable=v1, width=8).grid(row=r, column=1, sticky="w", padx=2)
-        Label(self.frame, text=labels[0], font=("", 8)).grid(row=r, column=1, sticky="e", padx=2)
-        ttk.Entry(self.frame, textvariable=v2, width=8).grid(row=r, column=2, sticky="w", padx=2)
-        Label(self.frame, text=labels[1], font=("", 8)).grid(row=r, column=2, sticky="e", padx=2)
-        if v3 is not None:
-            ttk.Entry(self.frame, textvariable=v3, width=8).grid(row=r, column=3, sticky="w", padx=2)
-            Label(self.frame, text=labels[2], font=("", 8)).grid(row=r, column=3, sticky="e", padx=2)
-    
-    def _entry(self, r, txt, var):
-        Label(self.frame, text=txt).grid(row=r, column=0, sticky="w", padx=(5,10))
-        ttk.Entry(self.frame, textvariable=var, width=12).grid(row=r, column=1, sticky="w", padx=2)
-    
+    # Preview callbacks
     def _on_toggle(self):
         if self.callbacks.get('toggle_preview'):
             self.callbacks['toggle_preview'](self.preview_enable.get(),
@@ -237,7 +254,6 @@ class PreviewTab:
     
     def _on_apply_size(self):
         if self.preview_enable.get():
-            # 재시작
             self._on_toggle()
     
     def _on_snap(self):

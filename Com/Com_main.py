@@ -8,7 +8,7 @@ import pathlib
 import datetime
 from tkinter import Tk, Label, Frame, ttk, messagebox
 from network import GuiCtrlClient, GuiImgClient
-from ui_components import PreviewFrame, ScanTab, ManualTab, PreviewTab
+from ui_components import PreviewFrame, ScanTab, TestSettingsTab
 
 SERVER_HOST = "127.0.0.1"
 GUI_CTRL_PORT = 7600
@@ -40,12 +40,10 @@ class App:
         
         # Create Tabs
         tab_scan = Frame(self.notebook)
-        tab_manual = Frame(self.notebook)
-        tab_preview = Frame(self.notebook)
+        tab_test = Frame(self.notebook)
         
         self.notebook.add(tab_scan, text="Scan")
-        self.notebook.add(tab_manual, text="Manual / LED")
-        self.notebook.add(tab_preview, text="Preview & Settings")
+        self.notebook.add(tab_test, text="Test & Settings")
         
         # Initialize Tab Content
         scan_callbacks = {
@@ -54,19 +52,15 @@ class App:
         }
         self.scan_tab = ScanTab(tab_scan, scan_callbacks)
         
-        manual_callbacks = {
+        test_callbacks = {
             'apply_move': self.apply_move,
             'set_led': self.set_led,
-            'toggle_laser': self.toggle_laser
-        }
-        self.manual_tab = ManualTab(tab_manual, manual_callbacks)
-        
-        preview_callbacks = {
+            'toggle_laser': self.toggle_laser,
             'toggle_preview': self.toggle_preview,
             'set_ir_cut': self.set_ir_cut,
             'snap_capture': self.snap_capture
         }
-        self.preview_tab = PreviewTab(tab_preview, preview_callbacks)
+        self.test_tab = TestSettingsTab(tab_test, test_callbacks)
         
         # Right Panel: Preview
         right_panel = Frame(main_container)
