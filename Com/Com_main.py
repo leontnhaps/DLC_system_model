@@ -85,6 +85,9 @@ class App:
         # 저장 대기 이미지 (snap용)
         self.snap_images = []  # [(name, data), ...]
         
+        # 레이저 상태
+        self.laser_state = False
+        
         # Network Clients
         self.ctrl_client = GuiCtrlClient(SERVER_HOST, GUI_CTRL_PORT)
         self.ctrl_client.start()
@@ -139,14 +142,15 @@ class App:
     
     def toggle_laser(self):
         """레이저 토글"""
-        print(f"[LASER] Toggle")
-        # TODO: 레이저 상태 관리
+        self.laser_state = not self.laser_state
+        print(f"[LASER] Toggle → {self.laser_state}")
+        
         cmd = {
             "cmd": "laser",
-            "value": 1  # TODO: 토글 로직
+            "value": 1 if self.laser_state else 0
         }
         self.ctrl_client.send(cmd)
-        self.info_label.config(text="🔴 레이저 토글")
+        self.info_label.config(text=f"🔴 레이저: {'ON' if self.laser_state else 'OFF'}")
     
     # ========== Preview Callbacks ==========
     def toggle_preview(self, enable, w, h, fps, q):
