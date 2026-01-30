@@ -66,7 +66,7 @@ class GuiImgClient(threading.Thread):
                     remain -= len(chunk)
                 
                 data = bytes(buf)
-                self.img_queue.put(("img", data))
+                self.img_queue.put(("img", name, data))
                 
         except Exception as e:
             print(f"[IMG] 오류: {e}")
