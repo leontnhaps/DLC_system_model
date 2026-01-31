@@ -167,22 +167,22 @@ flowchart TD
     *   **Fallback Strategy**: 레이저가 감지되지 않을 경우, 자동으로 Tilt를 1°씩 내리며(Scanning Down) 레이저를 재탐색하는 복구 로직이 포함되어 있습니다.
     *   비례 제어(P-Control)를 통해 산출된 보정량으로 오차를 0에 수렴시킵니다.
 
-### 1. 🖥️ PC Client (`Com/` - 최신 버전)
+### 1. 🖥️ PC Client (`Com_650nm/` - 메인 디렉토리)
 사용자가 조작하는 GUI 프로그램이며, 시스템의 두뇌 역할을 합니다.
 
 > [!IMPORTANT]
 > **디렉토리 구조 안내**  
-> - **`Com/`**: 현재 사용 중인 최신 안정 버전입니다.
-> - **`Com_test/`**: MOT (Multi-Object Tracking) 통합 완료 버전입니다.
+> - **`Com_650nm/Com/`**: 현재 사용 중인 최신 안정 버전입니다. (650nm 레이저 기반)
+> - **`Com_650nm/Com_test/`**: MOT (Multi-Object Tracking) 통합 완료 버전입니다.
 >   - ✅ track_id 기반 다중 객체 자동 추적
 >   - ✅ 객체별 독립 Pointing 계산
 >   - ✅ 동적 UI 버튼 생성 (각 객체별 "Move to Target")
-> - **`Com_1on1_arduino_valtage/`**: 이전 버전(1:1 방식, 아두이노 INA219 전압 읽기 포함). 참고용으로 보관 중입니다.
+> - **`Com_650nm/Com_1on1_arduino_valtage/`**: 이전 버전(1:1 방식, 아두이노 INA219 전압 읽기 포함). 참고용으로 보관 중입니다.
+> - **`Com/`** (루트): 간소화된 테스트 버전 (network.py, ui_components.py만 포함)
 
 *   **`Com_main.py` (Main Entry)**
     *   프로그램의 시작점입니다. `App` 클래스를 인스턴스화하고 메인 루프를 실행합니다.
     *   전체적인 초기화 과정과 모듈 간의 연결을 담당합니다.
-    *   **`test.py`**: `Com_main.py`와 동일한 기능을 수행하는 개발/테스트용 실행 파일입니다. 현재 주로 사용되는 진입점입니다.
 
 *   **`app_ui.py` (GUI Layout)**
     *   `tkinter`를 사용하여 윈도우, 탭, 버튼, 라벨 등 모든 UI 요소를 배치하고 구성합니다.
@@ -228,13 +228,19 @@ flowchart TD
     *   스냅샷 촬영(`snap`), 설정값 계산 등 `App` 클래스에서 사용되는 보조적인 메서드들을 모아둔 파일입니다.
 
 
-### 2. 🍓 Raspberry Pi Agent (`Raspberrypi/`)
+### 2. 🍓 Raspberry Pi Agent (`Raspberrypi/` 및 `Com_650nm/`)
 하드웨어를 직접 제어하는 에이전트 프로그램입니다.
+
+> [!NOTE]
+> `Rasp_main.py`는 `Raspberrypi/`와 `Com_650nm/` 두 위치에 존재합니다. 650nm 레이저 버전은 `Com_650nm/Rasp_main.py`를 사용합니다.
 
 *   **`Rasp_main.py` (Hardware Controller)**
     *   **카메라 제어**: `Picamera2`를 사용하여 고속으로 이미지를 캡처하고 스트리밍합니다.
     *   **모터 제어**: 시리얼 포트(UART)를 통해 ESP32 기반의 Pan-Tilt 모터 드라이버에 명령을 전송합니다.
     *   PC로부터 받은 JSON 명령(`scan`, `move`, `snap` 등)을 해석하고 하드웨어를 동작시킵니다.
+
+*   **`test.py` (Test Entry Point)**
+    *   개발 및 테스트용 실행 파일입니다.
 
 ### 3. 📡 Relay Server (`Server/`)
 PC와 라즈베리파이 간의 통신을 중계합니다.
@@ -242,6 +248,9 @@ PC와 라즈베리파이 간의 통신을 중계합니다.
 *   **`Server_main.py` (Socket Broker)**
     *   TCP/IP 소켓 서버를 열어 PC와 라즈베리파이의 연결을 수락합니다.
     *   **Non-blocking**: 클라이언트의 비정상 종료 시에도 서버가 멈추지 않도록 타임아웃 및 예외 처리 로직이 강화되었습니다.
+
+*   **`test.py` (Test Entry Point)**
+    *   개발 및 테스트용 실행 파일입니다.
 
 
 ### 4. 🔌 수신부 (RX, Receiver)
@@ -271,119 +280,138 @@ PC와 라즈베리파이 간의 통신을 중계합니다.
 *   **`Mini_LED/Mini_LED.ino` (간이 버전)**
     *   단순화된 LED 표시 코드 (테스트 및 디버깅용).
 
+*   **`Mini_LED_test/` (테스트 버전)**
+    *   추가 테스트 및 실험용 LED 코드.
+
 #### 🖨️ 3D 모델 파일
 
 *   **`Target.stl`**: 수신부 타겟 3D 모델 (STL 형식)
 *   **`Target.3mf`**: 3D 프린팅용 프로젝트 파일
 *   **`Target.gcode.3mf`**: G-code가 포함된 프린트 준비 파일
 
----
-
 ## 📂 디렉토리 구조 (Directory Structure)
 
 ```
 PTCamera_waveshare/
-├── Com/                     # 최신 안정 버전 (현재 사용)
-│   ├── app_ui.py           # GUI 레이아웃
-│   ├── event_handlers.py   # 이벤트 처리 및 Anti-Freeze
-│   ├── pointing_handler.py # Pointing 알고리즘
-│   ├── scan_utils.py       # Scan 알고리즘 및 MOT
-│   ├── image_utils.py      # 이미지 처리 및 Undistortion
-│   ├── yolo_utils.py       # YOLO 래핑
-│   ├── network.py          # 네트워크 클라이언트
-│   ├── app_helpers.py      # 보조 메서드
-│   ├── Com_main.py         # 메인 진입점
-│   └── test.py             # 개발/테스트 진입점 (주로 사용)
+├── Com/                     # 간소화된 테스트 버전
+│   ├── Com_main.py          # 메인 진입점
+│   ├── network.py           # 네트워크 클라이언트
+│   └── ui_components.py     # UI 컴포넌트
 │
-├── Com_test/               # MOT 통합 버전
-│   ├── MOT.py             # ✨ Multi-Object Tracker (NEW)
-│   ├── scan_utils.py      # Scan + MOT 통합 (track_id 자동 부여)
-│   ├── pointing_handler.py # track_id별 계산 + move_to_target()
-│   ├── app_ui.py          # 동적 버튼 생성
-│   └── (기타 Com과 동일)
-│
-├── Com_1on1_arduino_valtage/  # 이전 버전 (참고용)
-│   ├── pv_vi.py            # 아두이노 전압 읽기 모듈
-│   └── (1:1 방식 레거시 코드)
-│
-├── Raspberrypi/            # 라즈베리파이 에이전트
-│   └── Rasp_main.py        # 하드웨어 제어
-│
-├── Server/                 # 중계 서버
-│   └── Server_main.py      # 소켓 브로커
-│
-├── RX/                     # 🔌 수신부 (Receiver)
-│   ├── Arduino/            # 아두이노 펌웨어
-│   │   ├── Nano_LED/       # ✨ 메인 - 배터리 모니터 및 RGB LED
-│   │   │   └── Nano_LED.ino
-│   │   ├── Battery_test/   # 간단한 배터리 전압 모니터
-│   │   │   └── Battery_test.ino
-│   │   ├── INA219/         # (레거시) INA219 전압센서 코드
-│   │   │   └── INA219.ino
-│   │   └── Mini_LED/       # 간이 버전 (테스트용)
-│   │       └── Mini_LED.ino
-│   ├── Target.stl          # 3D 모델 - STL 형식
-│   ├── Target.3mf          # 3D 프린팅 프로젝트 파일
-│   └── Target.gcode.3mf    # G-code 포함 프린트 파일
-│
-├── Experiments/            # 실험 및 테스트 스크립트 (4개 카테고리로 구성)
+├── Com_650nm/               # 🔴 650nm 레이저 버전 (메인 프로젝트)
+│   ├── Com/                 # ✨ 최신 안정 버전 (현재 사용)
+│   │   ├── Com_main.py      # 메인 진입점
+│   │   ├── app_ui.py        # GUI 레이아웃
+│   │   ├── event_handlers.py # 이벤트 처리 및 Anti-Freeze
+│   │   ├── pointing_handler.py # Pointing 알고리즘
+│   │   ├── scan_utils.py    # Scan 알고리즘
+│   │   ├── image_utils.py   # 이미지 처리 및 Undistortion
+│   │   ├── yolo_utils.py    # YOLO 래핑
+│   │   ├── network.py       # 네트워크 클라이언트
+│   │   ├── app_helpers.py   # 보조 메서드
+│   │   ├── gui_parts.py     # GUI 파트
+│   │   └── pv_vi.py         # 전압 읽기 모듈
 │   │
-│   ├── MOT_test/          # 🎯 Multi-Object Tracking (8개 파일)
+│   ├── Com_test/            # MOT 통합 버전
+│   │   ├── MOT.py           # ✨ Multi-Object Tracker (NEW)
+│   │   ├── scan_utils.py    # Scan + MOT 통합 (track_id 자동 부여)
+│   │   ├── pointing_handler.py # track_id별 계산 + move_to_target()
+│   │   ├── app_ui.py        # 동적 버튼 생성
+│   │   └── (기타 Com과 동일)
+│   │
+│   ├── Com_1on1_arduino_valtage/  # 이전 버전 (참고용)
+│   │   ├── pv_vi.py         # 아두이노 전압 읽기 모듈
+│   │   └── (1:1 방식 레거시 코드)
+│   │
+│   └── Rasp_main.py         # 650nm용 라즈베리파이 에이전트
+│
+├── Raspberrypi/             # 라즈베리파이 에이전트
+│   ├── Rasp_main.py         # 하드웨어 제어
+│   └── test.py              # 테스트용 진입점
+│
+├── Server/                  # 중계 서버
+│   ├── Server_main.py       # 소켓 브로커
+│   └── test.py              # 테스트용 진입점
+│
+├── RX/                      # 🔌 수신부 (Receiver)
+│   ├── Arduino/             # 아두이노 펌웨어
+│   │   ├── Nano_LED/        # ✨ 메인 - 배터리 모니터 및 RGB LED
+│   │   │   └── Nano_LED.ino
+│   │   ├── Battery_test/    # 간단한 배터리 전압 모니터
+│   │   │   └── Battery_test.ino
+│   │   ├── INA219/          # (레거시) INA219 전압센서 코드
+│   │   │   └── INA219.ino
+│   │   ├── Mini_LED/        # 간이 버전 (테스트용)
+│   │   │   └── Mini_LED.ino
+│   │   └── Mini_LED_test/   # 추가 테스트 버전
+│   ├── Target.stl           # 3D 모델 - STL 형식
+│   ├── Target.3mf           # 3D 프린팅 프로젝트 파일
+│   └── Target.gcode.3mf     # G-code 포함 프린트 파일
+│
+├── 3D_printer/              # 3D 프린팅 관련 파일
+│
+├── Experiments/             # 실험 및 테스트 스크립트 (4개 카테고리로 구성)
+│   │
+│   ├── MOT_test/            # 🎯 Multi-Object Tracking (9개 파일)
 │   │   ├── mot_scan_test_hungarian_final.py  # ⭐⭐⭐ 최종 사용 버전
-│   │   │                   # ✨ 헝가리안 알고리즘 기반 최적 매칭
-│   │   │                   # - 특징 추출: HSV + Grayscale 히스토그램 (11x11 격자, 5,808차원)
-│   │   │                   # - Direct 후보 (n-1): 같은 Pan, 같은 Tilt, 대각선
-│   │   │                   # - Skip 후보 (n-2 + 양방향 대각선)
-│   │   │                   # - Cost Matrix 기반 글로벌 최적 매칭 (임계값 0.5)
-│   │   │                   # - Track 병합: 평균 유사도 0.4 이상, 최소 3개 검출
-│   │   │                   # - 출력: track_id별 ROI 그리드 이미지 + 상세 로그
+│   │   │                    # ✨ 헝가리안 알고리즘 기반 최적 매칭
+│   │   │                    # - 특징 추출: HSV + Grayscale 히스토그램 (11x11 격자, 5,808차원)
+│   │   │                    # - Direct 후보 (n-1): 같은 Pan, 같은 Tilt, 대각선
+│   │   │                    # - Skip 후보 (n-2 + 양방향 대각선)
+│   │   │                    # - Cost Matrix 기반 글로벌 최적 매칭 (임계값 0.5)
+│   │   │                    # - Track 병합: 평균 유사도 0.4 이상, 최소 3개 검출
+│   │   │                    # - 출력: track_id별 ROI 그리드 이미지 + 상세 로그
 │   │   │
 │   │   ├── mot_scan_test_hungarian.py  # 기본 헝가리안 버전
-│   │   ├── mot_scan_test.py    # Greedy 알고리즘 버전
+│   │   ├── mot_scan_test.py     # Greedy 알고리즘 버전
 │   │   ├── mot_scan_test_off.py # OFF 이미지 기반 테스트
-│   │   ├── mot_scan_hsv.py     # HSV+Grayscale 기반 Greedy 매칭
-│   │   ├── mot_gray_test.py    # Grayscale 단독 특징
-│   │   ├── mot_cosin_test.py   # 코사인 유사도 초기 테스트
+│   │   ├── mot_scan_hsv.py      # HSV+Grayscale 기반 Greedy 매칭
+│   │   ├── mot_gray_test.py     # Grayscale 단독 특징
+│   │   ├── mot_cosin_test.py    # 코사인 유사도 초기 테스트
+│   │   ├── mot_comparison_test.py # MOT 알고리즘 비교 테스트
 │   │   └── visualize_grid_roi.py # 11x11 격자 ROI 시각화 (발표 자료용)
 │   │
-│   ├── Detection_test/    # 🔍 YOLO 객체 탐지 (5개 파일)
-│   │   ├── yolo_utils.py       # YOLO 래핑 (IoMin NMS 포함)
-│   │   │                       # - Tiling 전략 (2x3 그리드)
-│   │   │                       # - IoMin NMS: 중첩 박스 제거
-│   │   │                       # - Full Image 추론과 병합
-│   │   ├── SAHI_yolo_test.py   # Tiling 전략 검증 및 IoMin NMS 테스트
-│   │   ├── yolo_test.py        # YOLO 기본 추론 테스트
+│   ├── Detection_test/      # 🔍 YOLO 객체 탐지 (5개 파일)
+│   │   ├── yolo_utils.py        # YOLO 래핑 (IoMin NMS 포함)
+│   │   │                        # - Tiling 전략 (2x3 그리드)
+│   │   │                        # - IoMin NMS: 중첩 박스 제거
+│   │   │                        # - Full Image 추론과 병합
+│   │   ├── SAHI_yolo_test.py    # Tiling 전략 검증 및 IoMin NMS 테스트
+│   │   ├── yolo_test.py         # YOLO 기본 추론 테스트
 │   │   ├── sahi_tiling_visualizer.py # 타일링 시각화 도구
-│   │   └── undistort_gui.py    # 왜곡 보정 GUI 도구
+│   │   └── undistort_gui.py     # 왜곡 보정 GUI 도구
 │   │
-│   ├── Filter_test/       # 🎨 Diff 이미지 필터링 (12개 파일)
-│   │   ├── diff_filter_hsv.py  # ⭐ HSV 색공간 + 밝기 증폭 필터링
-│   │   ├── diff_filter_rgb.py  # RGB 색공간 필터링
-│   │   ├── diff_filter_red.py  # 빨간색 채널 강조
+│   ├── Filter_test/         # 🎨 Diff 이미지 필터링 (12개 파일)
+│   │   ├── diff_filter_hsv.py   # ⭐ HSV 색공간 + 밝기 증폭 필터링
+│   │   ├── diff_filter_rgb.py   # RGB 색공간 필터링
+│   │   ├── diff_filter_red.py   # 빨간색 채널 강조
 │   │   ├── diff_filter_yellow.py # 노란색 채널 강조
 │   │   ├── diff_filter_red_yellow.py # 빨강+노랑 복합
-│   │   ├── diff_filter_1_2.py  # 비율 필터링 (1:2)
-│   │   ├── diff_laser.py       # Diff 기반 레이저 중심 감지
-│   │   ├── diff_laser_hsv.py   # HSV + Diff 레이저 감지
-│   │   ├── led_filter_test.py  # 🔵 대화형 LED 필터 테스트 GUI
-│   │   │                       # - 파일 다이얼로그로 이미지 선택
-│   │   │                       # - 클릭으로 100x100 ROI 설정
-│   │   │                       # - 트랙바로 HSV 파라미터 실시간 조절
+│   │   ├── diff_filter_1_2.py   # 비율 필터링 (1:2)
+│   │   ├── diff_laser.py        # Diff 기반 레이저 중심 감지
+│   │   ├── diff_laser_hsv.py    # HSV + Diff 레이저 감지
+│   │   ├── led_filter_test.py   # 🔵 대화형 LED 필터 테스트 GUI
+│   │   │                        # - 파일 다이얼로그로 이미지 선택
+│   │   │                        # - 클릭으로 100x100 ROI 설정
+│   │   │                        # - 트랙바로 HSV 파라미터 실시간 조절
 │   │   ├── generate_diff_dataset.py # Diff 학습 데이터셋 생성
-│   │   ├── view_diff.py        # Diff 이미지 시각화
-│   │   └── rate_image.py       # 이미지 품질 평가
+│   │   ├── view_diff.py         # Diff 이미지 시각화
+│   │   └── rate_image.py        # 이미지 품질 평가
 │   │
-│   └── Hardware_test/     # 🔌 하드웨어 제어 (2개 파일)
-│       ├── ircamera_test.py    # IR 카메라 Flask 웹 서버
-│       │                       # - GPIO로 IR 필터 제어
-│       │                       # - 웹 스트리밍 지원
-│       └── Laser_GPIO.py       # 라즈베리파이 레이저 GPIO 제어
+│   └── Hardware_test/       # 🔌 하드웨어 제어 (2개 파일)
+│       ├── ircamera_test.py     # IR 카메라 Flask 웹 서버
+│       │                        # - GPIO로 IR 필터 제어
+│       │                        # - 웹 스트리밍 지원
+│       └── Laser_GPIO.py        # 라즈베리파이 레이저 GPIO 제어
 │
-├── Docs/                   # 문서
-├── calib.npz               # 카메라 보정 파일
-├── yolov11n_diff.pt        # YOLOv11 Nano 모델
-├── yolov11m_diff.pt        # YOLOv11 Medium 모델
-└── example.mp4             # 데모 영상
+├── Docs/                    # 문서
+├── calib.npz                # 카메라 보정 파일
+├── yolov11n_diff.pt         # YOLOv11 Nano 모델
+├── yolov11m_diff.pt         # YOLOv11 Medium 모델
+├── testfile.py              # 테스트 파일
+└── example.mp4              # 데모 영상
+```
+
 
 ---
 
