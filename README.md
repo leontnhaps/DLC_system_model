@@ -415,7 +415,25 @@ PTCamera_waveshare/
 
 ---
 
-## 🚀 Future Works
+## � 관련 논문 및 발표자료 (Publications)
+
+본 프로젝트와 관련된 연구 성과 및 발표자료입니다. 자세한 내용은 [`Docs/Publications.md`](Docs/Publications.md)를 참고하세요.
+
+### 학회 논문 (Conference Papers)
+
+1. **레이저 기반 에너지 전송을 위한 픽셀-각도 맵핑 방식의 Pan-Tilt 카메라 제어**
+   - 학회: 한국통신학회 (KICS) 2025
+   - 내용: 픽셀 좌표와 Pan-Tilt 각도 간 맵핑을 통한 정밀 제어 기법
+   - 📄 [발표자료](Docs/레이저%20기반%20에너지%20전송을%20위한%20픽셀-각도%20맵핑%20방식의%20Pan-Tilt%20카메라%20제어.pptx)
+
+2. **광무선 전력 전송을 위한 Pan-Tilt 카메라 스캔 시스템에서 다중 객체 추적기법**
+   - 학회: 한국통신학회 (KICS) 2026
+   - 내용: 헝가리안 알고리즘 기반 Multi-Object Tracking 기법
+   - 📄 [발표자료](Docs/광무선%20전력%20전송을%20위한%20Pan-Tilt%20카메라%20스캔%20시스템에서%20다중%20객체%20추적기법.pptx)
+
+---
+
+## �🚀 Future Works
 
 *   레이저 > 적외선 레이저 교체(850nm, 1W)
 *   카메라도 IR cut camera 로 교체
