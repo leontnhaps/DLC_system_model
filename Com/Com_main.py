@@ -9,6 +9,7 @@ import datetime
 from tkinter import Tk, Label, Frame, ttk, messagebox
 from network import GuiCtrlClient, GuiImgClient
 from ui_components import PreviewFrame, ScanTab, TestSettingsTab
+from scan_controller import ScanController
 
 SERVER_HOST = "127.0.0.1"
 GUI_CTRL_PORT = 7600
@@ -82,6 +83,9 @@ class App:
         # 레이저 상태
         self.laser_state = False
         
+        # Scan Controller
+        self.scan_ctrl = ScanController(SAVE_DIR)
+        
         # Network Clients
         self.ctrl_client = GuiCtrlClient(SERVER_HOST, GUI_CTRL_PORT)
         self.ctrl_client.start()
@@ -128,19 +132,30 @@ class App:
     # ========== Scan Callbacks ==========
     def start_scan(self, params):
         """스캔 시작"""
+        # ScanController로 세션 시작
+        session = self.scan_ctrl.start_session()
+        
+        # Progress UI 초기화
+        self.scan_tab.prog.configure(value=0, maximum=100)
+        self.scan_tab.prog_lbl.config(text="0 / 0")
+        
         print(f"[SCAN] Start: {params}")
+        
+        # Command 전송 (session 이름 포함)
         cmd = {
             "cmd": "scan_run",
+            "session": session,
             **params
         }
         self.ctrl_client.send(cmd)
-        self.info_label.config(text="🔄 스캔 시작...")
+        self.info_label.config(text=f"🔄 스캔 시작: {session}")
     
     def stop_scan(self):
         """스캔 중지"""
         print(f"[SCAN] Stop")
         self.ctrl_client.send({"cmd": "scan_stop"})
-        self.info_label.config(text="⏹️ 스캔 중지")
+        result = self.scan_ctrl.stop_session()
+        self.info_label.config(text=f"⏹️ 스캔 중지: {result['done']}/{result['total']}")
     
     # ========== Manual Callbacks ==========
     def apply_move(self, pan, tilt, speed, acc):
@@ -264,8 +279,15 @@ class App:
                 name = None
             
             if tag == "img":
-                # Snap 이미지 저장
-                if name and not name.startswith("_preview_"):
+                # ⭐ Scan 이미지 자동 저장 (ScanController 사용)
+                if name and self.scan_ctrl.is_active():
+                    saved_path = self.scan_ctrl.save_image(name, payload)
+                    if saved_path:
+                        # Scan 이미지는 세션 폴더에 저장됨
+                        print(f"[SCAN_SAVE] {saved_path}")
+                
+                # Snap 이미지 저장 (scan이 아닌 경우만)
+                elif name and not name.startswith("_preview_"):
                     save_path = SAVE_DIR / name
                     with open(save_path, 'wb') as f:
                         f.write(payload)

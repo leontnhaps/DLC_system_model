@@ -51,10 +51,11 @@ class ScanTab:
         self.width = IntVar(value=2592)
         self.height = IntVar(value=1944)
         self.quality = IntVar(value=90)
-        self.speed = IntVar(value=100)
-        self.acc = DoubleVar(value=1.0)
-        self.settle = DoubleVar(value=0.25)
-        self.led_settle = DoubleVar(value=0.15)
+        self.speed = IntVar(value=0)
+        self.acc = DoubleVar(value=0.0)
+        self.settle = DoubleVar(value=0.4)
+        self.led_settle = DoubleVar(value=0.4)
+
         
         r = 0
         self._row(r, "Pan min/max/step", self.pan_min, self.pan_max, self.pan_step); r += 1
