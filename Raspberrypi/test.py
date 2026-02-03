@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
 """
-Raspberrypi Agent - Complete with Manual Control
+Raspberrypi Agent - Complete with Manual Control + Scan
 - ESP32 serial communication (Pan/Tilt)
 - Manual control (move, LED, laser)
 - Preview streaming
 - Snap capture
 - IR-CUT control
+- Grid Scan (Boustrophedon pattern)
+Modified: 2026-02-03
+- Reverted scan timing sequence to MATCH ORIGINAL Rasp_main.py logic exactly
 """
 import socket, struct, io, time, json, threading, glob
 from picamera2 import Picamera2
@@ -61,11 +64,175 @@ def send_to_slave(obj: dict):
 picam = None
 preview_stop = threading.Event()
 preview_thread = None
+scan_stop = threading.Event()
+scan_thread = None
 # ==================== 이미지 전송 ====================
 def push_image(sock: socket.socket, name: str, data: bytes):
     header = struct.pack("<H", len(name.encode())) + name.encode() + struct.pack("<I", len(data))
     sock.sendall(header)
     sock.sendall(data)
+# ==================== Scan 유틸리티 ====================
+def generate_boustrophedon_grid(pan_min, pan_max, pan_step, 
+                                 tilt_min, tilt_max, tilt_step):
+    """Boustrophedon 패턴 (뱀 모양) 그리드 생성
+    
+    시작점: (pan_min, tilt_min)
+    패턴: 짝수 행은 →, 홀수 행은 ←
+    """
+    grid = []
+    
+    # Tilt 최소값부터 시작
+    tilt_values = list(range(tilt_min, tilt_max + 1, tilt_step))
+    
+    for tilt_idx, tilt in enumerate(tilt_values):
+        # Pan 값들
+        pan_values = list(range(pan_min, pan_max + 1, pan_step))
+        
+        # 홀수 행은 역방향 (←)
+        if tilt_idx % 2 == 1:
+            pan_values.reverse()
+        
+        # 그리드에 추가
+        for pan in pan_values:
+            grid.append((pan, tilt))
+    
+    return grid
+# ==================== Scan Worker ====================
+def scan_worker(cmd, ctrl_sock, img_sock):
+    """Grid scan worker - ORIGINAL Rasp_main.py 시퀀스 복원
+    
+    Original Sequence:
+    1. Pan/Tilt 이동
+    2. Settle 대기 (0.1s)
+    3. LED ON
+    4. LED Settle 대기 (0.4s)
+    5. 촬영 (LED ON)
+    6. LED OFF
+    7. LED Settle 대기 (0.4s)
+    8. 촬영 (LED OFF)
+    """
+    global picam
+    
+    try:
+        # 파라미터 추출
+        pan_min = int(cmd["pan_min"])
+        pan_max = int(cmd["pan_max"])
+        pan_step = int(cmd["pan_step"])
+        tilt_min = int(cmd["tilt_min"])
+        tilt_max = int(cmd["tilt_max"])
+        tilt_step = int(cmd["tilt_step"])
+        
+        speed = int(cmd["speed"])
+        acc = float(cmd["acc"])
+        settle = float(cmd["settle"])
+        led_settle = float(cmd.get("led_settle", 0.4))  # led_settle 복원
+        
+        width = int(cmd["width"])
+        height = int(cmd["height"])
+        quality = int(cmd["quality"])
+        session = cmd["session"]
+        
+        print(f"[SCAN] 시작: Pan[{pan_min}~{pan_max}:{pan_step}], Tilt[{tilt_min}~{tilt_max}:{tilt_step}]")
+        print(f"[SCAN] 타이밍: settle={settle}s, led_settle={led_settle}s (Original Logic)")
+        
+        # Grid 생성
+        grid = generate_boustrophedon_grid(
+            pan_min, pan_max, pan_step,
+            tilt_min, tilt_max, tilt_step
+        )
+        total = len(grid)
+        print(f"[SCAN] 총 {total}개 포인트")
+        
+        # Start 이벤트 전송
+        ctrl_sock.sendall((json.dumps({
+            "event": "start",
+            "session": session,
+            "total": total
+        }) + "\n").encode())
+        
+        # 카메라 설정 (Still 모드)
+        picam.stop()
+        config = picam.create_still_configuration(main={"size": (width, height)})
+        picam.configure(config)
+        picam.options["quality"] = quality
+        picam.start()
+        time.sleep(0.2)
+        
+        # Grid 순회
+        for i, (pan, tilt) in enumerate(grid):
+            if scan_stop.is_set():
+                print("[SCAN] 중단됨")
+                break
+            
+            print(f"[SCAN] [{i+1}/{total}] Pan={pan}, Tilt={tilt}")
+            
+            # ① Pan/Tilt 이동
+            send_to_slave({
+                "T": 133,
+                "X": float(pan),
+                "Y": float(tilt),
+                "SPD": speed,
+                "ACC": acc
+            })
+            time.sleep(settle)  # 1. 이동 후 settle 대기
+            
+            # ② LED ON
+            send_to_slave({"T": 132, "IO4": 255, "IO5": 255})
+            time.sleep(led_settle)  # 2. LED 켜고 led_settle 대기
+            
+            # ③ 촬영 (LED ON)
+            bio = io.BytesIO()
+            picam.capture_file(bio, format="jpeg")
+            jpeg_data = bio.getvalue()
+            bio.close()
+            
+            name_on = f"{session}_t{tilt:+03d}_p{pan:+04d}_led_on.jpg"
+            push_image(img_sock, name_on, jpeg_data)
+            
+            # ④ LED OFF
+            send_to_slave({"T": 132, "IO4": 0, "IO5": 0})
+            time.sleep(led_settle)  # 3. LED 끄고 led_settle 대기
+            
+            # ⑤ 촬영 (LED OFF)
+            bio = io.BytesIO()
+            picam.capture_file(bio, format="jpeg")
+            jpeg_data = bio.getvalue()
+            bio.close()
+            
+            name_off = f"{session}_t{tilt:+03d}_p{pan:+04d}_led_off.jpg"
+            push_image(img_sock, name_off, jpeg_data)
+            
+            # ⑥ Progress 이벤트 전송
+            ctrl_sock.sendall((json.dumps({
+                "event": "progress",
+                "done": i + 1,
+                "total": total,
+                "name": name_off
+            }) + "\n").encode())
+        
+        # Done 이벤트 전송
+        ctrl_sock.sendall((json.dumps({"event": "done"}) + "\n").encode())
+        print(f"[SCAN] 완료: {i+1}/{total}")
+        
+    except KeyError as e:
+        print(f"[SCAN] 필수 파라미터 누락: {e}")
+        ctrl_sock.sendall((json.dumps({
+            "event": "error",
+            "message": f"필수 파라미터 누락: {e}"
+        }) + "\n").encode())
+    except Exception as e:
+        print(f"[SCAN] 오류: {e}")
+        ctrl_sock.sendall((json.dumps({
+            "event": "error",
+            "message": str(e)
+        }) + "\n").encode())
+    
+    finally:
+        # LED OFF
+        try:
+            send_to_slave({"T": 132, "IO4": 0, "IO5": 0})
+        except:
+            pass
 # ==================== 프리뷰 워커 ====================
 def preview_worker(img_sock, w=640, h=480, fps=5, q=70):
     global picam
@@ -170,7 +337,7 @@ def snap_capture(img_sock, w, h, q, name):
             pass
 # ==================== 메인 ====================
 def main():
-    global picam, preview_thread
+    global picam, preview_thread, scan_thread
     
     # GPIO 초기화
     GPIO.setmode(GPIO.BCM)
@@ -274,6 +441,28 @@ def main():
                     ).start()
                     print(f"[CMD] Snap 요청: {w}x{h}")
                 
+                elif c == "scan_run":
+                    # 기존 scan 중지
+                    scan_stop.set()
+                    if scan_thread and scan_thread.is_alive():
+                        scan_thread.join(timeout=1.0)
+                    
+                    # 새 scan 시작
+                    scan_stop.clear()
+                    scan_thread = threading.Thread(
+                        target=scan_worker,
+                        args=(cmd, ctrl_sock, img_sock),
+                        daemon=True
+                    )
+                    scan_thread.start()
+                    print("[CMD] Scan 시작")
+                
+                elif c == "scan_stop":
+                    scan_stop.set()
+                    if scan_thread:
+                        scan_thread.join(timeout=1.0)
+                    print("[CMD] Scan 중지")
+                
                 elif c == "move":
                     # Pan/Tilt 이동
                     pan = float(cmd.get("pan", 0.0))
@@ -301,7 +490,7 @@ def main():
                     print(f"[LED] Value={val}")
                 
                 elif c == "laser":
-                    # 레이저 제어
+                    # Laser 제어
                     val = int(cmd.get("value", 0))
                     GPIO.output(LASER_PIN, GPIO.HIGH if val else GPIO.LOW)
                     print(f"[LASER] {'ON' if val else 'OFF'}")
@@ -310,22 +499,26 @@ def main():
                     # IR-CUT 제어
                     mode = cmd.get("mode", "day")
                     if mode == "day":
-                        GPIO.output(IR_CUT_PIN, GPIO.HIGH)
-                        print("[IR-CUT] Day Mode (IR 필터 ON)")
-                    else:
                         GPIO.output(IR_CUT_PIN, GPIO.LOW)
-                        print("[IR-CUT] Night Mode (IR 필터 OFF)")
-                
-                else:
-                    print(f"[CMD] 알 수 없는 명령: {c}")
+                        print("[IR-CUT] Day Mode (필터 ON)")
+                    else:
+                        GPIO.output(IR_CUT_PIN, GPIO.HIGH)
+                        print("[IR-CUT] Night Mode (필터 OFF)")
     
-    finally:
-        GPIO.cleanup()
-        print("[GPIO] Cleanup 완료")
-if __name__ == "__main__":
-    try:
-        main()
     except KeyboardInterrupt:
-        print("\n[MAIN] 종료")
+        print("\n[EXIT] 종료 중...")
     finally:
+        # 정리
+        preview_stop.set()
+        scan_stop.set()
         GPIO.cleanup()
+        try:
+            ctrl_sock.close()
+        except:
+            pass
+        try:
+            img_sock.close()
+        except:
+            pass
+if __name__ == "__main__":
+    main()
