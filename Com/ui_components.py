@@ -47,6 +47,7 @@ class ScanTab:
         self.tilt_min = IntVar(value=0)
         self.tilt_max = IntVar(value=30)
         self.tilt_step = IntVar(value=10)
+        self.scan_resolution = StringVar(value="5MP (2592×1944)")
         self.width = IntVar(value=2592)
         self.height = IntVar(value=1944)
         self.quality = IntVar(value=90)
@@ -58,7 +59,19 @@ class ScanTab:
         r = 0
         self._row(r, "Pan min/max/step", self.pan_min, self.pan_max, self.pan_step); r += 1
         self._row(r, "Tilt min/max/step", self.tilt_min, self.tilt_max, self.tilt_step); r += 1
-        self._row(r, "Resolution (w×h)", self.width, self.height, None, ("W","H","")); r += 1
+        
+        # Resolution Combobox
+        Label(self.frame, text="Resolution").grid(row=r, column=0, sticky="w", padx=(5,10))
+        res_combo = ttk.Combobox(self.frame, textvariable=self.scan_resolution, state="readonly", width=20)
+        res_combo['values'] = (
+            "VGA (640×480)",
+            "1.3MP (1296×972)",
+            "Full HD (1920×1080)",
+            "5MP (2592×1944)"
+        )
+        res_combo.grid(row=r, column=1, columnspan=2, sticky="w", padx=2)
+        res_combo.bind("<<ComboboxSelected>>", self._on_scan_resolution_change); r += 1
+        
         self._entry(r, "Quality(%)", self.quality); r += 1
         self._entry(r, "Speed", self.speed); r += 1
         self._entry(r, "Accel", self.acc); r += 1
@@ -110,6 +123,20 @@ class ScanTab:
     def _on_stop(self):
         if self.callbacks.get('stop_scan'):
             self.callbacks['stop_scan']()
+    
+    def _on_scan_resolution_change(self, event=None):
+        """Resolution combobox 변경 시 width/height 자동 설정"""
+        res_map = {
+            "VGA (640×480)": (640, 480),
+            "1.3MP (1296×972)": (1296, 972),
+            "Full HD (1920×1080)": (1920, 1080),
+            "5MP (2592×1944)": (2592, 1944)
+        }
+        selected = self.scan_resolution.get()
+        if selected in res_map:
+            w, h = res_map[selected]
+            self.width.set(w)
+            self.height.set(h)
 
 class TestSettingsTab:
     """Test & Settings 탭 - Manual + Preview 통합"""
@@ -126,6 +153,7 @@ class TestSettingsTab:
         self.mv_acc = DoubleVar(value=1.0)
         self.led = IntVar(value=0)
         self.preview_enable = BooleanVar(value=False)
+        self.preview_resolution = StringVar(value="VGA (640×480)")
         self.preview_w = IntVar(value=640)
         self.preview_h = IntVar(value=480)
         self.preview_fps = IntVar(value=5)
@@ -170,14 +198,28 @@ class TestSettingsTab:
         Label(self.frame, text="📹 Preview Settings", font=("", 11, "bold")).grid(
             row=row, column=0, columnspan=3, sticky="w", padx=5, pady=(5, 10)); row += 1
         
-        Checkbutton(self.frame, text="Live Preview", variable=self.preview_enable,
-                   command=self._on_toggle).grid(row=row, column=0, sticky="w", pady=2); row += 1
+        # Live Preview 체크박스 (명시적으로 False로 강제)
+        self.preview_enable.set(False)  # 강제 초기화!
+        preview_check = Checkbutton(self.frame, text="Live Preview", variable=self.preview_enable,
+                   command=self._on_toggle)
+        preview_check.grid(row=row, column=0, columnspan=2, sticky="w", pady=2)
+        preview_check.deselect()  # 체크 해제
+        row += 1
         
-        self._row(row, "Preview w/h", self.preview_w, self.preview_h, None, ("W","H","")); row += 1
+        # Preview Resolution Combobox
+        Label(self.frame, text="Resolution").grid(row=row, column=0, sticky="w", padx=(5,10))
+        prev_res_combo = ttk.Combobox(self.frame, textvariable=self.preview_resolution, state="readonly", width=20)
+        prev_res_combo['values'] = (
+            "VGA (640×480)",
+            "1.3MP (1296×972)",
+            "Full HD (1920×1080)",
+            "5MP (2592×1944)"
+        )
+        prev_res_combo.grid(row=row, column=1, columnspan=2, sticky="w", padx=2)
+        prev_res_combo.bind("<<ComboboxSelected>>", self._on_preview_resolution_change); row += 1
+        
         self._entry(row, "Preview fps", self.preview_fps); row += 1
         self._entry(row, "Preview quality", self.preview_q); row += 1
-        Button(self.frame, text="Apply Preview Size", command=self._on_apply_size).grid(
-            row=row, column=1, sticky="w", pady=4); row += 1
         
         ttk.Separator(self.frame, orient="horizontal").grid(row=row, column=0, columnspan=3, sticky="ew", pady=10); row += 1
         
@@ -185,8 +227,8 @@ class TestSettingsTab:
         Label(self.frame, text="📸 Capture", font=("", 11, "bold")).grid(
             row=row, column=0, columnspan=3, sticky="w", padx=5, pady=(5, 10)); row += 1
         
-        Button(self.frame, text="Snap 5MP+3MP", command=self._on_snap,
-               bg="#4CAF50", fg="white", font=("", 10, "bold"), width=20).grid(
+        Button(self.frame, text="Snap (Preview Resolution)", command=self._on_snap,
+               bg="#4CAF50", fg="white", font=("", 10, "bold"), width=25).grid(
             row=row, column=0, columnspan=2, sticky="w", padx=5, pady=5); row += 1
         
         ttk.Separator(self.frame, orient="horizontal").grid(row=row, column=0, columnspan=3, sticky="ew", pady=10); row += 1
@@ -263,3 +305,20 @@ class TestSettingsTab:
     def _on_ir_cut(self, mode):
         if self.callbacks.get('set_ir_cut'):
             self.callbacks['set_ir_cut'](mode)
+    
+    def _on_preview_resolution_change(self, event=None):
+        """Preview resolution combobox 변경 시 자동 적용"""
+        res_map = {
+            "VGA (640×480)": (640, 480),
+            "1.3MP (1296×972)": (1296, 972),
+            "Full HD (1920×1080)": (1920, 1080),
+            "5MP (2592×1944)": (2592, 1944)
+        }
+        selected = self.preview_resolution.get()
+        if selected in res_map:
+            w, h = res_map[selected]
+            self.preview_w.set(w)
+            self.preview_h.set(h)
+            # 프리뷰 중이면 자동 재시작
+            if self.preview_enable.get():
+                self._on_toggle()

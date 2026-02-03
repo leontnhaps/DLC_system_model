@@ -92,6 +92,38 @@ class App:
         # Polling
         self.frame_count = 0
         self.root.after(50, self._poll)
+        
+        # ⚠️ Preview 자동 시작 제거 - 사용자가 직접 켜도록
+        # Raspberrypi 초기화 - 이전 실행 상태 초기화
+        self.root.after(100, self._init_raspberrypi)
+    
+    def _init_raspberrypi(self):
+        """Raspberrypi 초기 상태 설정 (모든 하드웨어 초기화)"""
+        print("[INIT] Raspberrypi 전체 초기화...")
+        
+        # 1. Preview OFF
+        self.ctrl_client.send({"cmd": "preview", "enable": False})
+        
+        # 2. LED OFF (0)
+        self.ctrl_client.send({"cmd": "led", "value": 0})
+        
+        # 3. Laser OFF
+        self.ctrl_client.send({"cmd": "laser", "value": 0})
+        self.laser_state = False
+        
+        # 4. Pan/Tilt Center (0, 0)
+        self.ctrl_client.send({
+            "cmd": "move",
+            "pan": 0.0,
+            "tilt": 0.0,
+            "speed": 100,
+            "acc": 1.0
+        })
+        
+        # 5. IR-CUT Day Mode (필터 ON)
+        self.ctrl_client.send({"cmd": "ir_cut", "mode": "day"})
+        
+        print("[INIT] ✅ 초기화 완료: Preview=OFF, LED=0, Laser=OFF, Pan/Tilt=0,0, IR-CUT=Day")
     
     # ========== Scan Callbacks ==========
     def start_scan(self, params):
@@ -179,9 +211,27 @@ class App:
         else:
             self.info_label.config(text="🌙 Night Mode (IR 필터 OFF)")
     
+    def _restart_preview(self):
+        """Preview 재시작 헬퍼"""
+        w = self.test_tab.preview_w.get()
+        h = self.test_tab.preview_h.get()
+        fps = self.test_tab.preview_fps.get()
+        q = self.test_tab.preview_q.get()
+        
+        self.ctrl_client.send({
+            "cmd": "preview",
+            "enable": True,
+            "width": w,
+            "height": h,
+            "fps": fps,
+            "quality": q
+        })
+    
     def snap_capture(self):
-        """Snap 캡처 - 5MP + 3MP (순차 촬영)"""
-        print(f"[SNAP] Capturing 5MP + 3MP")
+        """Snap 캡처 - Preview 해상도 사용"""
+        w = self.test_tab.preview_w.get()
+        h = self.test_tab.preview_h.get()
+        print(f"[SNAP] Capturing {w}x{h}")
         
         # 저장 이미지 초기화
         self.snap_images = []
@@ -189,32 +239,18 @@ class App:
         # 타임스탬프
         ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         
-        # 1. 5MP (2592x1944) - 최대 해상도
-        cmd_5mp = {
+        # Snap 캡처
+        cmd = {
             "cmd": "snap",
-            "width": 2592,
-            "height": 1944,
+            "width": w,
+            "height": h,
             "quality": 95,
-            "save": f"snap_{ts}_5MP.jpg"
+            "save": f"snap_{ts}.jpg"
         }
-        self.ctrl_client.send(cmd_5mp)
+        self.ctrl_client.send(cmd)
         
-        # 딜레이 후 3MP 촬영 (순차 처리)
-        self.root.after(1500, lambda: self._snap_second(ts))
-        
-        self.info_label.config(text="📸 캡처 중... (5MP)")
-    
-    def _snap_second(self, ts):
-        """두 번째 snap (3MP)"""
-        cmd_3mp = {
-            "cmd": "snap",
-            "width": 2048,
-            "height": 1536,
-            "quality": 95,
-            "save": f"snap_{ts}_3MP.jpg"
-        }
-        self.ctrl_client.send(cmd_3mp)
-        self.info_label.config(text="📸 캡처 중... (3MP)")
+        self.info_label.config(text=f"📸 캡처 중... ({w}x{h})")
+
     
     # ========== Polling ==========
     def _poll(self):
