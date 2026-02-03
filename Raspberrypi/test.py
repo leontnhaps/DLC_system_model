@@ -70,7 +70,7 @@ def push_image(sock: socket.socket, name: str, data: bytes):
 def preview_worker(img_sock, w=640, h=480, fps=5, q=70):
     global picam
     try:
-        print(f"[PREVIEW] 시작: {w}x{h} @ {fps}fps")
+        print(f"[PREVIEW] 시작: {w}x{h} @ {fps}fps, quality={q}")
         
         picam.stop()
         config = picam.create_video_configuration(main={"size": (w, h)})
@@ -80,22 +80,56 @@ def preview_worker(img_sock, w=640, h=480, fps=5, q=70):
         time.sleep(0.1)
         
         interval = 1.0 / max(1, fps)
+        frame_count = 0
+        error_count = 0
         
         while not preview_stop.is_set():
-            bio = io.BytesIO()
-            picam.capture_file(bio, format="jpeg")
-            jpeg_data = bio.getvalue()
+            bio = None
+            try:
+                bio = io.BytesIO()
+                picam.capture_file(bio, format="jpeg")
+                jpeg_data = bio.getvalue()
+                
+                push_image(img_sock, f"_preview_{int(time.time()*1000)}.jpg", jpeg_data)
+                frame_count += 1
+                error_count = 0  # 성공 시 에러 카운트 리셋
+                
+                # 주기적 로그 (100프레임마다)
+                if frame_count % 100 == 0:
+                    print(f"[PREVIEW] {frame_count} 프레임 전송 완료")
+                
+            except Exception as e:
+                error_count += 1
+                print(f"[PREVIEW] 프레임 오류 ({error_count}): {e}")
+                
+                # 연속 10회 오류 시 중단
+                if error_count >= 10:
+                    print("[PREVIEW] 오류 과다 → 중단")
+                    break
             
-            push_image(img_sock, f"_preview_{int(time.time()*1000)}.jpg", jpeg_data)
+            finally:
+                # 메모리 누수 방지 - BytesIO 명시적 닫기
+                if bio:
+                    bio.close()
+            
             time.sleep(interval)
-            
-        print("[PREVIEW] 중지됨")
+        
+        print(f"[PREVIEW] 중지됨 (총 {frame_count} 프레임)")
+        
     except Exception as e:
-        print(f"[PREVIEW] 오류: {e}")
+        print(f"[PREVIEW] 치명적 오류: {e}")
+    
+    finally:
+        # 카메라 중지
+        try:
+            picam.stop()
+        except:
+            pass
 # ==================== 스냅 캡처 ====================
 def snap_capture(img_sock, w, h, q, name):
     """고해상도 스틸 이미지 캡처"""
     global picam
+    bio = None
     try:
         print(f"[SNAP] 캡처 중: {w}x{h}, quality={q}")
         
@@ -123,6 +157,17 @@ def snap_capture(img_sock, w, h, q, name):
         
     except Exception as e:
         print(f"[SNAP] 오류: {e}")
+    
+    finally:
+        # 메모리 누수 방지
+        if bio:
+            bio.close()
+        
+        # 카메라 중지
+        try:
+            picam.stop()
+        except:
+            pass
 # ==================== 메인 ====================
 def main():
     global picam, preview_thread
