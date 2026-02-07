@@ -6,12 +6,13 @@ Network clients for server communication
 import json, socket, struct, threading
 
 class GuiCtrlClient(threading.Thread):
-    """제어 소켓 - 명령 전송"""
-    def __init__(self, host, port):
+    """제어 소켓 - 명령 전송 + 이벤트 수신"""
+    def __init__(self, host, port, event_queue):
         super().__init__(daemon=True)
         self.host = host
         self.port = port
         self.sock = None
+        self.event_queue = event_queue  # 이벤트 큐 추가
         
     def run(self):
         print(f"[CTRL] 연결 중: {self.host}:{self.port}")
@@ -19,6 +20,31 @@ class GuiCtrlClient(threading.Thread):
             self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             self.sock.connect((self.host, self.port))
             print(f"[CTRL] 연결 성공!")
+            
+            # 이벤트 수신 루프 추가
+            buf = b""
+            while True:
+                data = self.sock.recv(4096)
+                if not data:
+                    break
+                buf += data
+                
+                while True:
+                    nl = buf.find(b"\n")
+                    if nl < 0:
+                        break
+                    line = buf[:nl].decode("utf-8", "ignore").strip()
+                    buf = buf[nl+1:]
+                    if not line:
+                        continue
+                    
+                    try:
+                        event = json.loads(line)
+                        self.event_queue.put(("event", event))
+                        print(f"[CTRL] 이벤트 수신: {event.get('event', '?')}")
+                    except:
+                        continue
+                        
         except Exception as e:
             print(f"[CTRL] 오류: {e}")
     
