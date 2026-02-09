@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
 """
-Com Client - Complete UI with tabs
+Com Client - Modular architecture with mixins
 """
 
-import queue
 import pathlib
 import datetime
-from tkinter import Tk, Label, Frame, ttk, messagebox
+from tkinter import Tk, Label, Frame, ttk
+
 from network import GuiCtrlClient, GuiImgClient
+from event_handlers import EventHandlersMixin
+from app_helpers import AppHelpersMixin
 from ui_components import PreviewFrame, ScanTab, TestSettingsTab
 from scan_controller import ScanController
 
@@ -18,17 +20,14 @@ GUI_IMG_PORT = 7601
 # 저장 디렉토리
 SAVE_DIR = pathlib.Path("captures")
 
-class App:
+
+class App(EventHandlersMixin, AppHelpersMixin):
+    """메인 앱 - 믹스인 패턴으로 이벤트 처리 분리"""
+    
     def __init__(self, root: Tk):
         self.root = root
         root.title("IR-CUT Camera System")
         root.geometry("1200x800")
-        
-        # 이미지 큐
-        self.img_queue = queue.Queue()
-        
-        # 이벤트 큐 (progress 등)
-        self.event_queue = queue.Queue()
         
         # Main Layout: Left=Tabs, Right=Preview
         main_container = Frame(root)
@@ -80,46 +79,42 @@ class App:
         # 저장 디렉토리 생성
         SAVE_DIR.mkdir(exist_ok=True)
         
-        # 저장 대기 이미지 (snap용)
-        self.snap_images = []  # [(name, data), ...]
-        
         # 레이저 상태
         self.laser_state = False
         
         # Scan Controller
         self.scan_ctrl = ScanController(SAVE_DIR)
         
-        # Network Clients
-        self.ctrl_client = GuiCtrlClient(SERVER_HOST, GUI_CTRL_PORT, self.event_queue)
-        self.ctrl_client.start()
-        
-        self.img_client = GuiImgClient(SERVER_HOST, GUI_IMG_PORT, self.img_queue)
-        self.img_client.start()
-        
-        # Polling
+        # Frame count (for preview)
         self.frame_count = 0
-        self.root.after(50, self._poll)
         
-        # ⚠️ Preview 자동 시작 제거 - 사용자가 직접 켜도록
-        # Raspberrypi 초기화 - 이전 실행 상태 초기화
+        # Network Clients
+        self.ctrl = GuiCtrlClient(SERVER_HOST, GUI_CTRL_PORT)
+        self.ctrl.start()
+        
+        self.img = GuiImgClient(SERVER_HOST, GUI_IMG_PORT, SAVE_DIR)
+        self.img.start()
+        
+        # Start polling (from EventHandlersMixin)
         self.root.after(100, self._init_raspberrypi)
+        self.root.after(50, self._poll)
     
     def _init_raspberrypi(self):
         """Raspberrypi 초기 상태 설정 (모든 하드웨어 초기화)"""
         print("[INIT] Raspberrypi 전체 초기화...")
         
         # 1. Preview OFF
-        self.ctrl_client.send({"cmd": "preview", "enable": False})
+        self.ctrl.send({"cmd": "preview", "enable": False})
         
         # 2. LED OFF (0)
-        self.ctrl_client.send({"cmd": "led", "value": 0})
+        self.ctrl.send({"cmd": "led", "value": 0})
         
         # 3. Laser OFF
-        self.ctrl_client.send({"cmd": "laser", "value": 0})
+        self.ctrl.send({"cmd": "laser", "value": 0})
         self.laser_state = False
         
         # 4. Pan/Tilt Center (0, 0)
-        self.ctrl_client.send({
+        self.ctrl.send({
             "cmd": "move",
             "pan": 0.0,
             "tilt": 0.0,
@@ -128,7 +123,7 @@ class App:
         })
         
         # 5. IR-CUT Day Mode (필터 ON)
-        self.ctrl_client.send({"cmd": "ir_cut", "mode": "day"})
+        self.ctrl.send({"cmd": "ir_cut", "mode": "day"})
         
         print("[INIT] ✅ 초기화 완료: Preview=OFF, LED=0, Laser=OFF, Pan/Tilt=0,0, IR-CUT=Day")
     
@@ -150,13 +145,13 @@ class App:
             "session": session,
             **params
         }
-        self.ctrl_client.send(cmd)
+        self.ctrl.send(cmd)
         self.info_label.config(text=f"🔄 스캔 시작: {session}")
     
     def stop_scan(self):
         """스캔 중지"""
         print(f"[SCAN] Stop")
-        self.ctrl_client.send({"cmd": "scan_stop"})
+        self.ctrl.send({"cmd": "scan_stop"})
         result = self.scan_ctrl.stop_session()
         self.info_label.config(text=f"⏹️ 스캔 중지: {result['done']}/{result['total']}")
     
@@ -171,7 +166,7 @@ class App:
             "speed": speed,
             "acc": acc
         }
-        self.ctrl_client.send(cmd)
+        self.ctrl.send(cmd)
         self.info_label.config(text=f"🎯 이동: Pan={pan}°, Tilt={tilt}°")
     
     def set_led(self, value):
@@ -181,7 +176,7 @@ class App:
             "cmd": "led",
             "value": value
         }
-        self.ctrl_client.send(cmd)
+        self.ctrl.send(cmd)
         self.info_label.config(text=f"💡 LED: {value}")
     
     def toggle_laser(self):
@@ -193,7 +188,7 @@ class App:
             "cmd": "laser",
             "value": 1 if self.laser_state else 0
         }
-        self.ctrl_client.send(cmd)
+        self.ctrl.send(cmd)
         self.info_label.config(text=f"🔴 레이저: {'ON' if self.laser_state else 'OFF'}")
     
     # ========== Preview Callbacks ==========
@@ -208,7 +203,7 @@ class App:
             "fps": fps,
             "quality": q
         }
-        self.ctrl_client.send(cmd)
+        self.ctrl.send(cmd)
         
         if enable:
             self.info_label.config(text=f"✅ 프리뷰: {w}x{h}")
@@ -222,37 +217,18 @@ class App:
             "cmd": "ir_cut",
             "mode": mode
         }
-        self.ctrl_client.send(cmd)
+        self.ctrl.send(cmd)
         
         if mode == "day":
             self.info_label.config(text="☀️ Day Mode (IR 필터 ON)")
         else:
             self.info_label.config(text="🌙 Night Mode (IR 필터 OFF)")
     
-    def _restart_preview(self):
-        """Preview 재시작 헬퍼"""
-        w = self.test_tab.preview_w.get()
-        h = self.test_tab.preview_h.get()
-        fps = self.test_tab.preview_fps.get()
-        q = self.test_tab.preview_q.get()
-        
-        self.ctrl_client.send({
-            "cmd": "preview",
-            "enable": True,
-            "width": w,
-            "height": h,
-            "fps": fps,
-            "quality": q
-        })
-    
     def snap_capture(self):
         """Snap 캡처 - Preview 해상도 사용"""
         w = self.test_tab.preview_w.get()
         h = self.test_tab.preview_h.get()
         print(f"[SNAP] Capturing {w}x{h}")
-        
-        # 저장 이미지 초기화
-        self.snap_images = []
         
         # 타임스탬프
         ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -265,94 +241,18 @@ class App:
             "quality": 95,
             "save": f"snap_{ts}.jpg"
         }
-        self.ctrl_client.send(cmd)
+        self.ctrl.send(cmd)
         
         self.info_label.config(text=f"📸 캡처 중... ({w}x{h})")
-
-    
-    # ========== Polling ==========
-    def _poll(self):
-        """이미지 수신 체크"""
-        try:
-            msg = self.img_queue.get_nowait()
-            if len(msg) == 3:
-                tag, name, payload = msg
-            else:
-                tag, payload = msg
-                name = None
-            
-            if tag == "img":
-                # ⭐ Scan 이미지 자동 저장 (ScanController 사용)
-                if name and self.scan_ctrl.is_active():
-                    saved_path = self.scan_ctrl.save_image(name, payload)
-                    if saved_path:
-                        # Scan 이미지는 세션 폴더에 저장됨
-                        print(f"[SCAN_SAVE] {saved_path}")
-                
-                # Snap 이미지 저장 (scan이 아닌 경우만)
-                elif name and not name.startswith("_preview_"):
-                    save_path = SAVE_DIR / name
-                    with open(save_path, 'wb') as f:
-                        f.write(payload)
-                    print(f"[SAVE] {save_path}")
-                    self.info_label.config(text=f"💾 저장됨: {name}")
-                
-                # 프리뷰 표시
-                self.preview_frame.display_image(payload)
-                self.frame_count += 1
-        except queue.Empty:
-            pass
-        
-        # 이벤트 수신 체크 (progress 등)
-        try:
-            msg = self.event_queue.get_nowait()
-            if len(msg) == 2:
-                tag, event = msg
-                if tag == "event":
-                    self._handle_event(event)
-        except queue.Empty:
-            pass
-        
-        self.root.after(50, self._poll)
-    
-    def _handle_event(self, event):
-        """스캔 이벤트 처리"""
-        evt = event.get("event")
-        
-        if evt == "start":
-            total = event.get("total", 0)
-            self.scan_ctrl.update_progress(0, total)
-            self.scan_tab.prog.configure(value=0, maximum=total)
-            self.scan_tab.prog_lbl.config(text=f"0 / {total}")
-            print(f"[EVENT] Scan started: {total} images")
-        
-        elif evt == "progress":
-            done = event.get("done", 0)
-            total = event.get("total", 100)
-            name = event.get("name", "")
-            
-            self.scan_ctrl.update_progress(done, total)
-            self.scan_tab.prog.configure(value=done, maximum=total)
-            self.scan_tab.prog_lbl.config(text=f"{done} / {total}")
-            print(f"[EVENT] Progress: {done}/{total} - {name}")
-        
-        elif evt == "done":
-            done, total = self.scan_ctrl.get_progress()
-            print(f"[EVENT] Scan completed: {done}/{total}")
-            self.info_label.config(text=f"✅ 스캔 완료: {done}/{total}")
-        
-        elif evt == "error":
-            msg = event.get("message", "Unknown error")
-            print(f"[EVENT] Error: {msg}")
-            self.info_label.config(text=f"❌ 오류: {msg}")
-            messagebox.showerror("Scan Error", msg)
     
     def run(self):
         self.root.mainloop()
 
+
 def main():
     root = Tk()
     App(root).run()
+
 
 if __name__ == "__main__":
     main()
