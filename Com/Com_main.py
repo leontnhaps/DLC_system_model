@@ -12,6 +12,7 @@ from event_handlers import EventHandlersMixin
 from app_helpers import AppHelpersMixin
 from ui_components import PreviewFrame, ScanTab, TestSettingsTab
 from scan_controller import ScanController
+from yolo_utils import YOLOProcessor
 
 SERVER_HOST = "127.0.0.1"
 GUI_CTRL_PORT = 7600
@@ -82,8 +83,11 @@ class App(EventHandlersMixin, AppHelpersMixin):
         # 레이저 상태
         self.laser_state = False
         
+        # YOLO Processor
+        self.yolo_processor = YOLOProcessor()
+        
         # Scan Controller
-        self.scan_ctrl = ScanController(SAVE_DIR)
+        self.scan_ctrl = ScanController(SAVE_DIR, self.yolo_processor)
         
         # Frame count (for preview)
         self.frame_count = 0
@@ -130,8 +134,13 @@ class App(EventHandlersMixin, AppHelpersMixin):
     # ========== Scan Callbacks ==========
     def start_scan(self, params):
         """스캔 시작"""
+        # YOLO weights 경로 추출
+        yolo_weights = params.pop('yolo_weights', None)
+        if yolo_weights and not yolo_weights.strip():
+            yolo_weights = None
+        
         # ScanController로 세션 시작
-        session = self.scan_ctrl.start_session()
+        session = self.scan_ctrl.start_session(yolo_weights_path=yolo_weights)
         
         # Progress UI 초기화
         self.scan_tab.prog.configure(value=0, maximum=100)

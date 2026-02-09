@@ -79,6 +79,10 @@ class ScanTab:
         self._entry(r, "Settle(s)", self.settle); r += 1
         self._entry(r, "LED Settle(s)", self.led_settle); r += 1
         
+        # YOLO weights 경로
+        self.yolo_weights = StringVar(value="../yolov11m_diff.pt")
+        self._entry(r, "YOLO Weights", self.yolo_weights); r += 1
+        
         ops = Frame(self.frame)
         ops.grid(row=r, column=0, columnspan=4, sticky="w", pady=6)
         Button(ops, text="Start Scan", command=self._on_start).pack(side="left", padx=4)
@@ -117,7 +121,8 @@ class ScanTab:
                 'speed': self.speed.get(),
                 'acc': self.acc.get(),
                 'settle': self.settle.get(),
-                'led_settle': self.led_settle.get()
+                'led_settle': self.led_settle.get(),
+                'yolo_weights': self.yolo_weights.get()  # YOLO weights 추가
             }
             self.callbacks['start_scan'](params)
     
