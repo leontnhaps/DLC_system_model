@@ -1,20 +1,59 @@
-#!/usr/bin/env python3
-from picamera2 import Picamera2
-picam = Picamera2()
-print("=" * 60)
-print("카메라 센서 모드 정보")
-print("=" * 60)
-for i, mode in enumerate(picam.sensor_modes):
-    print(f"\n모드 {i}:")
-    print(f"  해상도: {mode['size']}")
-    print(f"  비트: {mode.get('bit_depth', 'N/A')}")
-    print(f"  포맷: {mode.get('format', 'N/A')}")
-print("\n" + "=" * 60)
-print("권장 설정")
-print("=" * 60)
-# 최대 해상도 찾기
-max_mode = max(picam.sensor_modes, key=lambda m: m['size'][0] * m['size'][1])
-max_w, max_h = max_mode['size']
-max_mp = (max_w * max_h) / 1_000_000
-print(f"최대 해상도: {max_w} x {max_h} ({max_mp:.1f}MP)")
-picam.close()
+import matplotlib.pyplot as plt
+import numpy as np
+
+# 1. 데이터 설정 (가운데 5x5를 제외하고 None과 11x11만 추출)
+x_labels = ['None', '11x11']
+x = np.arange(len(x_labels))  # 라벨 위치 (0, 1)
+width = 0.3  # 막대 두께
+
+# ID Purity 데이터 (None, 11x11)
+purity_scan = [32.7, 100.0]
+purity_maxage = [31.8, 100.0]
+
+# AssA 데이터 (None, 11x11)
+assa_scan = [0.25, 0.76]
+assa_maxage = [0.24, 0.58]
+
+# ---------------------------------------------------------
+# Figure 1: ID Purity (None vs 11x11)
+# ---------------------------------------------------------
+plt.figure(1, figsize=(6, 6))
+plt.bar(x - width/2, purity_scan, width, label='Scan Topology Based', color='teal', alpha=0.8)
+plt.bar(x + width/2, purity_maxage, width, label='Max Age = 5', color='orange', alpha=0.8)
+
+plt.ylabel('ID Purity (%)', fontsize=12)
+plt.xticks(x, x_labels)
+plt.grid(axis='y', linestyle=':', alpha=0.6)
+plt.legend(loc='upper left')
+plt.ylim(0, 120)
+
+# 값 표시
+for i in range(len(x)):
+    plt.text(x[i] - width/2, purity_scan[i] + 2, f'{purity_scan[i]}%', ha='center', va='bottom', fontweight='bold')
+    plt.text(x[i] + width/2, purity_maxage[i] + 2, f'{purity_maxage[i]}%', ha='center', va='bottom', fontweight='bold')
+
+plt.tight_layout()
+plt.savefig('figure1_id_purity_comparison.png', dpi=300)
+
+# ---------------------------------------------------------
+# Figure 2: AssA (None vs 11x11)
+# ---------------------------------------------------------
+plt.figure(2, figsize=(6, 6))
+plt.bar(x - width/2, assa_scan, width, label='Scan Topology Based', color='darkred', alpha=0.8)
+plt.bar(x + width/2, assa_maxage, width, label='Max Age = 5', color='gray', alpha=0.8)
+
+plt.ylabel('AssA Score', fontsize=12)
+plt.xticks(x, x_labels)
+plt.grid(axis='y', linestyle=':', alpha=0.6)
+plt.legend(loc='upper left')
+plt.ylim(0, 1.0)
+
+# 값 표시
+for i in range(len(x)):
+    plt.text(x[i] - width/2, assa_scan[i] + 0.02, f'{assa_scan[i]}', ha='center', va='bottom', fontweight='bold')
+    plt.text(x[i] + width/2, assa_maxage[i] + 0.02, f'{assa_maxage[i]}', ha='center', va='bottom', fontweight='bold')
+
+plt.tight_layout()
+plt.savefig('figure2_assa_comparison.png', dpi=300)
+
+plt.show()

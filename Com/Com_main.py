@@ -27,6 +27,9 @@ class App:
         # 이미지 큐
         self.img_queue = queue.Queue()
         
+        # 이벤트 큐 (progress 등)
+        self.event_queue = queue.Queue()
+        
         # Main Layout: Left=Tabs, Right=Preview
         main_container = Frame(root)
         main_container.pack(fill="both", expand=True)
@@ -87,7 +90,7 @@ class App:
         self.scan_ctrl = ScanController(SAVE_DIR)
         
         # Network Clients
-        self.ctrl_client = GuiCtrlClient(SERVER_HOST, GUI_CTRL_PORT)
+        self.ctrl_client = GuiCtrlClient(SERVER_HOST, GUI_CTRL_PORT, self.event_queue)
         self.ctrl_client.start()
         
         self.img_client = GuiImgClient(SERVER_HOST, GUI_IMG_PORT, self.img_queue)
@@ -300,7 +303,49 @@ class App:
         except queue.Empty:
             pass
         
+        # 이벤트 수신 체크 (progress 등)
+        try:
+            msg = self.event_queue.get_nowait()
+            if len(msg) == 2:
+                tag, event = msg
+                if tag == "event":
+                    self._handle_event(event)
+        except queue.Empty:
+            pass
+        
         self.root.after(50, self._poll)
+    
+    def _handle_event(self, event):
+        """스캔 이벤트 처리"""
+        evt = event.get("event")
+        
+        if evt == "start":
+            total = event.get("total", 0)
+            self.scan_ctrl.update_progress(0, total)
+            self.scan_tab.prog.configure(value=0, maximum=total)
+            self.scan_tab.prog_lbl.config(text=f"0 / {total}")
+            print(f"[EVENT] Scan started: {total} images")
+        
+        elif evt == "progress":
+            done = event.get("done", 0)
+            total = event.get("total", 100)
+            name = event.get("name", "")
+            
+            self.scan_ctrl.update_progress(done, total)
+            self.scan_tab.prog.configure(value=done, maximum=total)
+            self.scan_tab.prog_lbl.config(text=f"{done} / {total}")
+            print(f"[EVENT] Progress: {done}/{total} - {name}")
+        
+        elif evt == "done":
+            done, total = self.scan_ctrl.get_progress()
+            print(f"[EVENT] Scan completed: {done}/{total}")
+            self.info_label.config(text=f"✅ 스캔 완료: {done}/{total}")
+        
+        elif evt == "error":
+            msg = event.get("message", "Unknown error")
+            print(f"[EVENT] Error: {msg}")
+            self.info_label.config(text=f"❌ 오류: {msg}")
+            messagebox.showerror("Scan Error", msg)
     
     def run(self):
         self.root.mainloop()
