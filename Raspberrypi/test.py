@@ -16,7 +16,7 @@ import RPi.GPIO as GPIO
 import serial
 # ==================== GPIO 설정 ====================
 IR_CUT_PIN = 17  # BCM 17번
-LASER_PIN = 15   # BCM 15번
+LASER_PIN = 23   # BCM 23번
 # ==================== 서버 설정 ====================
 SERVER_OPTIONS = {
     "1": ("192.168.0.9", "711a"),
