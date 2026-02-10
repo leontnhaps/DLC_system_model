@@ -97,5 +97,5 @@ class EventHandlersMixin:
             print(f"[SAVE] {save_path}")
             self.info_label.config(text=f"💾 저장됨: {name}")
         
-        # 프리뷰 표시
+        # ⭐ 프리뷰 표시 (Scan 이미지도 보임!)
         self._set_preview(data)

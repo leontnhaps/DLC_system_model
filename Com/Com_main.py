@@ -83,6 +83,9 @@ class App(EventHandlersMixin, AppHelpersMixin):
         # 레이저 상태
         self.laser_state = False
         
+        # Preview 상태 추적
+        self.preview_active = False
+        
         # YOLO Processor
         self.yolo_processor = YOLOProcessor()
         
@@ -134,6 +137,14 @@ class App(EventHandlersMixin, AppHelpersMixin):
     # ========== Scan Callbacks ==========
     def start_scan(self, params):
         """스캔 시작"""
+        # ⭐ Preview가 켜져있으면 자동 중지
+        if self.preview_active:
+            print("[SCAN] Preview 자동 중지...")
+            self.toggle_preview(False, 640, 480, 10, 80)
+            self.preview_active = False
+            # Preview 완전히 중지될 때까지 대기
+            self.root.after(300)
+        
         # YOLO weights 경로 추출
         yolo_weights = params.pop('yolo_weights', None)
         if yolo_weights and not yolo_weights.strip():
@@ -213,6 +224,9 @@ class App(EventHandlersMixin, AppHelpersMixin):
             "quality": q
         }
         self.ctrl.send(cmd)
+        
+        # ⭐ Preview 상태 추적
+        self.preview_active = enable
         
         if enable:
             self.info_label.config(text=f"✅ 프리뷰: {w}x{h}")

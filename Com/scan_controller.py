@@ -1,6 +1,6 @@
 """
-Scan Controller - Manages scan session, YOLO processing, and CSV export
-Worker Thread pattern for async YOLO processing
+Scan Controller - Manages scan session, YOLO processing, CSV export, and MOT
+Worker Thread pattern for async YOLO processing + Multi-Object Tracking
 """
 import pathlib
 import csv
@@ -10,6 +10,7 @@ import queue
 from datetime import datetime
 import cv2
 import numpy as np
+from mot import ObjectTracker
 
 
 class ScanController:
@@ -24,6 +25,9 @@ class ScanController:
         self.save_dir = pathlib.Path(save_dir)
         self.save_dir.mkdir(exist_ok=True)
         self.yolo_processor = yolo_processor
+        
+        # MOT Tracker
+        self.mot_tracker = ObjectTracker(roi_size=300, grid_size=(11, 11))
         
         # Scan state
         self.active = False
@@ -46,6 +50,7 @@ class ScanController:
         # Statistics
         self.processed_count = 0
         self.detected_count = 0
+        self.track_count = 0
         
         # Worker Thread
         self.processing_queue = queue.Queue(maxsize=50)
@@ -113,15 +118,29 @@ class ScanController:
                         device=device
                     )
                     
-                    # CSV 저장
-                    if boxes and self.csv_writer:
-                        for i, (x, y, w, h) in enumerate(boxes):
-                            self.csv_writer.writerow([
-                                pan, tilt, x+w/2, y+h/2, w, h,
-                                float(scores[i]), int(classes[i]), W, H
-                            ])
-                            self.detected_count += 1
-                        self.csv_file.flush()
+                    # MOT tracking
+                    if boxes:
+                        # Timestamp 생성 (pan, tilt 기반)
+                        timestamp = f"{pan:+04d}_{tilt:+03d}"
+                        
+                        # MOT에 검출 결과 전달 (LED OFF for feature extraction)
+                        track_ids = self.mot_tracker.add_detections(
+                            boxes, scores,
+                            img_on=pair['off'],  # ⭐ LED OFF!
+                            diff=diff,
+                            pan=pan, tilt=tilt, timestamp=timestamp
+                        )
+                        
+                        # CSV 저장 (track_id 포함)
+                        if self.csv_writer:
+                            for i, (x, y, w, h) in enumerate(boxes):
+                                self.csv_writer.writerow([
+                                    pan, tilt, x+w/2, y+h/2, w, h,
+                                    float(scores[i]), int(classes[i]), W, H,
+                                    track_ids[i]  # ⭐ track_id 추가
+                                ])
+                                self.detected_count += 1
+                            self.csv_file.flush()
             
             self.processed_count += 1
             
@@ -148,13 +167,16 @@ class ScanController:
         # Worker Thread 시작
         self._start_worker_thread()
         
-        # CSV 생성
+        # MOT 리셋
+        self.mot_tracker.reset()
+        
+        # CSV 생성 (track_id 컬럼 추가)
         if self.yolo_weights_path:
             self.csv_path = self.session_dir / f"{self.session}_detections.csv"
             try:
                 self.csv_file = open(self.csv_path, "w", newline="", encoding="utf-8")
                 self.csv_writer = csv.writer(self.csv_file)
-                self.csv_writer.writerow(["pan_deg", "tilt_deg", "cx", "cy", "w", "h", "conf", "cls", "W", "H"])
+                self.csv_writer.writerow(["pan_deg", "tilt_deg", "cx", "cy", "w", "h", "conf", "cls", "W", "H", "track_id"])
                 print(f"[ScanController] CSV created: {self.csv_path}")
             except Exception as e:
                 print(f"[ScanController] CSV creation failed: {e}")
@@ -167,11 +189,24 @@ class ScanController:
         return self.session
     
     def stop_session(self):
-        """스캔 세션 종료"""
+        """스캔 세션 종료 + MOT 후처리"""
         self.active = False
         
         # Worker Thread 중지
         self._stop_worker_thread()
+        
+        # MOT 후처리 (track 병합)
+        if self.yolo_weights_path:
+            print("\n" + "="*60)
+            print("⭐ MOT 후처리 시작")
+            print("="*60)
+            merge_map = self.mot_tracker.merge_similar_tracks(
+                merge_threshold=0.4,
+                min_detections=3
+            )
+            self.track_count = self.mot_tracker.get_track_count()
+            print(f"[MOT] 최종 Track 수: {self.track_count}개")
+            print(f"[MOT] 병합된 track: {len(merge_map)}개")
         
         # CSV 닫기
         if self.csv_file:
@@ -182,7 +217,7 @@ class ScanController:
         self.image_pairs.clear()
         
         print(f"[SCAN] Session stopped: {self.session}")
-        print(f"[SCAN] Processed: {self.processed_count}, Detected: {self.detected_count}")
+        print(f"[SCAN] Processed: {self.processed_count}, Detected: {self.detected_count}, Tracks: {self.track_count}")
         
         result = {
             'session': self.session,
@@ -191,6 +226,7 @@ class ScanController:
             'done': self.done,
             'processed': self.processed_count,
             'detected': self.detected_count,
+            'tracks': self.track_count,
             'csv_path': self.csv_path
         }
         return result
