@@ -7,6 +7,7 @@ import csv
 import re
 import threading
 import queue
+import os
 from datetime import datetime
 import cv2
 import numpy as np
@@ -15,7 +16,6 @@ from mot import ObjectTracker
 
 class ScanController:
     """실시간 스캔 처리 관리자 - Worker Thread pattern"""
-    
     def __init__(self, save_dir, yolo_processor=None):
         """
         Args:
@@ -218,12 +218,21 @@ class ScanController:
             self.track_count = self.mot_tracker.get_track_count()
             print(f"[MOT] 최종 Track 수: {self.track_count}개")
             print(f"[MOT] 병합된 track: {len(merge_map)}개")
+            
+            # ⭐ 유사도 로그 저장 (mot_scan_test_hungarian_final.py와 동일 포맷)
+            if self.session_dir:
+                log_path = self.session_dir / "similarity_log_live.txt"
+                print(f"[MOT] Saving similarity log to {log_path}")
+                self.mot_tracker.save_similarity_log(str(log_path))
         
-        # CSV 닫기
         if self.csv_file:
             self.csv_file.close()
             self.csv_file = None
             self.csv_writer = None
+            print(f"[SCAN] Saved to {self.csv_path}")
+            csv_abs_path = os.path.abspath(self.csv_path)
+        else:
+            csv_abs_path = None
         
         self.image_pairs.clear()
         
@@ -238,7 +247,8 @@ class ScanController:
             'processed': self.processed_count,
             'detected': self.detected_count,
             'tracks': self.track_count,
-            'csv_path': self.csv_path
+            'csv_path': self.csv_path,
+            'csv_path_abs': csv_abs_path  # ⭐ 절대 경로 추가
         }
         return result
     

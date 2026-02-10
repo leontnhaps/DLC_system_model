@@ -57,6 +57,10 @@ class EventHandlersMixin:
             done, total = self.scan_ctrl.get_progress()
             print(f"[EVENT] Scan completed: {done}/{total}")
             self.info_label.config(text=f"✅ 스캔 완료: {done}/{total}")
+            
+            # ⭐ 스캔 완료 시 세션 자동 종료 및 로그 저장
+            print("[EVENT] Auto-stopping session...")
+            self.stop_scan()
         
         elif evt == "error":
             msg = event.get("message", "Unknown error")

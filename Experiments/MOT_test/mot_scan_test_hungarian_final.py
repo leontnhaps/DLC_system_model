@@ -33,9 +33,10 @@ except ImportError as e:
 MODEL_PATH = "yolov11m_diff.pt"
 
 # ⭐ 여기에 스캔 폴더 경로 입력! (예시)
-SCAN_FOLDER = r"C:\Users\gmlwn\OneDrive\바탕 화면\ICon1학년\OpticalWPT\PTCamera_waveshare\Captures\scan_20260211_014558"
+SCAN_FOLDER = r"C:\Users\gmlwn\OneDrive\바탕 화면\ICon1학년\OpticalWPT\PTCamera_waveshare\Captures\scan_20260211_044446"
 
-CONF_THRES = 0.50
+CONF_THRES = 0.20
+MOT_CONF_THRESHOLD = 0.50
 IOU_THRES = 0.45
 # ⭐ 고정 ROI 크기 (중심 기준)
 ROI_SIZE = 300  # 300x300 픽셀
@@ -358,10 +359,10 @@ class ObjectTracker:
                 # 후보 소스 판단 (direct vs skip)
                 if cand_idx < len(direct_candidates):
                     source = 'direct'
-                    threshold = 0.5  # Direct threshold
+                    threshold = 0.4  # Direct threshold
                 else:
                     source = 'skip'
-                    threshold = 0.5  # Skip threshold
+                    threshold = 0.4  # Skip threshold
                 
                 # ⭐ 임계값 이상일 때만 매칭
                 if sim >= threshold:
@@ -424,119 +425,117 @@ class ObjectTracker:
     
     def _find_prev_candidates(self, current_pan, current_tilt):
         """
-        프레임 후보 검색 (⭐ 양방향 대각선 1개씩 버전):
-        1. n-1 (최근 1프레임): 같은 Pan, 같은 Tilt, 대각선
-        2. n-2 (2프레임 전): 같은 Pan, 같은 Tilt
-        3. ⭐ 양방향 대각선: 각 방향에서 1개씩만 수집
+        프레임 후보 검색 (⭐ 5개 후보군 - 완전 공간 검색 버전):
+        1. n-1 (최근 1프레임)
+        2. n-2 (2프레임 전)
+        3. 바로 윗줄(Previous Row)에서 공간적으로 가장 가까운 3개:
+           - Vertical (Pan == Current)
+           - Diag Left (Pan < Current 중 최대)
+           - Diag Right (Pan > Current 중 최소)
         
         반환: {'direct': [...], 'skip': [...]}
         """
         if not self.frames:
             return {'direct': [], 'skip': []}
         
-        # n-1 프레임 (직접 이웃)
-        prev_pan_frame = None
-        prev_tilt_frame = None
+        # 1. n-1 & 2. n-2 프레임 (시간적 이웃)
+        frame_n1 = self.frames[-1] if len(self.frames) >= 1 else None
+        frame_n2 = self.frames[-2] if len(self.frames) >= 2 else None
         
-        # n-2 프레임 (프레임 건너뛰기)
-        skip_pan_frame = None
+        # 3. 바로 윗줄(Previous Row) 프레임들 수집
+        prev_row_frames = []
+        target_prev_tilt = None
         
-        # ⭐ 양방향 대각선 (지그재그 스캔 대응) - 각 방향에서 1개씩만
-        diagonal_increase = None  # Pan 증가, Tilt 변화
-        diagonal_decrease = None  # Pan 감소, Tilt 변화
-        
-        # 최근 프레임부터 역순 탐색
+        # 역순 탐색으로 바로 윗줄(Tilt가 다른 첫 줄)을 찾음
         for i in range(len(self.frames)):
-            prev_frame = self.frames[-(i+1)]
-            frame_pan = prev_frame['pan']
-            frame_tilt = prev_frame['tilt']
+            f = self.frames[-(i+1)]
             
-            # ⭐ n-1 프레임 검색
-            if i == 0:  # 가장 최근 프레임
-                # 같은 Pan, 다른 Tilt
-                if frame_pan == current_pan and frame_tilt != current_tilt and prev_pan_frame is None:
-                    prev_pan_frame = prev_frame
-                
-                # 같은 Tilt, 다른 Pan
-                if frame_tilt == current_tilt and frame_pan != current_pan and prev_tilt_frame is None:
-                    prev_tilt_frame = prev_frame
+            # 현재 줄(Tilt 같음)은 패스 (n-1, n-2에서 이미 처리됨)
+            if f['tilt'] == current_tilt:
+                continue
             
-            # ⭐ n-2 프레임 검색 (프레임 건너뛰기)
-            elif i == 1:  # 2프레임 전
-                # 같은 Pan, 다른 Tilt
-                if frame_pan == current_pan and frame_tilt != current_tilt and skip_pan_frame is None:
-                    skip_pan_frame = prev_frame
+            # 윗줄 발견
+            if target_prev_tilt is None:
+                target_prev_tilt = f['tilt']
             
-            # ⭐ 양방향 대각선 검색 (각 방향에서 1개씩만!)
-            if frame_pan != current_pan and frame_tilt != current_tilt:
-                # Pan 증가 방향 (→)
-                if frame_pan < current_pan and diagonal_increase is None:
-                    diagonal_increase = prev_frame
-                
-                # Pan 감소 방향 (←)
-                if frame_pan > current_pan and diagonal_decrease is None:
-                    diagonal_decrease = prev_frame
-            
-            # ⭐ 충분히 수집했으면 종료
-            if (skip_pan_frame is not None and 
-                diagonal_increase is not None and diagonal_decrease is not None):
+            # 같은 윗줄이면 수집
+            if f['tilt'] == target_prev_tilt:
+                prev_row_frames.append(f)
+            else:
+                # 더 윗줄(Previous Previous Row)이 나오면 종료
                 break
         
-        # ⭐ n-1 후보 수집 (direct)
+        # 수집된 윗줄 프레임 중에서 공간적으로 가장 가까운 3개 찾기
+        vertical_frame = None       # Pan == Current
+        diagonal_increase = None    # Pan < Current (Left)
+        diagonal_decrease = None    # Pan > Current (Right)
+        
+        # 거리가 가장 가까운 놈을 찾기 위한 변수
+        min_dist_inc = float('inf')
+        min_dist_dec = float('inf')
+        
+        for f in prev_row_frames:
+            f_pan = f['pan']
+            
+            # Vertical
+            if f_pan == current_pan:
+                vertical_frame = f
+            
+            # Diag Left (Pan < Current)
+            elif f_pan < current_pan:
+                dist = current_pan - f_pan
+                if dist < min_dist_inc:
+                    min_dist_inc = dist
+                    diagonal_increase = f
+            
+            # Diag Right (Pan > Current)
+            elif f_pan > current_pan:
+                dist = f_pan - current_pan
+                if dist < min_dist_dec:
+                    min_dist_dec = dist
+                    diagonal_decrease = f
+        
+        # 후보군 수집
         direct_candidates = []
-        
-        # Pan 방향
-        if prev_pan_frame is not None:
-            for obj in prev_pan_frame['objects']:
-                direct_candidates.append({
-                    **obj,
-                    'frame_pan': prev_pan_frame['pan'],
-                    'frame_tilt': prev_pan_frame['tilt'],
-                    'frame_timestamp': prev_pan_frame['timestamp']
-                })
-        
-        # Tilt 방향
-        if prev_tilt_frame is not None:
-            for obj in prev_tilt_frame['objects']:
-                direct_candidates.append({
-                    **obj,
-                    'frame_pan': prev_tilt_frame['pan'],
-                    'frame_tilt': prev_tilt_frame['tilt'],
-                    'frame_timestamp': prev_tilt_frame['timestamp']
-                })
-        
-        # ⭐ skip 후보 수집 (n-2 + 양방향 대각선 1개씩!)
         skip_candidates = []
         
-        # n-2 Pan 방향
-        if skip_pan_frame is not None:
-            for obj in skip_pan_frame['objects']:
-                skip_candidates.append({
+        # 1. n-1 (Direct)
+        if frame_n1:
+            for obj in frame_n1['objects']:
+                direct_candidates.append({
                     **obj,
-                    'frame_pan': skip_pan_frame['pan'],
-                    'frame_tilt': skip_pan_frame['tilt'],
-                    'frame_timestamp': skip_pan_frame['timestamp']
+                    'frame_pan': frame_n1['pan'],
+                    'frame_tilt': frame_n1['tilt'],
+                    'frame_timestamp': frame_n1['timestamp']
                 })
         
-        # ⭐ 양방향 대각선 (각 방향에서 1개씩)
-        if diagonal_increase is not None:
-            for obj in diagonal_increase['objects']:
+        # 나머지 4개는 Skip 후보로 통합
+        candidates_frames = []
+        if frame_n2: candidates_frames.append(frame_n2)
+        if vertical_frame: candidates_frames.append(vertical_frame)
+        if diagonal_increase: candidates_frames.append(diagonal_increase)
+        if diagonal_decrease: candidates_frames.append(diagonal_decrease)
+        
+        # 중복 제거 (n-1과 track_id 기준)
+        added_track_ids = set()
+        for cand in direct_candidates:
+            added_track_ids.add(cand['track_id'])
+            
+        for frame in candidates_frames:
+            if frame is frame_n1: continue
+            
+            for obj in frame['objects']:
+                if obj['track_id'] in added_track_ids:
+                    continue
+                
                 skip_candidates.append({
                     **obj,
-                    'frame_pan': diagonal_increase['pan'],
-                    'frame_tilt': diagonal_increase['tilt'],
-                    'frame_timestamp': diagonal_increase['timestamp']
+                    'frame_pan': frame['pan'],
+                    'frame_tilt': frame['tilt'],
+                    'frame_timestamp': frame['timestamp']
                 })
-        
-        if diagonal_decrease is not None:
-            for obj in diagonal_decrease['objects']:
-                skip_candidates.append({
-                    **obj,
-                    'frame_pan': diagonal_decrease['pan'],
-                    'frame_tilt': diagonal_decrease['tilt'],
-                    'frame_timestamp': diagonal_decrease['timestamp']
-                })
-        
+                added_track_ids.add(obj['track_id'])
+
         return {'direct': direct_candidates, 'skip': skip_candidates}
     
     def _match_object_with_log(self, curr_obj, candidates, pan, tilt, timestamp, obj_idx, unique_id):
@@ -917,13 +916,35 @@ def parse_scan_images(folder):
         images.append((pan, tilt, led_type, str(img_file), timestamp))
     
     # ⭐ Pan/Tilt 기준 정렬 (Boustrophedon 순서)
-    # Tilt 우선, 그 다음 Pan (짝수 Tilt는 오름차순, 홀수는 내림차순)
-    def sort_key(item):
-        pan, tilt, led_type, filepath, ts = item
-        # Tilt로 그룹화, Pan 방향은 Boustrophedon 고려하지 않고 단순 정렬
-        return (tilt, pan, led_type)
+    # 1. Tilt 오름차순 정렬
+    images.sort(key=lambda x: x[1])
     
-    images.sort(key=sort_key)
+    # 2. 유니크 Tilt 목록 추출 및 인덱싱 (동적 Step 지원)
+    unique_tilts = sorted(list(set(x[1] for x in images)))
+    tilt_to_row = {t: i for i, t in enumerate(unique_tilts)}
+    
+    # ⭐ Pan/Tilt 기준 정렬 (Boustrophedon 순서)
+    # 3. 각 Tilt별로 Pan 정렬 방향 결정
+    if images:
+        sorted_images = []
+        
+        # Tilt별 그룹화
+        from itertools import groupby
+        for tilt, group in groupby(images, key=lambda x: x[1]):
+            group_list = list(group)
+            
+            # Tilt 줄 번호 (0부터 시작)
+            row_idx = tilt_to_row[tilt]
+            
+            # 짝수 줄(0, 2...): Pan 오름차순 (→)
+            # 홀수 줄(1, 3...): Pan 내림차순 (←)
+            reverse = (row_idx % 2 == 1)
+            
+            group_list.sort(key=lambda x: x[0], reverse=reverse)
+            sorted_images.extend(group_list)
+        
+        images = sorted_images
+    
     return images
 
 # =========================================================
@@ -1003,12 +1024,23 @@ def main():
             conf=CONF_THRES, iou=IOU_THRES
         )
         
+        # ⭐ MOT 전에 confidence >= MOT_CONF_THRESHOLD 필터링 (실시간 코드와 동일하게)
+        if boxes:
+            filtered_indices = [i for i, score in enumerate(scores) if score >= MOT_CONF_THRESHOLD]
+            if filtered_indices:
+                boxes = [boxes[i] for i in filtered_indices]
+                scores = [scores[i] for i in filtered_indices]
+                classes = [classes[i] for i in filtered_indices]
+            else:
+                boxes = []
+        
         if not boxes:
             print(f"[Pan={pan:+4d}, Tilt={tilt:+3d}] 검출 없음")
             continue
         
         # ⭐ 추적 (timestamp와 diff 전달)
-        track_ids = tracker.add_detections(boxes, scores, img_on, diff, pan, tilt, timestamp)
+        # 실시간 스캔 코드(Com/scan_controller.py)와 동일하게 OFF 이미지를 사용해야 함
+        track_ids = tracker.add_detections(boxes, scores, img_off, diff, pan, tilt, timestamp)
         
         # 결과 출력
         print(f"[Pan={pan:+4d}, Tilt={tilt:+3d}] {len(boxes)}개 검출 → track_ids: {track_ids}")

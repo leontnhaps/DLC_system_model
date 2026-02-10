@@ -9,8 +9,9 @@ from tkinter import Tk, Label, Frame, ttk
 
 from network import GuiCtrlClient, GuiImgClient
 from event_handlers import EventHandlersMixin
+from pointing_handler import PointingHandlerMixin
 from app_helpers import AppHelpersMixin
-from ui_components import PreviewFrame, ScanTab, TestSettingsTab
+from ui_components import PreviewFrame, ScanTab, TestSettingsTab, PointingTab
 from scan_controller import ScanController
 from yolo_utils import YOLOProcessor
 
@@ -22,7 +23,7 @@ GUI_IMG_PORT = 7601
 SAVE_DIR = pathlib.Path("captures")
 
 
-class App(EventHandlersMixin, AppHelpersMixin):
+class ComApp(EventHandlersMixin, PointingHandlerMixin, AppHelpersMixin):
     """메인 앱 - 믹스인 패턴으로 이벤트 처리 분리"""
     
     def __init__(self, root: Tk):
@@ -45,9 +46,11 @@ class App(EventHandlersMixin, AppHelpersMixin):
         # Create Tabs
         tab_scan = Frame(self.notebook)
         tab_test = Frame(self.notebook)
+        tab_pointing = Frame(self.notebook)
         
         self.notebook.add(tab_scan, text="Scan")
         self.notebook.add(tab_test, text="Test & Settings")
+        self.notebook.add(tab_pointing, text="Pointing")
         
         # Initialize Tab Content
         scan_callbacks = {
@@ -65,6 +68,17 @@ class App(EventHandlersMixin, AppHelpersMixin):
             'snap_capture': self.snap_capture
         }
         self.test_tab = TestSettingsTab(tab_test, test_callbacks)
+        
+        pointing_callbacks = {
+            'pointing_choose_csv': self.pointing_choose_csv,
+            'pointing_compute': self.pointing_compute,
+            'move_to_target': self.move_to_target
+        }
+        self.pointing_tab = PointingTab(tab_pointing, pointing_callbacks)
+        
+        # pointing_handler에서 참조할 수 있도록 변수 연결
+        self.point_csv_path = self.pointing_tab.point_csv_path
+        self._create_target_buttons = self.pointing_tab._create_target_buttons
         
         # Right Panel: Preview
         right_panel = Frame(main_container)
@@ -137,6 +151,9 @@ class App(EventHandlersMixin, AppHelpersMixin):
     # ========== Scan Callbacks ==========
     def start_scan(self, params):
         """스캔 시작"""
+        # ⭐ 버튼 상태 변경 (Start -> Disabled, Stop -> Normal)
+        self.scan_tab.set_scan_state(True)
+        
         # ⭐ Preview가 켜져있으면 자동 중지
         if self.preview_active:
             print("[SCAN] Preview 자동 중지...")
@@ -172,8 +189,25 @@ class App(EventHandlersMixin, AppHelpersMixin):
         """스캔 중지"""
         print(f"[SCAN] Stop")
         self.ctrl.send({"cmd": "scan_stop"})
-        result = self.scan_ctrl.stop_session()
-        self.info_label.config(text=f"⏹️ 스캔 중지: {result['done']}/{result['total']}")
+        result = self.scan_ctrl.stop_session()  # 이제 딕셔너리 반환
+        
+        # UI 업데이트
+        if result:
+            self.info_label.config(text=f"⏹️ 스캔 중지: {result['done']}/{result['total']}")
+            self.scan_tab.set_scan_state(False)
+            
+            # Pointing 자동 실행
+            csv_path = result.get('csv_path_abs')
+            if csv_path:
+                print(f"[ComApp] Auto-computing pointing for: {csv_path}")
+                # Pointing 탭으로 전환 (선택 사항)
+                self.notebook.select(2)  # Pointing Tab index
+                self.pointing_compute(csv_path)
+            else:
+                print("[ComApp] No CSV path returned for auto-pointing")
+        else:
+             self.info_label.config(text="⏹️ 스캔 중지 (No result)")
+             self.scan_tab.set_scan_state(False)
     
     # ========== Manual Callbacks ==========
     def apply_move(self, pan, tilt, speed, acc):
@@ -275,7 +309,7 @@ class App(EventHandlersMixin, AppHelpersMixin):
 
 def main():
     root = Tk()
-    App(root).run()
+    ComApp(root).run()
 
 
 if __name__ == "__main__":

@@ -12,6 +12,8 @@ Modified for PTCamera_waveshare:
 """
 
 import cv2
+import os
+import re
 import numpy as np
 from numpy.linalg import norm
 from scipy.optimize import linear_sum_assignment  # ⭐ 헝가리안 알고리즘
@@ -273,8 +275,8 @@ class ObjectTracker:
                 candidate = all_candidates[cand_idx]
                 sim = similarity_matrix[obj_idx, cand_idx]
                 
-                # ⭐ 모든 후보에 대해 동일한 threshold (0.5) 적용
-                threshold = 0.5
+                # ⭐ 모든 후보에 대해 동일한 threshold (0.4) 적용
+                threshold = 0.4
                 
                 # 후보 소스 판단 (로깅용)
                 if cand_idx < len(direct_candidates):
@@ -303,18 +305,32 @@ class ObjectTracker:
                 obj['track_id'] = track_id
                 track_ids.append(track_id)
                 
-                # ⭐ 로그 생성 (간소화 버전)
+                # ⭐ 로그 생성 (모든 후보와의 비교 기록 - mot_scan_test_hungarian_final.py와 동일)
                 log_entry = {
                     'pan': pan,
                     'tilt': tilt,
                     'timestamp': timestamp,
                     'obj_idx': obj_idx,
                     'unique_id': obj['unique_id'],
-                    'assigned_id': track_id,
-                    'best_similarity': float(best_sim),
-                    'is_new_object': (best_candidate is None),
-                    'match_source': source  # 'direct', 'skip', or None
+                    'comparisons': []
                 }
+                
+                for candidate in all_candidates:
+                    sim = calc_cosine_similarity(obj['vec'], candidate['vec'])
+                    log_entry['comparisons'].append({
+                        'candidate_id': candidate['track_id'],
+                        'candidate_unique_id': candidate.get('unique_id', 'N/A'),
+                        'candidate_pan': candidate['frame_pan'],
+                        'candidate_tilt': candidate['frame_tilt'],
+                        'candidate_timestamp': candidate['frame_timestamp'],
+                        'similarity': float(sim)
+                    })
+                
+                log_entry['assigned_id'] = track_id
+                log_entry['best_similarity'] = float(best_sim)
+                log_entry['is_new_object'] = (best_candidate is None)
+                log_entry['match_source'] = source  # 'direct', 'skip', or None
+                
                 self.similarity_log.append(log_entry)
         
         # 현재 프레임 저장
@@ -329,122 +345,117 @@ class ObjectTracker:
     
     def _find_prev_candidates(self, current_pan, current_tilt):
         """
-        프레임 후보 검색 (⭐ 5개 프레임 버전):
-        1. n-1 (최근 1프레임): 같은 Pan, 같은 Tilt
-        2. n-2 (2프레임 전): 같은 Pan만
-        3. ⭐ 양방향 대각선: 각 방향에서 1개씩만 수집
-        
-        총 5개: Pan n-1, Tilt n-1, Pan n-2, 대각선↗, 대각선↙
+        프레임 후보 검색 (⭐ 5개 후보군 - 완전 공간 검색 버전):
+        1. n-1 (최근 1프레임)
+        2. n-2 (2프레임 전)
+        3. 바로 윗줄(Previous Row)에서 공간적으로 가장 가까운 3개:
+           - Vertical (Pan == Current)
+           - Diag Left (Pan < Current 중 최대)
+           - Diag Right (Pan > Current 중 최소)
         
         반환: {'direct': [...], 'skip': [...]}
         """
         if not self.frames:
             return {'direct': [], 'skip': []}
         
-        # n-1 프레임 (직접 이웃)
-        prev_pan_frame = None
-        prev_tilt_frame = None
+        # 1. n-1 & 2. n-2 프레임 (시간적 이웃)
+        frame_n1 = self.frames[-1] if len(self.frames) >= 1 else None
+        frame_n2 = self.frames[-2] if len(self.frames) >= 2 else None
         
-        # n-2 프레임 (프레임 건너뛰기)
-        skip_pan_frame = None
+        # 3. 바로 윗줄(Previous Row) 프레임들 수집
+        prev_row_frames = []
+        target_prev_tilt = None
         
-        # ⭐ 양방향 대각선 (Boustrophedon 스캔 대응)
-        # 둘 다 Tilt 아래 + Pan 방향이 반대
-        diagonal_increase = None  # 왼쪽 아래 (Pan < current, Tilt < current)
-        diagonal_decrease = None  # 오른쪽 아래 (Pan > current, Tilt < current)
-        
-        # 최근 프레임부터 역순 탐색
+        # 역순 탐색으로 바로 윗줄(Tilt가 다른 첫 줄)을 찾음
         for i in range(len(self.frames)):
-            prev_frame = self.frames[-(i+1)]
-            frame_pan = prev_frame['pan']
-            frame_tilt = prev_frame['tilt']
+            f = self.frames[-(i+1)]
             
-            # ⭐ n-1 프레임 검색
-            if i == 0:  # 가장 최근 프레임
-                # 같은 Pan, 다른 Tilt
-                if frame_pan == current_pan and frame_tilt != current_tilt and prev_pan_frame is None:
-                    prev_pan_frame = prev_frame
-                
-                # 같은 Tilt, 다른 Pan
-                if frame_tilt == current_tilt and frame_pan != current_pan and prev_tilt_frame is None:
-                    prev_tilt_frame = prev_frame
+            # 현재 줄(Tilt 같음)은 패스 (n-1, n-2에서 이미 처리됨)
+            if f['tilt'] == current_tilt:
+                continue
             
-            # ⭐ n-2 프레임 검색 (프레임 건너뛰기) - Pan만!
-            elif i == 1:  # 2프레임 전
-                # 같은 Pan, 다른 Tilt
-                if frame_pan == current_pan and frame_tilt != current_tilt and skip_pan_frame is None:
-                    skip_pan_frame = prev_frame
+            # 윗줄 발견
+            if target_prev_tilt is None:
+                target_prev_tilt = f['tilt']
             
-            # ⭐ 양방향 대각선 검색 (각 방향에서 1개씩만!)
-            if frame_pan != current_pan and frame_tilt != current_tilt:
-                # Pan 증가 방향 (→)
-                if frame_pan < current_pan and diagonal_increase is None:
-                    diagonal_increase = prev_frame
-                
-                # Pan 감소 방향 (←)
-                if frame_pan > current_pan and diagonal_decrease is None:
-                    diagonal_decrease = prev_frame
-            
-            # ⭐ 충분히 수집했으면 종료
-            if (skip_pan_frame is not None and 
-                diagonal_increase is not None and diagonal_decrease is not None):
+            # 같은 윗줄이면 수집
+            if f['tilt'] == target_prev_tilt:
+                prev_row_frames.append(f)
+            else:
+                # 더 윗줄(Previous Previous Row)이 나오면 종료
                 break
         
-        # ⭐ n-1 후보 수집 (direct)
+        # 수집된 윗줄 프레임 중에서 공간적으로 가장 가까운 3개 찾기
+        vertical_frame = None       # Pan == Current
+        diagonal_increase = None    # Pan < Current (Left)
+        diagonal_decrease = None    # Pan > Current (Right)
+        
+        # 거리가 가장 가까운 놈을 찾기 위한 변수
+        min_dist_inc = float('inf')
+        min_dist_dec = float('inf')
+        
+        for f in prev_row_frames:
+            f_pan = f['pan']
+            
+            # Vertical
+            if f_pan == current_pan:
+                vertical_frame = f
+            
+            # Diag Left (Pan < Current)
+            elif f_pan < current_pan:
+                dist = current_pan - f_pan
+                if dist < min_dist_inc:
+                    min_dist_inc = dist
+                    diagonal_increase = f
+            
+            # Diag Right (Pan > Current)
+            elif f_pan > current_pan:
+                dist = f_pan - current_pan
+                if dist < min_dist_dec:
+                    min_dist_dec = dist
+                    diagonal_decrease = f
+        
+        # 후보군 수집
         direct_candidates = []
-        
-        # Pan 방향
-        if prev_pan_frame is not None:
-            for obj in prev_pan_frame['objects']:
-                direct_candidates.append({
-                    **obj,
-                    'frame_pan': prev_pan_frame['pan'],
-                    'frame_tilt': prev_pan_frame['tilt'],
-                    'frame_timestamp': prev_pan_frame['timestamp']
-                })
-        
-        # Tilt 방향
-        if prev_tilt_frame is not None:
-            for obj in prev_tilt_frame['objects']:
-                direct_candidates.append({
-                    **obj,
-                    'frame_pan': prev_tilt_frame['pan'],
-                    'frame_tilt': prev_tilt_frame['tilt'],
-                    'frame_timestamp': prev_tilt_frame['timestamp']
-                })
-        
-        # ⭐ skip 후보 수집 (n-2 Pan + 양방향 대각선)
         skip_candidates = []
         
-        # n-2 Pan 방향만
-        if skip_pan_frame is not None:
-            for obj in skip_pan_frame['objects']:
-                skip_candidates.append({
+        # 1. n-1 (Direct)
+        if frame_n1:
+            for obj in frame_n1['objects']:
+                direct_candidates.append({
                     **obj,
-                    'frame_pan': skip_pan_frame['pan'],
-                    'frame_tilt': skip_pan_frame['tilt'],
-                    'frame_timestamp': skip_pan_frame['timestamp']
+                    'frame_pan': frame_n1['pan'],
+                    'frame_tilt': frame_n1['tilt'],
+                    'frame_timestamp': frame_n1['timestamp']
                 })
         
-        # ⭐ 양방향 대각선 (각 방향에서 1개씩)
-        if diagonal_increase is not None:
-            for obj in diagonal_increase['objects']:
+        # 나머지 4개는 Skip 후보로 통합
+        candidates_frames = []
+        if frame_n2: candidates_frames.append(frame_n2)
+        if vertical_frame: candidates_frames.append(vertical_frame)
+        if diagonal_increase: candidates_frames.append(diagonal_increase)
+        if diagonal_decrease: candidates_frames.append(diagonal_decrease)
+        
+        # 중복 제거 (n-1과 track_id 기준)
+        added_track_ids = set()
+        for cand in direct_candidates:
+            added_track_ids.add(cand['track_id'])
+            
+        for frame in candidates_frames:
+            if frame is frame_n1: continue
+            
+            for obj in frame['objects']:
+                if obj['track_id'] in added_track_ids:
+                    continue
+                
                 skip_candidates.append({
                     **obj,
-                    'frame_pan': diagonal_increase['pan'],
-                    'frame_tilt': diagonal_increase['tilt'],
-                    'frame_timestamp': diagonal_increase['timestamp']
+                    'frame_pan': frame['pan'],
+                    'frame_tilt': frame['tilt'],
+                    'frame_timestamp': frame['timestamp']
                 })
-        
-        if diagonal_decrease is not None:
-            for obj in diagonal_decrease['objects']:
-                skip_candidates.append({
-                    **obj,
-                    'frame_pan': diagonal_decrease['pan'],
-                    'frame_tilt': diagonal_decrease['tilt'],
-                    'frame_timestamp': diagonal_decrease['timestamp']
-                })
-        
+                added_track_ids.add(obj['track_id'])
+
         return {'direct': direct_candidates, 'skip': skip_candidates}
     
     def get_track_count(self):
@@ -582,4 +593,84 @@ class ObjectTracker:
         print(f"    병합된 검출: {merged_count}개")
         print(f"{'='*60}\n")
         
+        # 7. 병합 로그 저장 (메모리)
+        self.merge_log = {
+            'threshold': merge_threshold,
+            'min_detections': min_detections,
+            'total_tracks': len(tracks),
+            'valid_tracks': len(valid_tracks),
+            'excluded_tracks': {tid: len(objs) for tid, objs in small_tracks.items()},
+            'final_tracks': len(merge_groups),
+            'merged_count': merged_count,
+            'comparisons': [], # merge_log에 comparisons가 없으므로 빈 리스트 (실시간 로깅 특성상 생략 가능하거나 추가 필요)
+            'merge_groups': merge_groups
+        }
+        
         return merge_map
+
+    def save_similarity_log(self, output_path="similarity_log_live.txt"):
+        """유사도 로그를 텍스트 파일로 저장 (mot_scan_test_hungarian_final.py와 동일 포맷)"""
+        try:
+            os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
+            
+            with open(output_path, 'w', encoding='utf-8') as f:
+                f.write("=" * 80 + "\n")
+                f.write("MOT Similarity Log (Live Scan Version)\n")
+                f.write("=" * 80 + "\n\n")
+                
+                for entry in self.similarity_log:
+                    f.write(f"\n[Frame] Pan={entry['pan']:+4d}, Tilt={entry['tilt']:+3d}, "
+                           f"Timestamp={entry['timestamp']}, Object #{entry['obj_idx']}\n")
+                    f.write(f"  🆔 Unique ID: {entry['unique_id']}\n")
+                    f.write(f"  ✅ Assigned Track ID: {entry['assigned_id']} ")
+                    if entry['is_new_object']:
+                        f.write("(NEW OBJECT)\n")
+                    else:
+                        f.write(f"(Best Similarity: {entry['best_similarity']:.4f})\n")
+                    
+                    if entry['comparisons']:
+                        f.write(f"  🔍 Compared with {len(entry['comparisons'])} candidates:\n")
+                        # 유사도 높은 순으로 정렬
+                        sorted_comps = sorted(entry['comparisons'], 
+                                             key=lambda x: x['similarity'], reverse=True)
+                        for comp in sorted_comps:
+                            marker = "  ⭐" if comp['candidate_id'] == entry['assigned_id'] else "    "
+                            cand_uniq = comp.get('candidate_unique_id', 'N/A')
+                            f.write(f"{marker} Track ID {comp['candidate_id']:3d} "
+                                   f"[{cand_uniq}] "
+                                   f"(Pan={comp['candidate_pan']:+4d}, Tilt={comp['candidate_tilt']:+3d}) "
+                                   f"→ Sim: {comp['similarity']:.4f}\n")
+                    else:
+                        f.write(f"  ℹ️  No candidates (first detection)\n")
+                    
+                    f.write("-" * 80 + "\n")
+                
+                # 병합 로그 추가
+                if self.merge_log:
+                    f.write("\n" + "=" * 80 + "\n")
+                    f.write("🔄 Track 병합 정보 (Post-Processing)\n")
+                    f.write("=" * 80 + "\n\n")
+                    
+                    f.write(f"병합 설정:\n")
+                    f.write(f"  - Threshold: {self.merge_log.get('threshold', 'N/A')}\n")
+                    f.write(f"  - Min Detections: {self.merge_log.get('min_detections', 'N/A')}\n\n")
+                    
+                    f.write(f"통계:\n")
+                    f.write(f"  - 총 Track 수: {self.merge_log.get('total_tracks', 0)}개\n")
+                    f.write(f"  - 유효 Track: {self.merge_log.get('valid_tracks', 0)}개\n")
+                    excluded = self.merge_log.get('excluded_tracks', {})
+                    f.write(f"  - 제외 Track: {len(excluded)}개\n")
+                    f.write(f"  - 최종 Track: {self.merge_log.get('final_tracks', 0)}개\n")
+                    f.write(f"  - 병합된 검출: {self.merge_log.get('merged_count', 0)}개\n\n")
+                    
+                    if excluded:
+                        f.write(f"제외된 Track IDs:\n")
+                        for tid, count in excluded.items():
+                            f.write(f"  - Track {tid}: {count}개\n")
+                        f.write("\n")
+                    
+                    f.write("=" * 80 + "\n")
+                    # (실시간 버전은 병합 상세 로그 생략 또는 추후 추가)
+                    # merge_log에 comparisons 리스트가 없으므로 여기까지만 출력
+        except Exception as e:
+            print(f"❌ 로그 저장 실패: {e}")
