@@ -7,7 +7,7 @@ HSV + Grayscale 히스토그램 특징 추출 및 코사인 유사도 기반 매
 Modified for PTCamera_waveshare:
 - Grid: 11x11 (세밀한 특징, 5808차원)
 - Histogram: HSV [8,4] + Gray [16] = 48차원/cell (hungarian_final과 동일)
-- Threshold: 0.3 (모든 후보 동일, Com_650nm 방식)
+- Threshold: 0.5 (모든 후보 동일, 엄격한 매칭)
 - Image: LED OFF for feature extraction
 """
 
@@ -273,8 +273,8 @@ class ObjectTracker:
                 candidate = all_candidates[cand_idx]
                 sim = similarity_matrix[obj_idx, cand_idx]
                 
-                # ⭐ 모든 후보에 대해 동일한 threshold (0.3) 적용
-                threshold = 0.3
+                # ⭐ 모든 후보에 대해 동일한 threshold (0.5) 적용
+                threshold = 0.5
                 
                 # 후보 소스 판단 (로깅용)
                 if cand_idx < len(direct_candidates):

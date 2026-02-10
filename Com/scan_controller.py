@@ -118,6 +118,17 @@ class ScanController:
                         device=device
                     )
                     
+                    # ⭐ MOT 전에 confidence >= 0.5 필터링 (hungarian_final 기준)
+                    MOT_CONF_THRESHOLD = 0.5
+                    if boxes:
+                        filtered_indices = [i for i, score in enumerate(scores) if score >= MOT_CONF_THRESHOLD]
+                        if filtered_indices:
+                            boxes = [boxes[i] for i in filtered_indices]
+                            scores = [scores[i] for i in filtered_indices]
+                            classes = [classes[i] for i in filtered_indices]
+                        else:
+                            boxes = []
+                    
                     # MOT tracking
                     if boxes:
                         # Timestamp 생성 (pan, tilt 기반)

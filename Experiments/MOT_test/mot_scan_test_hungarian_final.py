@@ -33,13 +33,13 @@ except ImportError as e:
 MODEL_PATH = "yolov11m_diff.pt"
 
 # ⭐ 여기에 스캔 폴더 경로 입력! (예시)
-SCAN_FOLDER = r"C:\Users\gmlwn\OneDrive\바탕 화면\ICon2학년\2026_통신학회동계\captures_gui_20260107_181822"
+SCAN_FOLDER = r"C:\Users\gmlwn\OneDrive\바탕 화면\ICon1학년\OpticalWPT\PTCamera_waveshare\Captures\scan_20260211_014558"
 
 CONF_THRES = 0.50
 IOU_THRES = 0.45
 # ⭐ 고정 ROI 크기 (중심 기준)
 ROI_SIZE = 300  # 300x300 픽셀
-GRID_SIZE = (5, 5)  # Grid 분할 크기 (rows, cols)
+GRID_SIZE = (11, 11)  # Grid 분할 크기 (rows, cols)
 
 # =========================================================
 # 특징 추출 (HSV + Grayscale 결합)
@@ -891,34 +891,39 @@ class ObjectTracker:
 # =========================================================
 # 스캔 이미지 파싱 및 정렬
 # =========================================================
-def parse_scan_images(scan_folder):
-    """
-    스캔 폴더에서 이미지 파싱 (_ud 파일만)
-    Returns: [(pan, tilt, 'on'/'off', filepath, timestamp), ...]
-    """
-    folder = Path(scan_folder)
+def parse_scan_images(folder):
+    """스캔 폴더에서 LED ON/OFF 이미지 쌍 파싱 (현재 스캔 포맷)"""
+    folder = Path(folder)
     images = []
     
     for img_file in folder.glob("*.jpg"):
-        # ⭐ .ud (undistorted) 파일만 처리
-        if '.ud' not in img_file.name:
-            continue
-            
-        # 파일명 파싱: img_t+00_p+000_20260107_181924_352_led_on.ud.jpg
-        # 패턴: t[tilt]_p[pan]_[timestamp]_led_[on/off].ud.jpg
-        match = re.search(r't([+-]?\d+)_p([+-]?\d+)_(\d{8}_\d{6}_\d{3})_(led_on|led_off)\.ud', img_file.name)
+        # 파일명 파싱: scan_20260211_014558_t+00_p+000_led_off.jpg
+        # 패턴: scan_[date]_[time]_t[tilt]_p[pan]_led_[on/off].jpg
+        match = re.search(r't([+-]?\d+)_p([+-]?\d+)_(led_on|led_off)\.jpg', img_file.name)
         if not match:
             continue
         
         tilt = int(match.group(1))
         pan = int(match.group(2))
-        timestamp = match.group(3)  # '20251128_221105_941'
-        led_type = 'on' if 'led_on' in match.group(4) else 'off'
+        led_type = 'on' if 'led_on' in match.group(3) else 'off'
+        
+        # 타임스탬프는 파일명 앞부분에서 추출 (scan_20260211_014558_...)
+        timestamp_match = re.search(r'scan_(\d{8}_\d{6})', img_file.name)
+        if timestamp_match:
+            timestamp = timestamp_match.group(1)  # '20260211_014558'
+        else:
+            timestamp = '00000000_000000'  # fallback
         
         images.append((pan, tilt, led_type, str(img_file), timestamp))
     
-    # ⭐ 타임스탬프 기준 정렬 (실제 촬영 순서)
-    images.sort(key=lambda x: x[4])
+    # ⭐ Pan/Tilt 기준 정렬 (Boustrophedon 순서)
+    # Tilt 우선, 그 다음 Pan (짝수 Tilt는 오름차순, 홀수는 내림차순)
+    def sort_key(item):
+        pan, tilt, led_type, filepath, ts = item
+        # Tilt로 그룹화, Pan 방향은 Boustrophedon 고려하지 않고 단순 정렬
+        return (tilt, pan, led_type)
+    
+    images.sort(key=sort_key)
     return images
 
 # =========================================================

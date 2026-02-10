@@ -129,10 +129,10 @@ class App(EventHandlersMixin, AppHelpersMixin):
             "acc": 1.0
         })
         
-        # 5. IR-CUT Day Mode (필터 ON)
-        self.ctrl.send({"cmd": "ir_cut", "mode": "day"})
+        # 5. IR-CUT Normal Mode (가시광선)
+        self.ctrl.send({"cmd": "ir_cut", "mode": "night"})
         
-        print("[INIT] ✅ 초기화 완료: Preview=OFF, LED=0, Laser=OFF, Pan/Tilt=0,0, IR-CUT=Day")
+        print("[INIT] ✅ 초기화 완료: Preview=OFF, LED=0, Laser=OFF, Pan/Tilt=0,0, IR-CUT=Normal")
     
     # ========== Scan Callbacks ==========
     def start_scan(self, params):
@@ -242,10 +242,11 @@ class App(EventHandlersMixin, AppHelpersMixin):
         }
         self.ctrl.send(cmd)
         
-        if mode == "day":
-            self.info_label.config(text="☀️ Day Mode (IR 필터 ON)")
-        else:
-            self.info_label.config(text="🌙 Night Mode (IR 필터 OFF)")
+        # 실제 하드웨어 동작: day=IR통과, night=가시광선
+        if mode == "night":  # Normal 버튼
+            self.info_label.config(text="🔍 Normal Mode (가시광선)")
+        else:  # day → IR Mode 버튼
+            self.info_label.config(text="🔴 IR Mode (적외선)")
     
     def snap_capture(self):
         """Snap 캡처 - Preview 해상도 사용"""

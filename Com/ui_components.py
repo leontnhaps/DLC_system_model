@@ -245,10 +245,10 @@ class TestSettingsTab:
         
         ir_frame = Frame(self.frame)
         ir_frame.grid(row=row, column=0, columnspan=3, sticky="w", pady=5); row += 1
-        Button(ir_frame, text="☀️ Day Mode", command=lambda: self._on_ir_cut("day"),
-               bg="#FFE0B2", width=12).pack(side="left", padx=5)
-        Button(ir_frame, text="🌙 Night Mode", command=lambda: self._on_ir_cut("night"),
-               bg="#444", fg="white", width=12).pack(side="left", padx=5)
+        Button(ir_frame, text="🔍 Normal", command=lambda: self._on_ir_cut("night"),
+               width=10, bg="#9E9E9E", fg="white", font=("", 10, "bold")).pack(side="left", padx=5)
+        Button(ir_frame, text="🔴 IR Mode", command=lambda: self._on_ir_cut("day"),
+               width=10, bg="#E57373", fg="white", font=("", 10, "bold")).pack(side="left", padx=5)
         
         for c in range(3): self.frame.grid_columnconfigure(c, weight=1)
     
