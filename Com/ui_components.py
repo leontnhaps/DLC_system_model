@@ -85,8 +85,10 @@ class ScanTab:
         
         ops = Frame(self.frame)
         ops.grid(row=r, column=0, columnspan=4, sticky="w", pady=6)
-        Button(ops, text="Start Scan", command=self._on_start).pack(side="left", padx=4)
-        Button(ops, text="Stop Scan", command=self._on_stop).pack(side="left", padx=4)
+        self.btn_start = Button(ops, text="Start Scan", command=self._on_start)
+        self.btn_start.pack(side="left", padx=4)
+        self.btn_stop = Button(ops, text="Stop Scan", command=self._on_stop, state="disabled")
+        self.btn_stop.pack(side="left", padx=4)
         self.prog = ttk.Progressbar(ops, orient=HORIZONTAL, length=280, mode="determinate")
         self.prog.pack(side="left", padx=10)
         self.prog_lbl = Label(ops, text="0 / 0")
@@ -129,6 +131,15 @@ class ScanTab:
     def _on_stop(self):
         if self.callbacks.get('stop_scan'):
             self.callbacks['stop_scan']()
+            
+    def set_scan_state(self, is_scanning):
+        """스캔 중 버튼 상태 변경"""
+        if is_scanning:
+            self.btn_start.config(state="disabled")
+            self.btn_stop.config(state="normal")
+        else:
+            self.btn_start.config(state="normal")
+            self.btn_stop.config(state="disabled")
     
     def _on_scan_resolution_change(self, event=None):
         """Resolution combobox 변경 시 width/height 자동 설정"""
@@ -245,10 +256,10 @@ class TestSettingsTab:
         
         ir_frame = Frame(self.frame)
         ir_frame.grid(row=row, column=0, columnspan=3, sticky="w", pady=5); row += 1
-        Button(ir_frame, text="☀️ Day Mode", command=lambda: self._on_ir_cut("day"),
-               bg="#FFE0B2", width=12).pack(side="left", padx=5)
-        Button(ir_frame, text="🌙 Night Mode", command=lambda: self._on_ir_cut("night"),
-               bg="#444", fg="white", width=12).pack(side="left", padx=5)
+        Button(ir_frame, text="🔍 Normal", command=lambda: self._on_ir_cut("night"),
+               width=10, bg="#9E9E9E", fg="white", font=("", 10, "bold")).pack(side="left", padx=5)
+        Button(ir_frame, text="🔴 IR Mode", command=lambda: self._on_ir_cut("day"),
+               width=10, bg="#E57373", fg="white", font=("", 10, "bold")).pack(side="left", padx=5)
         
         for c in range(3): self.frame.grid_columnconfigure(c, weight=1)
     
@@ -304,16 +315,16 @@ class TestSettingsTab:
         if self.preview_enable.get():
             self._on_toggle()
     
-    def _on_snap(self):
-        if self.callbacks.get('snap_capture'):
-            self.callbacks['snap_capture']()
-    
     def _on_ir_cut(self, mode):
         if self.callbacks.get('set_ir_cut'):
             self.callbacks['set_ir_cut'](mode)
     
+    def _on_snap(self):
+        if self.callbacks.get('snap_capture'):
+            self.callbacks['snap_capture']()
+
     def _on_preview_resolution_change(self, event=None):
-        """Preview resolution combobox 변경 시 자동 적용"""
+        """Preview resolution combobox 변경 시 자동 적용 (Auto)"""
         res_map = {
             "VGA (640×480)": (640, 480),
             "1.3MP (1296×972)": (1296, 972),
@@ -328,3 +339,85 @@ class TestSettingsTab:
             # 프리뷰 중이면 자동 재시작
             if self.preview_enable.get():
                 self._on_toggle()
+    
+    def update_info(self, text):
+        """정보 라벨 업데이트"""
+        if hasattr(self, 'info_label'):
+            self.info_label.config(text=text)
+
+
+class PointingTab:
+    """Pointing 탭 UI"""
+    def __init__(self, parent, callbacks):
+        self.callbacks = callbacks
+        self.frame = parent
+        self._build()
+    
+    def _build(self):
+        # 변수들
+        self.point_csv_path = StringVar(value="")
+        
+        # CSV 선택
+        r = 0
+        Label(self.frame, text="CSV 파일:").grid(row=r, column=0, sticky="w", padx=(5,10), pady=5)
+        ttk.Entry(self.frame, textvariable=self.point_csv_path, width=40).grid(row=r, column=1, sticky="w", padx=2)
+        Button(self.frame, text="Browse", command=self._on_choose_csv, width=10).grid(row=r, column=2, sticky="w", padx=5)
+        r += 1
+        
+        # Compute 버튼
+        Button(self.frame, text="🔍 Compute Targets", command=self._on_compute, 
+               width=20, bg="#4CAF50", fg="white", font=("", 10, "bold")).grid(row=r, column=0, columnspan=3, pady=10)
+        r += 1
+        
+        # Track ID 버튼 영역
+        Label(self.frame, text="Targets:").grid(row=r, column=0, sticky="w", padx=(5,10), pady=5)
+        r += 1
+        
+        self.buttons_frame = Frame(self.frame)
+        self.buttons_frame.grid(row=r, column=0, columnspan=3, sticky="w", padx=10, pady=5)
+    
+    def _on_choose_csv(self):
+        if self.callbacks.get('pointing_choose_csv'):
+            self.callbacks['pointing_choose_csv']()
+    
+    def _on_compute(self):
+        if self.callbacks.get('pointing_compute'):
+            self.callbacks['pointing_compute']()
+    
+    def _create_target_buttons(self, targets):
+        """Track ID별 버튼 생성
+        
+        Args:
+            targets: {track_id: (pan, tilt), ...}
+        """
+        # 기존 버튼 제거
+        for widget in self.buttons_frame.winfo_children():
+            widget.destroy()
+        
+        if not targets:
+            Label(self.buttons_frame, text="No targets computed", fg="gray").pack()
+            return
+        
+        # Track ID별 버튼 생성
+        for track_id in sorted(targets.keys()):
+            pan, tilt = targets[track_id]
+            btn_text = f"ID {track_id}"
+            btn = Button(
+                self.buttons_frame,
+                text=btn_text,
+                command=lambda tid=track_id: self._on_move_to_target(tid),
+                width=12,
+                bg="#2196F3",
+                fg="white",
+                font=("", 9, "bold")
+            )
+            btn.pack(side="left", padx=5, pady=2)
+            
+            # Tooltip (Pan/Tilt 표시)
+            label = Label(self.buttons_frame, text=f"({pan}°, {tilt}°)", font=("", 8), fg="gray")
+            label.pack(side="left", padx=(0, 10))
+    
+    def _on_move_to_target(self, track_id):
+        if self.callbacks.get('move_to_target'):
+            self.callbacks['move_to_target'](track_id)
+    
