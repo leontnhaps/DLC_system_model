@@ -214,3 +214,34 @@ class YOLOProcessor:
             return "cpu"
         import torch
         return "cuda" if torch.cuda.is_available() else "cpu"
+
+    def detect(self, img, conf=0.25, iou=0.45):
+        """
+        Run detection on image using loaded model.
+        Returns:
+            list of [x1, y1, x2, y2, conf, cls]
+        """
+        if self._cached_model is None:
+            print("[YOLOProcessor] No model loaded! Call get_model() first.")
+            return []
+            
+        try:
+            device = self.get_device()
+            # Use tiled inference for better accuracy on small objects
+            boxes, scores, classes = predict_with_tiling(
+                self._cached_model, img, rows=2, cols=3, 
+                conf=conf, iou=iou, device=device
+            )
+            
+            results = []
+            for box, score, cls in zip(boxes, scores, classes):
+                x1, y1, w, h = box
+                x2 = x1 + w
+                y2 = y1 + h
+                results.append([float(x1), float(y1), float(x2), float(y2), float(score), int(cls)])
+                
+            return results
+            
+        except Exception as e:
+            print(f"[YOLOProcessor] Detection failed: {e}")
+            return []

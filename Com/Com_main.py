@@ -14,6 +14,7 @@ from app_helpers import AppHelpersMixin
 from ui_components import PreviewFrame, ScanTab, TestSettingsTab, PointingTab
 from scan_controller import ScanController
 from yolo_utils import YOLOProcessor
+import threading
 
 SERVER_HOST = "127.0.0.1"
 GUI_CTRL_PORT = 7600
@@ -72,7 +73,8 @@ class ComApp(EventHandlersMixin, PointingHandlerMixin, AppHelpersMixin):
         pointing_callbacks = {
             'pointing_choose_csv': self.pointing_choose_csv,
             'pointing_compute': self.pointing_compute,
-            'move_to_target': self.move_to_target
+            'move_to_target': self.move_to_target,
+            'stop_aiming': self.stop_aiming
         }
         self.pointing_tab = PointingTab(tab_pointing, pointing_callbacks)
         
@@ -94,6 +96,14 @@ class ComApp(EventHandlersMixin, PointingHandlerMixin, AppHelpersMixin):
         # 저장 디렉토리 생성
         SAVE_DIR.mkdir(exist_ok=True)
         
+        # YOLO 로드
+        try:
+            self.yolo = YOLOProcessor()
+            print("[ComApp] YOLO 모델 로드 완료")
+        except Exception as e:
+            print(f"[ComApp] YOLO 로드 실패 (무시 가능): {e}")
+            self.yolo = None  # 없어도 앱은 실행되게
+
         # 레이저 상태
         self.laser_state = False
         
@@ -105,6 +115,10 @@ class ComApp(EventHandlersMixin, PointingHandlerMixin, AppHelpersMixin):
         
         # Scan Controller
         self.scan_ctrl = ScanController(SAVE_DIR, self.yolo_processor)
+
+        # Pointing related initializations (from PointingHandlerMixin)
+        self._pointing_gains = {}
+        self._pointing_img_event = threading.Event()
         
         # Frame count (for preview)
         self.frame_count = 0
@@ -286,7 +300,11 @@ class ComApp(EventHandlersMixin, PointingHandlerMixin, AppHelpersMixin):
         """Snap 캡처 - Preview 해상도 사용"""
         w = self.test_tab.preview_w.get()
         h = self.test_tab.preview_h.get()
-        print(f"[SNAP] Capturing {w}x{h}")
+        
+        # 노출 제어 파라미터 가져오기
+        shutter, gain = self.test_tab.get_exposure_params()
+        
+        print(f"[SNAP] Capturing {w}x{h}, Shutter={shutter}, Gain={gain}")
         
         # 타임스탬프
         ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -297,7 +315,9 @@ class ComApp(EventHandlersMixin, PointingHandlerMixin, AppHelpersMixin):
             "width": w,
             "height": h,
             "quality": 95,
-            "save": f"snap_{ts}.jpg"
+            "save": f"snap_{ts}.jpg",
+            "shutter_speed": shutter,
+            "analogue_gain": gain
         }
         self.ctrl.send(cmd)
         

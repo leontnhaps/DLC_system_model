@@ -85,6 +85,15 @@ class EventHandlersMixin:
         """저장된 이미지 처리"""
         name, data = payload
         
+        # ⭐ Pointing 조준 중이면 이미지를 pointing handler로 전달
+        if hasattr(self, '_aiming_active') and self._aiming_active:
+            if name.startswith("pointing_"):
+                print(f"[POINTING_IMG] Routing to pointing handler: {name}")
+                self._on_pointing_image_received(name, data)
+                # 프리뷰에도 표시
+                self._set_preview(data)
+                return
+        
         # Scan 이미지 자동 저장 (ScanController 사용)
         if self.scan_ctrl.is_active():
             saved_path = self.scan_ctrl.save_image(name, data)
