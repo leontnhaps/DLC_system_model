@@ -227,5 +227,6 @@ mot_output/**/*.log
 mot_output_*/**/*.txt
 mot_output_*/**/*.log
 
+Captures/**
 # CSV files
 *.csv
