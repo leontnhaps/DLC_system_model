@@ -10,6 +10,8 @@ import numpy as np
 import cv2
 from tkinter import filedialog
 from collections import defaultdict
+import datetime
+import os
 
 
 # ========== Constants ==========
@@ -193,13 +195,14 @@ class PointingHandlerMixin:
                     sum_w_h = sum(d['N'] for d in fits_h.values())
                     avg_a = sum_a_w / sum_w_h if sum_w_h > 0 else 0.0
                     if abs(avg_a) > 1e-9:
-                        k_pan = abs(1.0 / avg_a)
+                        # 오차 보정을 위해 -1.0/slope (Negative Feedback)
+                        k_pan = -1.0 / avg_a
                 if fits_v:
                     sum_e_w = sum(d['e'] * d['N'] for d in fits_v.values())
                     sum_w_v = sum(d['N'] for d in fits_v.values())
                     avg_e = sum_e_w / sum_w_v if sum_w_v > 0 else 0.0
                     if abs(avg_e) > 1e-9:
-                        k_tilt = abs(1.0 / avg_e)
+                        k_tilt = -1.0 / avg_e
                 
                 # Track ID별 결과 저장
                 if pan_target is not None and tilt_target is not None:
@@ -349,10 +352,10 @@ class PointingHandlerMixin:
         k_pan, k_tilt = CENTERING_GAIN_PAN, CENTERING_GAIN_TILT
         if fits_h:
             avg_a = sum(d['a'] * d['N'] for d in fits_h.values()) / sum(d['N'] for d in fits_h.values())
-            if abs(avg_a) > 1e-9: k_pan = abs(1.0 / avg_a)
+            if abs(avg_a) > 1e-9: k_pan = -1.0 / avg_a
         if fits_v:
             avg_e = sum(d['e'] * d['N'] for d in fits_v.values()) / sum(d['N'] for d in fits_v.values())
-            if abs(avg_e) > 1e-9: k_tilt = abs(1.0 / avg_e)
+            if abs(avg_e) > 1e-9: k_tilt = -1.0 / avg_e
         
         return {
             'target': (round(pan_t, 3), round(tilt_t, 3)),
@@ -474,6 +477,12 @@ class PointingHandlerMixin:
             # UI 상태 업데이트
             self._update_aiming_status(track_id, 0, "초기 이동 완료, 조준 시작...")
             
+            # [LOG] 세션 로깅 디렉토리 생성
+            now_str = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            log_dir = f"Captures/Pointing/{now_str}_Track_{track_id}"
+            os.makedirs(log_dir, exist_ok=True)
+            print(f"[Pointing] Logging to: {log_dir}")
+            
             iteration = 0
             while self._aiming_active:
                 iteration += 1
@@ -502,6 +511,13 @@ class PointingHandlerMixin:
                 if img_led_off is None:
                     print("[Pointing] ⚠️ LED OFF 이미지 수신 실패")
                     continue
+                
+                # [LOG] LED 이미지 저장
+                try:
+                    cv2.imwrite(f"{log_dir}/iter_{iteration}_led_on.jpg", img_led_on)
+                    cv2.imwrite(f"{log_dir}/iter_{iteration}_led_off.jpg", img_led_off)
+                except Exception as e:
+                    print(f"[Pointing] Log save failed: {e}")
                 
                 # ⭐ 타겟 찾기 호출
                 target_cx, target_cy, bbox, all_bboxes = self._find_object_center(img_led_on, img_led_off)
@@ -534,6 +550,13 @@ class PointingHandlerMixin:
                 if img_laser_off is None:
                     print("[Pointing] ⚠️ Laser OFF 이미지 수신 실패")
                     continue
+
+                # [LOG] Laser 이미지 저장
+                try:
+                    cv2.imwrite(f"{log_dir}/iter_{iteration}_laser_on.jpg", img_laser_on)
+                    cv2.imwrite(f"{log_dir}/iter_{iteration}_laser_off.jpg", img_laser_off)
+                except Exception as e:
+                    print(f"[Pointing] Log save failed: {e}")
                 
                 # ⭐ 레이저 찾기 호출
                 laser_pos = self._find_laser_center(img_laser_on, img_laser_off, exclude_bboxes=all_bboxes)
@@ -556,7 +579,7 @@ class PointingHandlerMixin:
                 self._draw_debug_image(
                     img_led_on, target_cx, target_cy, laser_pos, bbox, 
                     all_bboxes, err_x, err_y, iteration,
-                    img_laser_on, img_laser_off
+                    img_laser_on, img_laser_off, log_dir
                 )
                 
                 self._update_aiming_status(
@@ -600,6 +623,20 @@ class PointingHandlerMixin:
                     "acc": 1.0
                 })
                 
+                # [LOG] 데이터 기록
+                try:
+                    with open(f"{log_dir}/log.txt", "a", encoding="utf-8") as f:
+                        log_line = (f"Iter {iteration}: "
+                                    f"Target=({target_cx:.1f}, {target_cy:.1f}), "
+                                    f"Laser=({laser_pos[0]:.1f}, {laser_pos[1]:.1f}), "
+                                    f"Err=({err_x:.1f}, {err_y:.1f}), Mag={err_mag:.1f}, "
+                                    f"Correction=({d_pan:.3f}, {d_tilt:.3f}), "
+                                    f"Next=({next_pan:.3f}, {next_tilt:.3f}), "
+                                    f"Gain=({k_pan:.5f}, {k_tilt:.5f})\n")
+                        f.write(log_line)
+                except Exception as e:
+                    print(f"[Pointing] Log write failed: {e}")
+                
                 # 이동 안정화 대기
                 time.sleep(settle)
         
@@ -629,9 +666,9 @@ class PointingHandlerMixin:
     
     def _draw_debug_image(self, base_img, target_cx, target_cy, laser_pos, 
                           best_bbox, all_bboxes, err_x, err_y, iteration,
-                          img_laser_on=None, img_laser_off=None):
+                          img_laser_on=None, img_laser_off=None, log_dir=None):
         """
-        디버그 시각화 이미지 생성 → Pointing 탭에 표시
+        디버그 시각화 이미지 생성 → Pointing 탭에 표시 + 로깅
         """
         try:
             debug = base_img.copy()
@@ -752,6 +789,13 @@ class PointingHandlerMixin:
                 laser_crop = laser_vis[y1l:y2l, x1l:x2l]
                 self.root.after(0, lambda img=laser_crop.copy(): self._show_laser_diff(img))
             
+            # [LOG] 디버그 이미지 저장
+            if log_dir:
+                try:
+                    cv2.imwrite(f"{log_dir}/iter_{iteration}_debug.jpg", debug)
+                except Exception as e:
+                    print(f"[Pointing] Debug image save failed: {e}")
+            
         except Exception as e:
             print(f"[Pointing] Debug 이미지 생성 오류: {e}")
     
@@ -802,11 +846,15 @@ class PointingHandlerMixin:
     # ========== Helper Functions (Missing Re-added) ==========
 
     def _find_object_center(self, img_led_on, img_led_off):
-        """타겟(반사판) 중심 찾기"""
+        """타겟(반사판) 중심 찾기 - Scan과 동일하게 diff 기반"""
         if img_led_on is None or img_led_off is None:
             return None, None, None, None
 
-        # 1. YOLO Detection
+        # 1) Scan과 동일: LED ON/OFF 차분(diff)
+        diff = cv2.absdiff(img_led_on, img_led_off)
+
+        # 2) YOLO Detection은 diff에 대해 수행
+        results = []
         if hasattr(self, 'yolo') and self.yolo:
             # 모델 로드 (없으면 로드 시도)
             if not self.yolo._cached_model:
@@ -814,38 +862,62 @@ class PointingHandlerMixin:
                     model_path = self.scan_tab.yolo_weights.get()
                     if model_path:
                         self.yolo.get_model(model_path)
-            results = self.yolo.detect(img_led_on)
+
+            # Scan 쪽과 최대한 동일한 파라미터
+            results = self.yolo.detect(diff, conf=0.20, iou=0.45)
         else:
             results = []
-        
+
         all_bboxes = []
         target_bbox = None
         target_center = None
-        
-        H, W = img_led_on.shape[:2]
+
+        H, W = diff.shape[:2]
         center_x, center_y = W // 2, H // 2
         min_dist = float('inf')
 
-        # 2. 가장 중앙에 가까운 객체 선택
-        for r in results:
+        # 3) conf>=0.5 후보가 있으면 우선 사용 (없으면 전체 사용)
+        use_results = [r for r in results if len(r) >= 6 and float(r[4]) >= 0.5] or results
+
+        # 4) 가장 중앙에 가까운 객체 선택 (기존 로직 유지)
+        for r in use_results:
             x1, y1, x2, y2, conf, cls_id = r
             w = x2 - x1
             h = y2 - y1
             cx = x1 + w / 2
             cy = y1 + h / 2
-            
+
             all_bboxes.append((int(x1), int(y1), int(w), int(h)))
-            
-            # 화면 중심과의 거리
-            dist = ((cx - center_x)**2 + (cy - center_y)**2)**0.5
-            
+
+            dist = ((cx - center_x) ** 2 + (cy - center_y) ** 2) ** 0.5
             if dist < min_dist:
                 min_dist = dist
                 target_bbox = (int(x1), int(y1), int(w), int(h))
                 target_center = (cx, cy)
 
+        # 5) YOLO 실패 시: diff에서 blob 기반 fallback (현장 안정성)
         if target_center is None:
-            print("[Pointing] ⚠️ YOLO: 타겟 검출 실패")
+            try:
+                gray = cv2.cvtColor(diff, cv2.COLOR_BGR2GRAY)
+                # 너무 약하면 20~50 사이로 조정 가능
+                _, mask = cv2.threshold(gray, 20, 255, cv2.THRESH_BINARY)
+                mask = cv2.medianBlur(mask, 5)
+
+                fc = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                cnts = fc[0] if len(fc) == 2 else fc[1]
+
+                if cnts:
+                    c = max(cnts, key=cv2.contourArea)
+                    if cv2.contourArea(c) > 30:  # 작은 노이즈 제거
+                        x, y, w, h = cv2.boundingRect(c)
+                        cx = x + w / 2.0
+                        cy = y + h / 2.0
+                        all_bboxes = [(int(x), int(y), int(w), int(h))]
+                        return cx, cy, (int(x), int(y), int(w), int(h)), all_bboxes
+            except Exception:
+                pass
+
+            print("[Pointing] ⚠️ YOLO(diff): 타겟 검출 실패")
             return None, None, None, all_bboxes
 
         return target_center[0], target_center[1], target_bbox, all_bboxes
