@@ -21,6 +21,7 @@ CONVERGENCE_TOL_PX = 7       # 수렴 판정 임계값 (px)
 OBJECT_SIZE_CM = 5.0         # 객체 크기 (cm) - offset 계산용
 TARGET_OFFSET_CM = -9.0      # 객체 중심 아래 9cm
 LASER_DIFF_THRESHOLD = 150   # 레이저 diff threshold (산란광 제거)
+MAX_STEP_DEG = 5.0           # 최대 보정 각도 (deg/step)
 
 
 class PointingHandlerMixin:
@@ -195,14 +196,13 @@ class PointingHandlerMixin:
                     sum_w_h = sum(d['N'] for d in fits_h.values())
                     avg_a = sum_a_w / sum_w_h if sum_w_h > 0 else 0.0
                     if abs(avg_a) > 1e-9:
-                        # 오차 보정을 위해 -1.0/slope (Negative Feedback)
-                        k_pan = -1.0 / avg_a
+                        k_pan = abs(1.0 / avg_a)
                 if fits_v:
                     sum_e_w = sum(d['e'] * d['N'] for d in fits_v.values())
                     sum_w_v = sum(d['N'] for d in fits_v.values())
                     avg_e = sum_e_w / sum_w_v if sum_w_v > 0 else 0.0
                     if abs(avg_e) > 1e-9:
-                        k_tilt = -1.0 / avg_e
+                        k_tilt = abs(1.0 / avg_e)
                 
                 # Track ID별 결과 저장
                 if pan_target is not None and tilt_target is not None:
@@ -352,10 +352,10 @@ class PointingHandlerMixin:
         k_pan, k_tilt = CENTERING_GAIN_PAN, CENTERING_GAIN_TILT
         if fits_h:
             avg_a = sum(d['a'] * d['N'] for d in fits_h.values()) / sum(d['N'] for d in fits_h.values())
-            if abs(avg_a) > 1e-9: k_pan = -1.0 / avg_a
+            if abs(avg_a) > 1e-9: k_pan = abs(1.0 / avg_a)
         if fits_v:
             avg_e = sum(d['e'] * d['N'] for d in fits_v.values()) / sum(d['N'] for d in fits_v.values())
-            if abs(avg_e) > 1e-9: k_tilt = -1.0 / avg_e
+            if abs(avg_e) > 1e-9: k_tilt = abs(1.0 / avg_e)
         
         return {
             'target': (round(pan_t, 3), round(tilt_t, 3)),
@@ -526,7 +526,15 @@ class PointingHandlerMixin:
                     all_bboxes = []
                     continue
                 
-                print(f"[Pointing] ✅ Object target: ({target_cx:.1f}, {target_cy:.1f})")
+                # 타겟 오프셋 적용 (객체 중심 아래 9cm)
+                obj_cx_raw, obj_cy_raw = target_cx, target_cy
+                if bbox:
+                    bx, by, bw, bh = bbox
+                    px_per_cm = bw / OBJECT_SIZE_CM
+                    target_cy = target_cy + abs(TARGET_OFFSET_CM) * px_per_cm
+                    print(f"[Pointing] Target offset: {TARGET_OFFSET_CM}cm → +{abs(TARGET_OFFSET_CM) * px_per_cm:.1f}px")
+                
+                print(f"[Pointing] ✅ Object center: ({obj_cx_raw:.1f}, {obj_cy_raw:.1f}) → Target: ({target_cx:.1f}, {target_cy:.1f})")
                 
                 # ---- Step 2: Laser Center Detection (IR Mode 유지) ----
                 # Manual Exposure 사용 (레이저 점만 선명하게)
@@ -967,7 +975,9 @@ class PointingHandlerMixin:
         return (roi_cx + roi_x1, roi_cy + roi_y1)
 
     def _calculate_angle_delta(self, err_x, err_y, k_pan, k_tilt):
-        """각도 변환 헬퍼"""
+        """각도 변환 헬퍼 (Com_650nm 방식: tilt 부호 반전 + max step 클램핑)"""
         d_pan = err_x * k_pan
-        d_tilt = err_y * k_tilt
+        d_tilt = -err_y * k_tilt
+        d_pan = max(min(d_pan, MAX_STEP_DEG), -MAX_STEP_DEG)
+        d_tilt = max(min(d_tilt, MAX_STEP_DEG), -MAX_STEP_DEG)
         return d_pan, d_tilt
