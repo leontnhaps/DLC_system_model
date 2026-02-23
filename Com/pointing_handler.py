@@ -720,6 +720,11 @@ class PointingHandlerMixin:
                         (30, 50), cv2.FONT_HERSHEY_SIMPLEX, 1.0, color, 2)
             cv2.putText(debug, f"Tol: {CONVERGENCE_TOL_PX}px",
                         (30, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (200, 200, 200), 2)
+            # 현재 Pan/Tilt 표시
+            cur_pan = getattr(self, '_curr_pan', 0.0)
+            cur_tilt = getattr(self, '_curr_tilt', 0.0)
+            cv2.putText(debug, f"Pan: {cur_pan:.2f}  Tilt: {cur_tilt:.2f}",
+                        (30, 130), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 200, 100), 2)
             
             # 400x400 Crop (타겟 중심)
             crop_half = 200
@@ -742,13 +747,11 @@ class PointingHandlerMixin:
                 # 2. Threshold (계산 로직과 동일하게 50)
                 _, laser_mask = cv2.threshold(laser_gray, 50, 255, cv2.THRESH_BINARY)
                 
-                # 3. Masking (계산 로직과 동일하게 제외 영역 블랙 처리)
+                # 3. Masking (객체 영역 제거)
                 if all_bboxes:
                     for (mx, my, mw, mh) in all_bboxes:
-                        # 좌표 정수 변환
                         x1, y1 = int(mx), int(my)
                         x2, y2 = int(mx+mw), int(my+mh)
-                        # 이미지 범위 클램핑
                         x1 = max(0, x1); y1 = max(0, y1)
                         x2 = min(W, x2); y2 = min(H, y2)
                         
@@ -953,7 +956,7 @@ class PointingHandlerMixin:
         gray = cv2.cvtColor(diff, cv2.COLOR_BGR2GRAY)
         _, mask = cv2.threshold(gray, 40, 255, cv2.THRESH_BINARY)
         
-        # 마스킹
+        # 마스킹 (객체 영역 제거)
         if exclude_bboxes:
             for (bx, by, bw, bh) in exclude_bboxes:
                 rx1 = max(0, bx - roi_x1)
