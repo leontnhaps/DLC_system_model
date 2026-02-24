@@ -376,6 +376,13 @@ class PointingHandlerMixin:
         if hasattr(self, '_aiming_active') and self._aiming_active:
             print(f"[Pointing] 이미 조준 중입니다. 완료될 때까지 대기하세요.")
             return
+
+        # Aiming 시작 전 Preview 상태 저장 (종료/중단 시 복구용)
+        self._aiming_restore_preview = bool(getattr(self, 'preview_active', False))
+        if self._aiming_restore_preview and hasattr(self, '_get_preview_cfg'):
+            self._aiming_preview_cfg = self._get_preview_cfg()
+        else:
+            self._aiming_preview_cfg = None
         
         pan_t, tilt_t = self.computed_targets[track_id]
         
@@ -395,6 +402,7 @@ class PointingHandlerMixin:
         
         # 3. 정밀 조준 Thread 시작
         self._aiming_active = True
+        self._aiming_cancel_event = threading.Event()
         self._aiming_track_id = track_id
         self._curr_pan = pan_t
         self._curr_tilt = tilt_t
@@ -405,11 +413,38 @@ class PointingHandlerMixin:
         
         t = threading.Thread(target=self._fine_aim_thread, args=(track_id,), daemon=True)
         t.start()
+
+    def _restore_preview_after_aiming(self, reason="aiming"):
+        """Aiming 종료/중단 후 Preview 복구 (시작 전 ON이었던 경우만)"""
+        if not getattr(self, '_aiming_restore_preview', False):
+            return
+
+        # 사용자가 중간에 직접 OFF했다면 복구하지 않음
+        if not getattr(self, 'preview_active', False):
+            self._aiming_restore_preview = False
+            self._aiming_preview_cfg = None
+            return
+
+        cfg = getattr(self, '_aiming_preview_cfg', None)
+        self._aiming_restore_preview = False
+        self._aiming_preview_cfg = None
+
+        def _do_restore():
+            if hasattr(self, '_restore_preview'):
+                self._restore_preview(cfg, reason=reason)
+            elif hasattr(self, '_restart_preview'):
+                self._restart_preview()
+
+        # Pi snap thread 정리 시간을 조금 준 뒤 복구
+        self.root.after(400, _do_restore)
     
     def _snap_and_wait(self, label, timeout=10.0, shutter_speed=None, analogue_gain=None):
         """
         Snap 명령 전송 후 이미지 수신 대기 (Thread-blocking)
         """
+        if not getattr(self, '_aiming_active', False):
+            return None
+
         self._pointing_img_event.clear()
         self._pointing_img_data = None
         
@@ -433,13 +468,32 @@ class PointingHandlerMixin:
             cmd["analogue_gain"] = float(analogue_gain)
             
         self.ctrl.send(cmd)
-        
-        # 이미지 수신 대기
-        if self._pointing_img_event.wait(timeout=timeout):
-            return self._pointing_img_data
-        else:
-            print(f"[Pointing] ⚠️ Snap timeout: {label}")
-            return None
+
+        # 이미지 수신 대기 (stop_aiming 즉시 반영을 위해 short-poll)
+        deadline = time.monotonic() + float(timeout)
+        poll_s = 0.1
+        while True:
+            if not getattr(self, '_aiming_active', False):
+                print(f"[Pointing] Snap wait cancelled (inactive): {label}")
+                return None
+
+            cancel_evt = getattr(self, '_aiming_cancel_event', None)
+            if cancel_evt is not None and cancel_evt.is_set():
+                print(f"[Pointing] Snap wait cancelled (event): {label}")
+                return None
+
+            remain = deadline - time.monotonic()
+            if remain <= 0:
+                print(f"[Pointing] ⚠️ Snap timeout: {label}")
+                return None
+
+            if self._pointing_img_event.wait(timeout=min(poll_s, remain)):
+                # stop 이후 set()된 이벤트일 수 있으므로 한 번 더 체크
+                if not getattr(self, '_aiming_active', False):
+                    return None
+                if cancel_evt is not None and cancel_evt.is_set():
+                    return None
+                return self._pointing_img_data
     
     def _on_pointing_image_received(self, name, data):
         """
@@ -657,6 +711,7 @@ class PointingHandlerMixin:
         finally:
             self._aiming_active = False
             self._aiming_track_id = None
+            self._restore_preview_after_aiming(reason="aiming-end")
             print(f"[Pointing] Fine-aim Thread 종료")
     
     def _update_aiming_status(self, track_id, iteration, message):
@@ -850,6 +905,11 @@ class PointingHandlerMixin:
         """조준 중단"""
         if hasattr(self, '_aiming_active') and self._aiming_active:
             self._aiming_active = False
+            if hasattr(self, '_aiming_cancel_event'):
+                self._aiming_cancel_event.set()
+            if hasattr(self, '_pointing_img_event'):
+                # _snap_and_wait 즉시 해제
+                self._pointing_img_event.set()
             self.ctrl.send({"cmd": "laser", "value": 0})
             self.ctrl.send({"cmd": "led", "value": 0})
             print("[Pointing] 조준 중단됨")
