@@ -366,7 +366,7 @@ class PointingHandlerMixin:
     
     def move_to_target(self, track_id):
         """
-        특정 track_id의 계산된 pan/tilt로 카메라 이동 후 정밀 조준 시작
+        특정 track_id의 계산된 pan/tilt로 초기 위치 이동만 수행
         """
         if not hasattr(self, 'computed_targets') or track_id not in self.computed_targets:
             print(f"[Pointing] Track {track_id} 타깃 없음. 먼저 계산하세요")
@@ -377,30 +377,59 @@ class PointingHandlerMixin:
             print(f"[Pointing] 이미 조준 중입니다. 완료될 때까지 대기하세요.")
             return
 
+        pan_t, tilt_t = self.computed_targets[track_id]
+
+        # Start 버튼에서 사용할 현재 선택 타깃 저장
+        self._selected_track_id = track_id
+        self._curr_pan = pan_t
+        self._curr_tilt = tilt_t
+
+        print(f"[Pointing] Track {track_id} 선택. 초기 위치로 이동: pan={pan_t}°, tilt={tilt_t}°")
+
+        # 초기 이동만 수행
+        spd = 100
+        acc = 1.0
+        self.ctrl.send({"cmd": "move", "pan": pan_t, "tilt": tilt_t, "speed": spd, "acc": acc})
+        print(f"[Pointing] 초기 이동 명령 전송 완료. Start Aiming 대기 중")
+
+    def start_aiming(self, track_id=None):
+        """
+        선택된 track_id에 대해 정밀 조준 알고리즘 시작
+        """
+        if track_id is None:
+            track_id = getattr(self, '_selected_track_id', None)
+        else:
+            self._selected_track_id = track_id
+
+        if track_id is None:
+            print("[Pointing] Start 실패: 선택된 타깃이 없습니다")
+            return False
+
+        if not hasattr(self, 'computed_targets') or track_id not in self.computed_targets:
+            print(f"[Pointing] Start 실패: Track {track_id} 타깃 없음")
+            return False
+
+        if hasattr(self, '_aiming_active') and self._aiming_active:
+            print("[Pointing] 이미 조준 중입니다. 완료될 때까지 대기하세요.")
+            return False
+
+        pan_t, tilt_t = self.computed_targets[track_id]
+
         # Aiming 시작 전 Preview 상태 저장 (종료/중단 시 복구용)
         self._aiming_restore_preview = bool(getattr(self, 'preview_active', False))
         if self._aiming_restore_preview and hasattr(self, '_get_preview_cfg'):
             self._aiming_preview_cfg = self._get_preview_cfg()
         else:
             self._aiming_preview_cfg = None
-        
-        pan_t, tilt_t = self.computed_targets[track_id]
-        
+
         print(f"[Pointing] ===== Track {track_id} Fine-Aiming 시작 =====")
-        print(f"[Pointing] 초기 위치: pan={pan_t}°, tilt={tilt_t}°")
-        
-        # 1. IR Mode로 전환 (IR Laser 가시화)
+        print(f"[Pointing] 기준 위치: pan={pan_t}°, tilt={tilt_t}°")
+
+        # IR Mode로 전환 (IR Laser 가시화)
         print("[Pointing] IR Mode로 전환...")
         self.set_ir_cut("day")  # day = IR 필터 해제 → IR 레이저 보임
         time.sleep(0.5)
-        
-        # 2. 초기 이동
-        spd = 100
-        acc = 1.0
-        self.ctrl.send({"cmd": "move", "pan": pan_t, "tilt": tilt_t, "speed": spd, "acc": acc})
-        print(f"[Pointing] 초기 이동 명령 전송: pan={pan_t}°, tilt={tilt_t}°")
-        
-        # 3. 정밀 조준 Thread 시작
+
         self._aiming_active = True
         self._aiming_cancel_event = threading.Event()
         self._aiming_track_id = track_id
@@ -413,6 +442,7 @@ class PointingHandlerMixin:
         
         t = threading.Thread(target=self._fine_aim_thread, args=(track_id,), daemon=True)
         t.start()
+        return True
 
     def _restore_preview_after_aiming(self, reason="aiming"):
         """Aiming 종료/중단 후 Preview 복구 (시작 전 ON이었던 경우만)"""

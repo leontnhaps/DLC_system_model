@@ -453,6 +453,17 @@ class PointingTab:
         self.aim_status_label = Label(self.frame, text="", font=("", 10), fg="#333")
         self.aim_status_label.grid(row=r, column=0, columnspan=3, sticky="w", padx=10, pady=5)
         r += 1
+
+        # 선택된 타깃에 대해 Start로 정밀 조준 시작
+        self._selected_track_id = None
+        self.btn_start_aim = Button(
+            self.frame, text="▶ Start Aiming",
+            command=self._on_start_aiming,
+            width=15, bg="#4CAF50", fg="white",
+            font=("", 10, "bold"), state="disabled"
+        )
+        self.btn_start_aim.grid(row=r, column=0, columnspan=3, pady=5)
+        r += 1
         
         # Stop Aiming 버튼
         self.btn_stop_aim = Button(self.frame, text="⛔ Stop Aiming", 
@@ -502,6 +513,8 @@ class PointingTab:
         if self.callbacks.get('stop_aiming'):
             self.callbacks['stop_aiming']()
         self.btn_stop_aim.config(state="disabled")
+        if self._selected_track_id is not None:
+            self.btn_start_aim.config(state="normal")
         self.aim_status_label.config(text="⛔ 조준 중단됨", fg="red")
     
     def _create_target_buttons(self, targets):
@@ -513,6 +526,12 @@ class PointingTab:
         # 기존 버튼 제거
         for widget in self.buttons_frame.winfo_children():
             widget.destroy()
+
+        self._selected_track_id = None
+        if hasattr(self, 'btn_start_aim'):
+            self.btn_start_aim.config(state="disabled")
+        if hasattr(self, 'btn_stop_aim'):
+            self.btn_stop_aim.config(state="disabled")
         
         if not targets:
             Label(self.buttons_frame, text="No targets computed", fg="gray").pack()
@@ -538,11 +557,32 @@ class PointingTab:
             label.pack(side="left", padx=(0, 10))
     
     def _on_aim_target(self, track_id):
-        """ID 버튼 클릭 → 이동 + 정밀 조준 시작"""
+        """ID 버튼 클릭 → 초기 위치 이동만 수행"""
         if self.callbacks.get('move_to_target'):
-            self.btn_stop_aim.config(state="normal")
-            self.aim_status_label.config(text=f"🎯 Track {track_id} 조준 시작...", fg="blue")
+            self._selected_track_id = track_id
+            self.btn_start_aim.config(state="normal")
+            self.btn_stop_aim.config(state="disabled")
+            self.aim_status_label.config(
+                text=f"🎯 Track {track_id} 초기 위치 이동. Start Aiming을 누르세요.",
+                fg="blue"
+            )
             self.callbacks['move_to_target'](track_id)
+
+    def _on_start_aiming(self):
+        """선택된 타깃으로 정밀 조준 시작"""
+        if self._selected_track_id is None:
+            self.aim_status_label.config(text="⚠️ 먼저 Target(ID) 버튼을 선택하세요.", fg="orange")
+            return
+
+        if self.callbacks.get('start_aiming'):
+            started = self.callbacks['start_aiming'](self._selected_track_id)
+            if started:
+                self.btn_start_aim.config(state="disabled")
+                self.btn_stop_aim.config(state="normal")
+                self.aim_status_label.config(
+                    text=f"🎯 Track {self._selected_track_id} 조준 시작...",
+                    fg="blue"
+                )
     
     def _on_move_to_target(self, track_id):
         if self.callbacks.get('move_to_target'):
@@ -553,6 +593,8 @@ class PointingTab:
         self.aim_status_label.config(text=f"🎯 [{track_id}] {message}")
         if "수렴 완료" in message or "❌" in message:
             self.btn_stop_aim.config(state="disabled")
+            if self._selected_track_id is not None:
+                self.btn_start_aim.config(state="normal")
             if "수렴 완료" in message:
                 self.aim_status_label.config(fg="green")
             else:

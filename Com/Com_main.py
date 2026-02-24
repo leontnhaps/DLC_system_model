@@ -75,6 +75,7 @@ class ComApp(EventHandlersMixin, PointingHandlerMixin, AppHelpersMixin):
             'pointing_choose_csv': self.pointing_choose_csv,
             'pointing_compute': self.pointing_compute,
             'move_to_target': self.move_to_target,
+            'start_aiming': self.start_aiming,
             'stop_aiming': self.stop_aiming
         }
         self.pointing_tab = PointingTab(tab_pointing, pointing_callbacks)
