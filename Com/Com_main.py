@@ -97,13 +97,16 @@ class ComApp(EventHandlersMixin, PointingHandlerMixin, AppHelpersMixin):
         # 저장 디렉토리 생성
         SAVE_DIR.mkdir(exist_ok=True)
         
-        # YOLO 로드
+        # YOLO Processor (scan/pointing 공유 인스턴스)
         try:
-            self.yolo = YOLOProcessor()
+            shared_yolo = YOLOProcessor()
+            self.yolo = shared_yolo
+            self.yolo_processor = shared_yolo
             print("[ComApp] YOLO 모델 로드 완료")
         except Exception as e:
             print(f"[ComApp] YOLO 로드 실패 (무시 가능): {e}")
             self.yolo = None  # 없어도 앱은 실행되게
+            self.yolo_processor = None
 
         # 레이저 상태
         self.laser_state = False
@@ -118,9 +121,6 @@ class ComApp(EventHandlersMixin, PointingHandlerMixin, AppHelpersMixin):
         self._scan_done_pending = False
         self._scan_finalize_idle_s = 1.2
         self._last_scan_image_ts = 0.0
-        
-        # YOLO Processor
-        self.yolo_processor = YOLOProcessor()
         
         # Scan Controller
         self.scan_ctrl = ScanController(SAVE_DIR, self.yolo_processor)
