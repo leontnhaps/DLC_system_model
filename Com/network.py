@@ -15,6 +15,26 @@ import queue
 # 전역 UI 큐 - 모든 이벤트가 여기로
 ui_q: queue.Queue[tuple[str, object]] = queue.Queue()
 
+# Preview는 큐에 누적하지 않고 최신 프레임 1개만 유지
+_preview_lock = threading.Lock()
+_latest_preview = None
+
+
+def set_latest_preview(data: bytes):
+    """Store only the latest preview frame."""
+    global _latest_preview
+    with _preview_lock:
+        _latest_preview = data
+
+
+def pop_latest_preview():
+    """Get and clear the latest preview frame."""
+    global _latest_preview
+    with _preview_lock:
+        data = _latest_preview
+        _latest_preview = None
+    return data
+
 
 def _recv_exact(sock: socket.socket, size: int):
     """Receive exactly `size` bytes. Return None only on clean EOF before any bytes."""
@@ -129,7 +149,7 @@ class GuiImgClient(threading.Thread):
                     
                     # 프리뷰는 ui_q로
                     if name.startswith("_preview_"):
-                        ui_q.put(("preview", data))
+                        set_latest_preview(data)
                     else:
                         # 일반 이미지는 ui_q로만 전달 (저장은 event_handlers에서)
                         ui_q.put(("saved", (name, data)))

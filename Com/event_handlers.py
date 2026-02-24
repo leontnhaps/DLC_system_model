@@ -7,7 +7,7 @@ Handles all event processing from ui_q
 import queue
 import time
 from tkinter import messagebox
-from network import ui_q
+from network import ui_q, pop_latest_preview
 
 
 class EventHandlersMixin:
@@ -33,6 +33,11 @@ class EventHandlersMixin:
         # done 이후 tail 이미지 반영이 끝나면 finalize
         if hasattr(self, '_maybe_finalize_scan'):
             self._maybe_finalize_scan()
+
+        # Preview는 최신 1프레임만 표시 (큐 누적 방지)
+        preview = pop_latest_preview()
+        if preview is not None:
+            self._set_preview(preview)
         
         # Poll interval (50ms)
         self.root.after(50, self._poll)
