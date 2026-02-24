@@ -43,10 +43,10 @@ class ScanTab:
     def _build(self):
         # 변수들
         self.pan_min = IntVar(value=-30)
-        self.pan_max = IntVar(value=30)
-        self.pan_step = IntVar(value=10)
-        self.tilt_min = IntVar(value=0)
-        self.tilt_max = IntVar(value=30)
+        self.pan_max = IntVar(value=0)
+        self.pan_step = IntVar(value=5)
+        self.tilt_min = IntVar(value=-10)
+        self.tilt_max = IntVar(value=10)
         self.tilt_step = IntVar(value=5)
         self.scan_resolution = StringVar(value="5MP (2592×1944)")
         self.width = IntVar(value=2592)
