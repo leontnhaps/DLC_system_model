@@ -4,7 +4,7 @@ UI components - Complete layout matching Com_test
 """
 
 from tkinter import Tk, Label, Button, Frame, BooleanVar, Checkbutton, ttk, StringVar, IntVar, DoubleVar, Scale, HORIZONTAL, Canvas, Scrollbar
-from PIL import Image, ImageTk, ImageDraw
+from PIL import Image, ImageTk
 import io
 
 class PreviewFrame:
@@ -25,19 +25,7 @@ class PreviewFrame:
         """이미지 표시"""
         try:
             img = Image.open(io.BytesIO(jpeg_bytes))
-            
-            # ⭐ 고정 레이저 위치 표시 (1313, 755)
-            try:
-                draw = ImageDraw.Draw(img)
-                lx, ly = 1313, 755
-                size = 40
-                width = 5
-                # 빨간 십자가
-                draw.line([(lx - size, ly), (lx + size, ly)], fill="red", width=width)
-                draw.line([(lx, ly - size), (lx, ly + size)], fill="red", width=width)
-            except Exception:
-                pass
-            
+
             img.thumbnail((self.width, self.height), Image.Resampling.LANCZOS)
             tk_img = ImageTk.PhotoImage(img)
             self.label.config(image=tk_img)
