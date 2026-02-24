@@ -461,6 +461,14 @@ class ObjectTracker:
     def get_track_count(self):
         """할당된 총 track_id 개수 반환"""
         return self.next_id
+
+    def get_final_track_count(self):
+        """현재 frames에 남아있는 고유 track_id 개수 반환 (병합 후 기준)"""
+        unique_ids = set()
+        for frame in self.frames:
+            for obj in frame['objects']:
+                unique_ids.add(obj['track_id'])
+        return len(unique_ids)
     
     def get_all_tracks(self):
         """모든 track별 검출 정보 반환 (시각화/분석용)"""

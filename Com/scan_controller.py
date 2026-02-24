@@ -234,9 +234,10 @@ class ScanController:
                 merge_threshold=0.4,
                 min_detections=3
             )
-            self.track_count = self.mot_tracker.get_track_count()
+            self.track_count = self.mot_tracker.get_final_track_count()
+            merged_ids = sum(1 for old_id, new_id in merge_map.items() if old_id != new_id)
             print(f"[MOT] 최종 Track 수: {self.track_count}개")
-            print(f"[MOT] 병합된 track: {len(merge_map)}개")
+            print(f"[MOT] 병합된 ID: {merged_ids}개")
             
             # ⭐ 유사도 로그 저장 (mot_scan_test_hungarian_final.py와 동일 포맷)
             if self.session_dir:
