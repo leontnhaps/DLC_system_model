@@ -198,12 +198,30 @@ def scan_worker(cmd, ctrl_sock, img_sock):
             pass
 
 # ==================== 프리뷰 워커 ====================
-def preview_worker(img_sock, w=640, h=480, fps=5, q=70):
+# 1) preview_worker 시그니처/controls
+def preview_worker(img_sock, w=640, h=480, fps=5, q=70, shutter_speed=None, analogue_gain=None):
     global picam
     try:
-        print(f"[PREVIEW] 시작: {w}x{h} @ {fps}fps")
+        print(f"[PREVIEW] 시작: {w}x{h} @ {fps}fps, Shutter={shutter_speed}, Gain={analogue_gain}")
         picam.stop()
-        config = picam.create_video_configuration(main={"size": (w, h)})
+
+        # Controls 설정 (Auto 복귀 보장)
+        controls = {}
+        manual = (shutter_speed is not None) or (analogue_gain is not None)
+
+        if manual:
+            controls["AeEnable"] = False
+            if shutter_speed is not None:
+                controls["ExposureTime"] = int(shutter_speed)
+                controls["FrameDurationLimits"] = (int(shutter_speed) + 5000, 2000000)
+            if analogue_gain is not None:
+                controls["AnalogueGain"] = float(analogue_gain)
+        else:
+            controls["AeEnable"] = True
+
+
+
+        config = picam.create_video_configuration(main={"size": (w, h)}, controls=controls)
         picam.configure(config)
         picam.options["quality"] = int(q)
         picam.start()
@@ -269,7 +287,7 @@ def snap_capture(img_sock, w, h, q, name, shutter_speed=None, analogue_gain=None
         
         # 노출 안정화 대기 (수동 노출은 더 짧아도 됨)
         # 하지만 Auto일 경우를 대비해 넉넉히
-        wait_time = 0.5 if shutter_speed is None else 0.2
+        wait_time = 0.2 if manual else 0.5
         time.sleep(wait_time)
         
         # 캡처
@@ -365,14 +383,17 @@ def main():
                         h = int(cmd.get("height", 480))
                         fps = int(cmd.get("fps", 5))
                         q = int(cmd.get("quality", 70))
-                        
+                        shutter = cmd.get("shutter_speed")
+                        gain = cmd.get("analogue_gain")
+
                         preview_thread = threading.Thread(
                             target=preview_worker,
-                            args=(img_sock, w, h, fps, q),
+                            args=(img_sock, w, h, fps, q, shutter, gain),
                             daemon=True
                         )
                         preview_thread.start()
-                        print(f"[CMD] 프리뷰 시작")
+                        print(f"[CMD] 프리뷰 시작 (Shutter={shutter}, Gain={gain})")
+
                     else:
                         preview_stop.set()
                         if preview_thread:
