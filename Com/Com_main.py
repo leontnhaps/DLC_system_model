@@ -343,14 +343,17 @@ class ComApp(EventHandlersMixin, PointingHandlerMixin, AppHelpersMixin):
     # ========== Preview Callbacks ==========
     def toggle_preview(self, enable, w, h, fps, q):
         """프리뷰 토글"""
-        print(f"[PREVIEW] Enable={enable}, {w}x{h} @ {fps}fps")
+        shutter, gain = self.test_tab.get_exposure_params()
+        print(f"[PREVIEW] Enable={enable}, {w}x{h} @ {fps}fps, Shutter={shutter}, Gain={gain}")
         cmd = {
             "cmd": "preview",
             "enable": enable,
             "width": w,
             "height": h,
             "fps": fps,
-            "quality": q
+            "quality": q,
+            "shutter_speed": shutter,
+            "analogue_gain": gain
         }
         self.ctrl.send(cmd)
         

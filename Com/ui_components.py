@@ -255,22 +255,29 @@ class TestSettingsTab:
         
         self._entry(row, "Preview fps", self.preview_fps); row += 1
         self._entry(row, "Preview quality", self.preview_q); row += 1
-        
-        ttk.Separator(self.frame, orient="horizontal").grid(row=row, column=0, columnspan=3, sticky="ew", pady=10); row += 1
-        
-        # ========== Exposure Control (Manual) ==========
-        Label(self.frame, text="☀️ Exposure Control", font=("", 11, "bold")).grid(
-            row=row, column=0, columnspan=3, sticky="w", padx=5, pady=(5, 10)); row += 1
-        
+
+        Label(self.frame, text="☀️ Exposure (Preview/Snap)", font=("", 10, "bold")).grid(
+            row=row, column=0, columnspan=3, sticky="w", padx=5, pady=(8, 6)); row += 1
+
         self.exposure_manual = BooleanVar(value=False)
         self.shutter_speed = IntVar(value=1000)   # µs (default 1ms)
         self.analogue_gain = DoubleVar(value=1.0) # 1.0 ~ 16.0
-        
-        chk_manual = Checkbutton(self.frame, text="Manual Exposure", variable=self.exposure_manual)
+
+        chk_manual = Checkbutton(
+            self.frame,
+            text="Manual Exposure (Preview/Snap)",
+            variable=self.exposure_manual
+        )
         chk_manual.grid(row=row, column=0, columnspan=2, sticky="w", padx=5); row += 1
         
         self._entry(row, "Shutter(µs)", self.shutter_speed); row += 1
         self._slider(row, "Gain", 1.0, 16.0, self.analogue_gain, 0.1); row += 1
+        Button(
+            self.frame,
+            text="Apply Exposure To Live Preview",
+            command=self._on_apply_preview_exposure,
+            width=25
+        ).grid(row=row, column=0, columnspan=2, sticky="w", padx=5, pady=(0, 6)); row += 1
         
         ttk.Separator(self.frame, orient="horizontal").grid(row=row, column=0, columnspan=3, sticky="ew", pady=10); row += 1
         
@@ -278,7 +285,7 @@ class TestSettingsTab:
         Label(self.frame, text="📸 Capture", font=("", 11, "bold")).grid(
             row=row, column=0, columnspan=3, sticky="w", padx=5, pady=(5, 10)); row += 1
         
-        Button(self.frame, text="Snap (Preview Resolution)", command=self._on_snap,
+        Button(self.frame, text="Snap (Preview + Exposure)", command=self._on_snap,
                bg="#4CAF50", fg="white", font=("", 10, "bold"), width=25).grid(
             row=row, column=0, columnspan=2, sticky="w", padx=5, pady=5); row += 1
         
@@ -348,6 +355,10 @@ class TestSettingsTab:
     def _on_apply_size(self):
         if self.preview_enable.get():
             self._on_toggle()
+
+    def _on_apply_preview_exposure(self):
+        if self.preview_enable.get():
+            self._on_toggle()
     
     def _on_ir_cut(self, mode):
         if self.callbacks.get('set_ir_cut'):
@@ -359,7 +370,7 @@ class TestSettingsTab:
             self.callbacks['snap_capture']()
             
     def get_exposure_params(self):
-        """노출 파라미터 반환 (Manual일 때만 값 반환, Auto면 None)"""
+        """노출 파라미터 반환 (Preview/Snap 공용, Manual일 때만 값 반환)"""
         shutter = None
         gain = None
         if self.exposure_manual.get():
