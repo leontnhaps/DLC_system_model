@@ -266,19 +266,21 @@ def snap_capture(img_sock, w, h, q, name, shutter_speed=None, analogue_gain=None
         # Still 모드로 전환 + 노출 제어
         picam.stop()
         
-        # Controls 설정
+        # Controls 설정 (Auto 복귀 보장)
         controls = {}
-        if shutter_speed is not None:
-             # 노출 시간 (µs)
-            controls["ExposureTime"] = int(shutter_speed)
-        if analogue_gain is not None:
-             # 아날로그 게인
-            controls["AnalogueGain"] = float(analogue_gain)
-            
-        # 프레임 지속 시간 설정 (노출 시간보다 길어야 함)
-        if shutter_speed:
-            min_duration = int(shutter_speed) + 5000  # 여유 5ms
-            controls["FrameDurationLimits"] = (min_duration, 2000000) # 최대 2초
+        manual = (shutter_speed is not None) or (analogue_gain is not None)
+        if manual:
+            controls["AeEnable"] = False
+            if shutter_speed is not None:
+                # 노출 시간 (µs)
+                controls["ExposureTime"] = int(shutter_speed)
+                min_duration = int(shutter_speed) + 5000  # 여유 5ms
+                controls["FrameDurationLimits"] = (min_duration, 2000000)  # 최대 2초
+            if analogue_gain is not None:
+                # 아날로그 게인
+                controls["AnalogueGain"] = float(analogue_gain)
+        else:
+            controls["AeEnable"] = True
             
         config = picam.create_still_configuration(main={"size": (w, h)}, controls=controls)
         picam.configure(config)
