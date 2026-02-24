@@ -20,6 +20,18 @@ class PreviewFrame:
         
         self.label = Label(self.frame, bg="#111")
         self.label.place(x=0, y=0, width=width, height=height)
+
+        # Overlay (hotkey/current ID)
+        self.overlay_label = Label(
+            self.frame,
+            text="Shoot Dwell: - | ID: - | Idle",
+            bg="#000000",
+            fg="#FFFFFF",
+            font=("", 9, "bold"),
+            padx=6,
+            pady=3,
+        )
+        self.overlay_label.place(x=8, y=8)
     
     def display_image(self, jpeg_bytes):
         """이미지 표시"""
@@ -32,6 +44,13 @@ class PreviewFrame:
             self.label.image = tk_img
         except Exception as e:
             print(f"[DISPLAY] 오류: {e}")
+
+    def set_overlay_text(self, text):
+        """프리뷰 오버레이 텍스트 갱신"""
+        try:
+            self.overlay_label.config(text=text)
+        except Exception:
+            pass
 
 class ScanTab:
     """스캔 탭 UI"""
@@ -46,7 +65,7 @@ class ScanTab:
         self.pan_max = IntVar(value=0)
         self.pan_step = IntVar(value=5)
         self.tilt_min = IntVar(value=-10)
-        self.tilt_max = IntVar(value=10)
+        self.tilt_max = IntVar(value=5)
         self.tilt_step = IntVar(value=5)
         self.scan_resolution = StringVar(value="5MP (2592×1944)")
         self.width = IntVar(value=2592)
@@ -111,23 +130,26 @@ class ScanTab:
     
     def _on_start(self):
         if self.callbacks.get('start_scan'):
-            params = {
-                'pan_min': self.pan_min.get(),
-                'pan_max': self.pan_max.get(),
-                'pan_step': self.pan_step.get(),
-                'tilt_min': self.tilt_min.get(),
-                'tilt_max': self.tilt_max.get(),
-                'tilt_step': self.tilt_step.get(),
-                'width': self.width.get(),
-                'height': self.height.get(),
-                'quality': self.quality.get(),
-                'speed': self.speed.get(),
-                'acc': self.acc.get(),
-                'settle': self.settle.get(),
-                'led_settle': self.led_settle.get(),
-                'yolo_weights': self.yolo_weights.get()  # YOLO weights 추가
-            }
-            self.callbacks['start_scan'](params)
+            self.callbacks['start_scan'](self.get_scan_params())
+
+    def get_scan_params(self):
+        """현재 Scan UI 값을 dict로 반환"""
+        return {
+            'pan_min': self.pan_min.get(),
+            'pan_max': self.pan_max.get(),
+            'pan_step': self.pan_step.get(),
+            'tilt_min': self.tilt_min.get(),
+            'tilt_max': self.tilt_max.get(),
+            'tilt_step': self.tilt_step.get(),
+            'width': self.width.get(),
+            'height': self.height.get(),
+            'quality': self.quality.get(),
+            'speed': self.speed.get(),
+            'acc': self.acc.get(),
+            'settle': self.settle.get(),
+            'led_settle': self.led_settle.get(),
+            'yolo_weights': self.yolo_weights.get()
+        }
     
     def _on_stop(self):
         if self.callbacks.get('stop_scan'):
@@ -560,9 +582,12 @@ class PointingTab:
         # Track ID별 버튼 생성
         for track_id in sorted(targets.keys()):
             pan, tilt = targets[track_id]
+            row_frame = Frame(self.buttons_frame)
+            row_frame.pack(anchor="w", fill="x", pady=2)
+
             btn_text = f"🎯 ID {track_id}"
             btn = Button(
-                self.buttons_frame,
+                row_frame,
                 text=btn_text,
                 command=lambda tid=track_id: self._on_aim_target(tid),
                 width=12,
@@ -570,11 +595,11 @@ class PointingTab:
                 fg="white",
                 font=("", 9, "bold")
             )
-            btn.pack(side="left", padx=5, pady=2)
+            btn.pack(side="left", padx=(0, 8))
             
             # Tooltip (Pan/Tilt 표시)
-            label = Label(self.buttons_frame, text=f"({pan}°, {tilt}°)", font=("", 8), fg="gray")
-            label.pack(side="left", padx=(0, 10))
+            label = Label(row_frame, text=f"({pan}°, {tilt}°)", font=("", 8), fg="gray")
+            label.pack(side="left")
             self.target_value_labels[track_id] = label
 
     def update_target_value(self, track_id, pan, tilt):
@@ -629,3 +654,78 @@ class PointingTab:
                 self.aim_status_label.config(fg="green")
             else:
                 self.aim_status_label.config(fg="red")
+
+
+class SchedulingTab:
+    """Scheduling 탭 UI"""
+    def __init__(self, parent, callbacks):
+        self.callbacks = callbacks
+        self.frame = parent
+        self._build()
+
+    def _build(self):
+        r = 0
+        Label(self.frame, text="Scheduling", font=("", 12, "bold")).grid(
+            row=r, column=0, columnspan=2, sticky="w", padx=8, pady=(8, 12)
+        )
+        r += 1
+
+        self.dwell_seconds = DoubleVar(value=10.0)
+        Label(self.frame, text="Shoot Dwell (s)").grid(row=r, column=0, sticky="w", padx=8, pady=4)
+        ttk.Entry(self.frame, textvariable=self.dwell_seconds, width=10).grid(row=r, column=1, sticky="w", padx=8, pady=4)
+        r += 1
+
+        self.btn_roundrobin = Button(
+            self.frame,
+            text="RoundRobin",
+            command=self._on_roundrobin,
+            width=18,
+            bg="#1976D2",
+            fg="white",
+            font=("", 10, "bold"),
+        )
+        self.btn_roundrobin.grid(row=r, column=0, sticky="w", padx=8, pady=4)
+
+        self.btn_stop = Button(
+            self.frame,
+            text="Stop Scheduling",
+            command=self._on_stop,
+            width=18,
+            bg="#D32F2F",
+            fg="white",
+            font=("", 10, "bold"),
+            state="disabled",
+        )
+        self.btn_stop.grid(row=r, column=1, sticky="w", padx=8, pady=4)
+        r += 1
+
+        self.status_label = Label(self.frame, text="대기 중", fg="#333", font=("", 10))
+        self.status_label.grid(row=r, column=0, columnspan=2, sticky="w", padx=8, pady=(10, 6))
+
+        for c in range(2):
+            self.frame.grid_columnconfigure(c, weight=1)
+
+    def _on_roundrobin(self):
+        if self.callbacks.get("start_roundrobin"):
+            self.callbacks["start_roundrobin"]()
+
+    def _on_stop(self):
+        if self.callbacks.get("stop_scheduling"):
+            self.callbacks["stop_scheduling"]()
+
+    def set_running_state(self, is_running):
+        if is_running:
+            self.btn_roundrobin.config(state="disabled")
+            self.btn_stop.config(state="normal")
+        else:
+            self.btn_roundrobin.config(state="normal")
+            self.btn_stop.config(state="disabled")
+
+    def update_status(self, text, fg="#333"):
+        self.status_label.config(text=text, fg=fg)
+
+    def get_dwell_seconds(self):
+        try:
+            return max(0.2, float(self.dwell_seconds.get()))
+        except Exception:
+            return 10.0

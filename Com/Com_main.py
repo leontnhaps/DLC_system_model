@@ -12,7 +12,7 @@ from network import GuiCtrlClient, GuiImgClient
 from event_handlers import EventHandlersMixin
 from pointing_handler import PointingHandlerMixin
 from app_helpers import AppHelpersMixin
-from ui_components import PreviewFrame, ScanTab, TestSettingsTab, PointingTab
+from ui_components import PreviewFrame, ScanTab, TestSettingsTab, PointingTab, SchedulingTab
 from scan_controller import ScanController
 from yolo_utils import YOLOProcessor
 import threading
@@ -23,6 +23,8 @@ GUI_IMG_PORT = 7601
 
 # 저장 디렉토리
 SAVE_DIR = pathlib.Path("captures")
+ROUNDROBIN_DWELL_S = 10.0
+ROUNDROBIN_AIM_TIMEOUT_S = 120.0
 
 
 class ComApp(EventHandlersMixin, PointingHandlerMixin, AppHelpersMixin):
@@ -49,10 +51,13 @@ class ComApp(EventHandlersMixin, PointingHandlerMixin, AppHelpersMixin):
         tab_scan = Frame(self.notebook)
         tab_test = Frame(self.notebook)
         tab_pointing = Frame(self.notebook)
+        tab_scheduling = Frame(self.notebook)
         
         self.notebook.add(tab_scan, text="Scan")
         self.notebook.add(tab_test, text="Test & Settings")
         self.notebook.add(tab_pointing, text="Pointing")
+        self.notebook.add(tab_scheduling, text="Scheduling")
+        self._tab_index_pointing = 2
         
         # Initialize Tab Content
         scan_callbacks = {
@@ -80,6 +85,12 @@ class ComApp(EventHandlersMixin, PointingHandlerMixin, AppHelpersMixin):
             'stop_aiming': self.stop_aiming
         }
         self.pointing_tab = PointingTab(tab_pointing, pointing_callbacks)
+
+        scheduling_callbacks = {
+            "start_roundrobin": self.start_roundrobin,
+            "stop_scheduling": self.stop_scheduling,
+        }
+        self.scheduling_tab = SchedulingTab(tab_scheduling, scheduling_callbacks)
         
         # pointing_handler에서 참조할 수 있도록 변수 연결
         self.point_csv_path = self.pointing_tab.point_csv_path
@@ -123,6 +134,14 @@ class ComApp(EventHandlersMixin, PointingHandlerMixin, AppHelpersMixin):
         self._scan_done_pending = False
         self._scan_finalize_idle_s = 1.2
         self._last_scan_image_ts = 0.0
+        self._scan_finished_event = threading.Event()
+        self._scan_finished_event.set()
+        self._last_scan_result = None
+        
+        # Scheduling 상태
+        self._scheduling_active = False
+        self._scheduling_thread = None
+        self._scheduling_stop_event = threading.Event()
         
         # Scan Controller
         self.scan_ctrl = ScanController(SAVE_DIR, self.yolo_processor)
@@ -192,6 +211,16 @@ class ComApp(EventHandlersMixin, PointingHandlerMixin, AppHelpersMixin):
         print(f"[PREVIEW] Auto-restore ({reason}): {w}x{h} @ {fps}fps")
         self.toggle_preview(True, w, h, fps, q)
 
+    def _set_preview_overlay(self, current_id=None, phase="Idle", dwell_elapsed=None, dwell_total=None):
+        """프리뷰 오버레이(현재 ID + Phase + Shoot Dwell 진행률) 갱신"""
+        cid = "-" if current_id is None else str(current_id)
+        if dwell_elapsed is not None and dwell_total is not None and dwell_total > 0:
+            text = f"Shoot Dwell: {dwell_elapsed:.1f}/{dwell_total:.1f}s | ID: {cid} | {phase}"
+        else:
+            text = f"Shoot Dwell: - | ID: {cid} | {phase}"
+        if hasattr(self, "preview_frame") and hasattr(self.preview_frame, "set_overlay_text"):
+            self.root.after(0, lambda t=text: self.preview_frame.set_overlay_text(t))
+
     def _send_scan_run(self, cmd, session):
         """scan_run 실제 전송 (after 지연 전송용 분리)"""
         self.ctrl.send(cmd)
@@ -236,6 +265,8 @@ class ComApp(EventHandlersMixin, PointingHandlerMixin, AppHelpersMixin):
         self.scan_tab.set_scan_state(True)
         self._scan_done_pending = False
         self._last_scan_image_ts = time.monotonic()
+        self._scan_finished_event.clear()
+        self._last_scan_result = None
 
         preview_was_on = self.preview_active
         if preview_was_on:
@@ -281,6 +312,7 @@ class ComApp(EventHandlersMixin, PointingHandlerMixin, AppHelpersMixin):
         self._scan_done_pending = False
         self.ctrl.send({"cmd": "scan_stop"})
         result = self.scan_ctrl.stop_session()  # 이제 딕셔너리 반환
+        self._last_scan_result = result
         
         # UI 업데이트
         if result:
@@ -290,15 +322,19 @@ class ComApp(EventHandlersMixin, PointingHandlerMixin, AppHelpersMixin):
             # Pointing 자동 실행
             csv_path = result.get('csv_path_abs')
             if csv_path:
-                print(f"[ComApp] Auto-computing pointing for: {csv_path}")
-                # Pointing 탭으로 전환 (선택 사항)
-                self.notebook.select(2)  # Pointing Tab index
-                self.pointing_compute(csv_path)
+                if self._scheduling_active and self._scheduling_stop_event.is_set():
+                    print("[ComApp] Scheduling stop requested -> skip auto-pointing compute")
+                else:
+                    print(f"[ComApp] Auto-computing pointing for: {csv_path}")
+                    # Pointing 탭으로 전환 (선택 사항)
+                    if not self._scheduling_active:
+                        self.notebook.select(self._tab_index_pointing)
+                    self.pointing_compute(csv_path)
             else:
                 print("[ComApp] No CSV path returned for auto-pointing")
         else:
-             self.info_label.config(text="⏹️ 스캔 중지 (No result)")
-             self.scan_tab.set_scan_state(False)
+            self.info_label.config(text="⏹️ 스캔 중지 (No result)")
+            self.scan_tab.set_scan_state(False)
 
         # Scan 전 Preview가 켜져 있었다면 자동 복구
         if self._resume_preview_after_scan:
@@ -306,6 +342,277 @@ class ComApp(EventHandlersMixin, PointingHandlerMixin, AppHelpersMixin):
             self._resume_preview_after_scan = False
             self._scan_preview_cfg = None
             self.root.after(300, lambda c=cfg: self._restore_preview(c, reason="scan"))
+
+        self._scan_finished_event.set()
+        return result
+    
+    # ========== Scheduling Callbacks ==========
+    def _call_on_ui_thread(self, fn, timeout=10.0):
+        """Worker thread에서 UI thread 함수 안전 호출"""
+        done_evt = threading.Event()
+        holder = {}
+
+        def _runner():
+            try:
+                holder["result"] = fn()
+            except Exception as exc:
+                holder["error"] = exc
+            finally:
+                done_evt.set()
+
+        self.root.after(0, _runner)
+        if not done_evt.wait(timeout):
+            raise TimeoutError("UI thread call timeout")
+        if "error" in holder:
+            raise holder["error"]
+        return holder.get("result")
+
+    def _set_scheduling_ui_state(self, is_running):
+        def _update():
+            if hasattr(self, "scheduling_tab"):
+                self.scheduling_tab.set_running_state(is_running)
+        self.root.after(0, _update)
+
+    def _set_scheduling_status(self, text, fg="#333"):
+        def _update():
+            if hasattr(self, "scheduling_tab"):
+                self.scheduling_tab.update_status(text, fg=fg)
+            self.info_label.config(text=text)
+        self.root.after(0, _update)
+
+    def _finalize_scheduling_ui(self, message, fg="#333"):
+        self._scheduling_active = False
+        self._scheduling_thread = None
+        self._scheduling_stop_event.clear()
+        if hasattr(self, "scheduling_tab"):
+            self.scheduling_tab.set_running_state(False)
+            self.scheduling_tab.update_status(message, fg=fg)
+        self.info_label.config(text=message)
+        self._set_preview_overlay(current_id=None, phase="Idle")
+
+    def start_roundrobin(self):
+        """RoundRobin 스케줄 시작"""
+        if self._scheduling_active:
+            self._set_scheduling_status("⚠️ Scheduling already running", fg="orange")
+            return False
+        if self.scan_ctrl.is_active():
+            self._set_scheduling_status("⚠️ Scan already running", fg="orange")
+            return False
+        if getattr(self, "_aiming_active", False):
+            self._set_scheduling_status("⚠️ Pointing is running. Stop aiming first.", fg="orange")
+            return False
+
+        self._scheduling_active = True
+        self._scheduling_stop_event.clear()
+        self._set_scheduling_ui_state(True)
+        self._set_scheduling_status("🔁 RoundRobin 시작...", fg="blue")
+
+        self._scheduling_thread = threading.Thread(target=self._roundrobin_worker, daemon=True)
+        self._scheduling_thread.start()
+        return True
+
+    def stop_scheduling(self):
+        """현재 실행 중인 Scheduling 알고리즘 중지"""
+        self._scheduling_stop_event.set()
+        self._set_scheduling_status("⛔ Scheduling 중지 요청...", fg="red")
+
+        if self.scan_ctrl.is_active():
+            self.stop_scan()
+        if getattr(self, "_aiming_active", False):
+            self.stop_aiming()
+
+        self.ctrl.send({"cmd": "laser", "value": 0})
+        self.laser_state = False
+
+        if not self._scheduling_active:
+            self._set_scheduling_ui_state(False)
+
+    def _roundrobin_worker(self):
+        final_message = "✅ RoundRobin 완료"
+        final_color = "green"
+        try:
+            final_targets = dict(getattr(self, "computed_targets", {}) or {})
+            settle_s = float(self._call_on_ui_thread(lambda: self.scan_tab.settle.get(), timeout=2.0))
+            settle_s = max(0.1, settle_s)
+            dwell_s = float(self._call_on_ui_thread(
+                lambda: self.scheduling_tab.get_dwell_seconds() if hasattr(self, "scheduling_tab") else ROUNDROBIN_DWELL_S,
+                timeout=2.0
+            ))
+            dwell_s = max(0.2, dwell_s)
+
+            if final_targets:
+                self._set_scheduling_status(
+                    f"🔁 RoundRobin: 기존 타깃 {len(final_targets)}개 사용, Shoot 바로 시작",
+                    fg="blue",
+                )
+                self._set_preview_overlay(current_id=None, phase="Shoot")
+            else:
+                self._set_scheduling_status("🔁 RoundRobin: Scan 시작", fg="blue")
+                self._set_preview_overlay(current_id=None, phase="Scan")
+                params = self._call_on_ui_thread(lambda: self.scan_tab.get_scan_params())
+                self._call_on_ui_thread(lambda: setattr(self, "computed_targets", {}), timeout=2.0)
+                self._call_on_ui_thread(lambda p=dict(params): self.start_scan(p), timeout=3.0)
+
+                while not self._scheduling_stop_event.is_set():
+                    if self._scan_finished_event.wait(timeout=0.2):
+                        break
+                if self._scheduling_stop_event.is_set():
+                    final_message = "⛔ Scheduling 중지됨"
+                    final_color = "red"
+                    return
+
+                result = getattr(self, "_last_scan_result", None)
+                csv_path = result.get("csv_path_abs") if result else None
+                targets = dict(getattr(self, "computed_targets", {}) or {})
+
+                # stop_scan에서 auto-compute 실패했을 때만 한 번 더 보정
+                if not targets and csv_path:
+                    self._set_scheduling_status("🔎 RoundRobin: CSV Compute 재시도...", fg="blue")
+                    self._call_on_ui_thread(lambda p=csv_path: self.pointing_compute(p), timeout=60.0)
+                    targets = dict(getattr(self, "computed_targets", {}) or {})
+
+                if not targets:
+                    raise RuntimeError("계산된 타깃이 없습니다. Scan/YOLO 결과를 확인하세요.")
+
+                ordered_ids = sorted(targets.keys())
+                self._set_scheduling_status(
+                    f"🎯 RoundRobin: {len(ordered_ids)}개 ID Rough 수렴 시작",
+                    fg="blue",
+                )
+
+                # Scheduling에서는 IR 모드 강제 유지
+                self._call_on_ui_thread(lambda: self.set_ir_cut("day"), timeout=3.0)
+                time.sleep(0.1)
+
+                # Phase A: 모든 ID를 rough aiming으로 수렴
+                for idx, track_id in enumerate(ordered_ids, start=1):
+                    if self._scheduling_stop_event.is_set():
+                        final_message = "⛔ Scheduling 중지됨"
+                        final_color = "red"
+                        return
+
+                    self._set_scheduling_status(
+                        f"🎯 Rough [{idx}/{len(ordered_ids)}] ID {track_id} 수렴 중...",
+                        fg="blue",
+                    )
+                    self._set_preview_overlay(current_id=track_id, phase="Rough")
+
+                    self._call_on_ui_thread(lambda: self.set_pointing_mode("rough"), timeout=2.0)
+                    self._call_on_ui_thread(lambda tid=track_id: self.move_to_target(tid), timeout=3.0)
+                    time.sleep(settle_s)
+
+                    started = bool(self._call_on_ui_thread(lambda tid=track_id: self.start_aiming(tid), timeout=3.0))
+                    if not started:
+                        print(f"[Scheduling] Rough start failed for ID {track_id}, skip")
+                        continue
+
+                    aim_deadline = time.monotonic() + ROUNDROBIN_AIM_TIMEOUT_S
+                    while not self._scheduling_stop_event.is_set():
+                        if not getattr(self, "_aiming_active", False):
+                            break
+                        if time.monotonic() >= aim_deadline:
+                            print(f"[Scheduling] Rough timeout for ID {track_id} -> stop_aiming")
+                            self.stop_aiming()
+                            break
+                        time.sleep(0.2)
+
+                    if self._scheduling_stop_event.is_set():
+                        final_message = "⛔ Scheduling 중지됨"
+                        final_color = "red"
+                        return
+
+                    # 다음 ID 전환 전 레이저 강제 OFF
+                    self.ctrl.send({"cmd": "laser", "value": 0})
+                    self.laser_state = False
+                    time.sleep(0.2)
+
+                final_targets = dict(getattr(self, "computed_targets", {}) or {})
+                if not final_targets:
+                    raise RuntimeError("Rough 수렴 후 사용 가능한 ID가 없습니다.")
+
+            final_ids = sorted(final_targets.keys())
+            if not final_ids:
+                raise RuntimeError("Scheduling용 타깃이 없습니다.")
+
+            self._set_scheduling_status(
+                f"🔴 RoundRobin Shoot: {len(final_ids)}개 ID 순환 조사 시작 ({dwell_s:.1f}초/ID, Stop까지 계속)",
+                fg="blue",
+            )
+            self._set_preview_overlay(current_id=None, phase="Shoot", dwell_elapsed=0.0, dwell_total=dwell_s)
+
+            # Shoot loop에서 preview 강제 ON
+            preview_on = bool(self._call_on_ui_thread(lambda: self.preview_active, timeout=2.0))
+            if not preview_on:
+                self._call_on_ui_thread(
+                    lambda: self.toggle_preview(True, *self._get_preview_cfg()),
+                    timeout=4.0,
+                )
+                time.sleep(0.2)
+
+            # Phase B: ID 순환 조사 (Stop까지 반복)
+            loop_count = 0
+            while not self._scheduling_stop_event.is_set():
+                loop_count += 1
+                # 루프마다 IR 모드 재보장
+                self._call_on_ui_thread(lambda: self.set_ir_cut("day"), timeout=3.0)
+                for idx, track_id in enumerate(final_ids, start=1):
+                    if self._scheduling_stop_event.is_set():
+                        break
+
+                    # Shoot loop 중 preview가 꺼졌다면 즉시 복구
+                    preview_on_loop = bool(self._call_on_ui_thread(lambda: self.preview_active, timeout=2.0))
+                    if not preview_on_loop:
+                        self._call_on_ui_thread(
+                            lambda: self.toggle_preview(True, *self._get_preview_cfg()),
+                            timeout=4.0,
+                        )
+                        time.sleep(0.1)
+
+                    self._set_scheduling_status(
+                        f"🔴 Shoot loop {loop_count} [{idx}/{len(final_ids)}] ID {track_id}",
+                        fg="blue",
+                    )
+                    self._set_preview_overlay(current_id=track_id, phase="Shoot", dwell_elapsed=0.0, dwell_total=dwell_s)
+                    self._call_on_ui_thread(
+                        lambda tid=track_id: self.move_to_target(tid, use_tilt_approach=True),
+                        timeout=5.0,
+                    )
+                    time.sleep(settle_s)
+
+                    self.ctrl.send({"cmd": "laser", "value": 1})
+                    self.laser_state = True
+
+                    start_t = time.monotonic()
+                    while (time.monotonic() - start_t) < dwell_s:
+                        if self._scheduling_stop_event.is_set():
+                            break
+                        elapsed = time.monotonic() - start_t
+                        self._set_preview_overlay(
+                            current_id=track_id,
+                            phase="Shoot",
+                            dwell_elapsed=min(elapsed, dwell_s),
+                            dwell_total=dwell_s,
+                        )
+                        time.sleep(0.1)
+
+                    self.ctrl.send({"cmd": "laser", "value": 0})
+                    self.laser_state = False
+                    time.sleep(0.05)
+
+            final_message = "⛔ Scheduling 중지됨"
+            final_color = "red"
+
+        except Exception as e:
+            final_message = f"❌ RoundRobin 오류: {e}"
+            final_color = "red"
+            print(final_message)
+        finally:
+            try:
+                self.ctrl.send({"cmd": "laser", "value": 0})
+                self.laser_state = False
+            except Exception:
+                pass
+            self.root.after(0, lambda msg=final_message, fg=final_color: self._finalize_scheduling_ui(msg, fg))
     
     # ========== Manual Callbacks ==========
     def apply_move(self, pan, tilt, speed, acc):
