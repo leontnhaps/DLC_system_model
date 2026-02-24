@@ -5,6 +5,7 @@ Handles all event processing from ui_q
 """
 
 import queue
+import time
 from tkinter import messagebox
 from network import ui_q
 
@@ -28,6 +29,10 @@ class EventHandlersMixin:
                     print(f"[TOAST] {payload}")
         except queue.Empty:
             pass
+
+        # done 이후 tail 이미지 반영이 끝나면 finalize
+        if hasattr(self, '_maybe_finalize_scan'):
+            self._maybe_finalize_scan()
         
         # Poll interval (50ms)
         self.root.after(50, self._poll)
@@ -58,9 +63,11 @@ class EventHandlersMixin:
             print(f"[EVENT] Scan completed: {done}/{total}")
             self.info_label.config(text=f"✅ 스캔 완료: {done}/{total}")
             
-            # ⭐ 스캔 완료 시 세션 자동 종료 및 로그 저장
-            print("[EVENT] Auto-stopping session...")
-            self.stop_scan()
+            # done 즉시 stop하지 않고 tail 이미지 유입이 멈출 때 finalize
+            self._scan_done_pending = True
+            if not getattr(self, '_last_scan_image_ts', 0.0):
+                self._last_scan_image_ts = time.monotonic()
+            print("[EVENT] Scan done -> waiting for tail images before finalizing")
         
         elif evt == "error":
             msg = event.get("message", "Unknown error")
@@ -99,6 +106,8 @@ class EventHandlersMixin:
             saved_path = self.scan_ctrl.save_image(name, data)
             if saved_path:
                 print(f"[SCAN_SAVE] {saved_path}")
+                # done 이후 finalize idle 기준 갱신
+                self._last_scan_image_ts = time.monotonic()
         else:
             # Snap 등 일반 저장 (SAVE_DIR에)
             from pathlib import Path

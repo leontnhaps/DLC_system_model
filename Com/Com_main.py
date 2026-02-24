@@ -5,6 +5,7 @@ Com Client - Modular architecture with mixins
 
 import pathlib
 import datetime
+import time
 from tkinter import Tk, Label, Frame, ttk
 
 from network import GuiCtrlClient, GuiImgClient
@@ -114,6 +115,9 @@ class ComApp(EventHandlersMixin, PointingHandlerMixin, AppHelpersMixin):
         self._scan_preview_cfg = None
         self._snap_preview_cfg = None
         self._snap_restore_token = 0
+        self._scan_done_pending = False
+        self._scan_finalize_idle_s = 1.2
+        self._last_scan_image_ts = 0.0
         
         # YOLO Processor
         self.yolo_processor = YOLOProcessor()
@@ -190,6 +194,17 @@ class ComApp(EventHandlersMixin, PointingHandlerMixin, AppHelpersMixin):
         self.ctrl.send(cmd)
         self.info_label.config(text=f"🔄 스캔 시작: {session}")
 
+    def _maybe_finalize_scan(self):
+        """done 이후 tail 이미지 유입이 멈췄을 때 스캔 종료"""
+        if not self._scan_done_pending:
+            return
+        idle_s = time.monotonic() - self._last_scan_image_ts
+        if idle_s < self._scan_finalize_idle_s:
+            return
+        print(f"[SCAN] Finalize idle reached ({idle_s:.3f}s) -> stop_scan()")
+        self._scan_done_pending = False
+        self.stop_scan()
+
     def _on_manual_snap_saved(self, name):
         """수동 Snap 저장 완료 후 Preview 복구"""
         if not self._resume_preview_after_snap:
@@ -216,6 +231,8 @@ class ComApp(EventHandlersMixin, PointingHandlerMixin, AppHelpersMixin):
         """스캔 시작"""
         # ⭐ 버튼 상태 변경 (Start -> Disabled, Stop -> Normal)
         self.scan_tab.set_scan_state(True)
+        self._scan_done_pending = False
+        self._last_scan_image_ts = time.monotonic()
 
         preview_was_on = self.preview_active
         if preview_was_on:
@@ -258,6 +275,7 @@ class ComApp(EventHandlersMixin, PointingHandlerMixin, AppHelpersMixin):
     def stop_scan(self):
         """스캔 중지"""
         print(f"[SCAN] Stop")
+        self._scan_done_pending = False
         self.ctrl.send({"cmd": "scan_stop"})
         result = self.scan_ctrl.stop_session()  # 이제 딕셔너리 반환
         

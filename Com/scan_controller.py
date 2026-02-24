@@ -68,25 +68,44 @@ class ScanController:
     
     def _stop_worker_thread(self):
         """Worker Thread 중지"""
+        if not self.worker_thread:
+            return
+
+        # 큐에 들어간 작업은 끝까지 처리
+        try:
+            self.processing_queue.join()
+        except Exception as e:
+            print(f"[ScanController] Queue join warning: {e}")
+
+        # sentinel로 정상 종료
+        try:
+            self.processing_queue.put_nowait(None)
+        except queue.Full:
+            # join 이후라면 거의 발생하지 않지만, 안전하게 fallback
+            self.processing_queue.put(None)
+
         self.worker_running = False
-        if self.worker_thread:
-            self.worker_thread.join(timeout=2.0)
+        self.worker_thread.join(timeout=2.0)
         print("[ScanController] Worker thread stopped")
     
     def _worker_loop(self):
         """Worker thread loop - 이미지 쌍을 비동기로 처리"""
-        while self.worker_running:
+        while True:
             try:
                 task = self.processing_queue.get(timeout=0.5)
+            except queue.Empty:
+                continue
+
+            try:
                 if task is None:
                     break
                 pan, tilt, pair = task
                 self._process_pair(pan, tilt, pair)
-                self.processing_queue.task_done()
-            except queue.Empty:
-                continue
             except Exception as e:
                 print(f"[ScanController] Worker error: {e}")
+            finally:
+                # join()이 안정적으로 동작하도록 항상 task_done 보장
+                self.processing_queue.task_done()
     
     def _process_pair(self, pan, tilt, pair):
         """Worker Thread 내부에서 실행됨 - YOLO 처리"""
