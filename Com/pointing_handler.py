@@ -17,7 +17,8 @@ import os
 # ========== Constants ==========
 CENTERING_GAIN_PAN = 0.03    # deg/px (기본값, 역산으로 대체됨)
 CENTERING_GAIN_TILT = 0.03   # deg/px
-CONVERGENCE_TOL_PX = 7       # 수렴 판정 임계값 (px)
+CONVERGENCE_TOL_PX_X = 7       # 수렴 판정 임계값 X (px)
+CONVERGENCE_TOL_PX_Y = 25      # 수렴 판정 임계값 Y (px)
 OBJECT_SIZE_CM = 5.5         # 객체 크기 (cm) - offset 계산용
 TARGET_OFFSET_CM = -12.25    # 객체 중심 아래 12.25cm (2.75 + 5.5 + 4)
 LASER_DIFF_THRESHOLD = 150   # 레이저 diff threshold (산란광 제거)
@@ -676,11 +677,16 @@ class PointingHandlerMixin:
                 
                 self._update_aiming_status(
                     track_id, iteration,
-                    f"반복 {iteration}: 오차 {err_mag:.1f}px (tol={CONVERGENCE_TOL_PX}px)"
+                    f"반복 {iteration}: 오차 {err_mag:.1f}px (tol=({CONVERGENCE_TOL_PX_X}, {CONVERGENCE_TOL_PX_Y})px)"
                 )
                 
                 # 수렴 판정
-                if abs(err_x) <= CONVERGENCE_TOL_PX and abs(err_y) <= CONVERGENCE_TOL_PX:
+                if abs(err_x) <= CONVERGENCE_TOL_PX_X and abs(err_y) <= CONVERGENCE_TOL_PX_Y:
+                    # 수렴 위치를 해당 Track의 기준 위치로 저장(다음에 ID 버튼 클릭 시 바로 이동)
+                    self.computed_targets[track_id] = (
+                        round(self._curr_pan, 3),
+                        round(self._curr_tilt, 3),
+                    )
                     print(f"[Pointing] 🎉 수렴 완료! err=({err_x:.1f}, {err_y:.1f})px, {iteration}회 반복")
                     self._update_aiming_status(
                         track_id, iteration,
@@ -799,11 +805,11 @@ class PointingHandlerMixin:
                                   (int(mx+mw), int(my+mh)), (128, 128, 128), 2)
             
             # 오차 정보
-            converged = abs(err_x) <= CONVERGENCE_TOL_PX and abs(err_y) <= CONVERGENCE_TOL_PX
+            converged = abs(err_x) <= CONVERGENCE_TOL_PX_X and abs(err_y) <= CONVERGENCE_TOL_PX_Y
             color = (0, 255, 0) if converged else (0, 0, 255)
             cv2.putText(debug, f"Iter {iteration}  Err: ({err_x:.1f}, {err_y:.1f}) = {err_mag:.1f}px",
                         (30, 50), cv2.FONT_HERSHEY_SIMPLEX, 1.0, color, 2)
-            cv2.putText(debug, f"Tol: {CONVERGENCE_TOL_PX}px",
+            cv2.putText(debug, f"Tol: ({CONVERGENCE_TOL_PX_X}, {CONVERGENCE_TOL_PX_Y})px",
                         (30, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (200, 200, 200), 2)
             # 현재 Pan/Tilt 표시
             cur_pan = getattr(self, '_curr_pan', 0.0)
@@ -909,9 +915,9 @@ class PointingHandlerMixin:
             
             # 오차 텍스트 업데이트
             if hasattr(self, 'pointing_tab') and hasattr(self.pointing_tab, 'debug_error_label'):
-                color = "green" if abs(err_x) <= CONVERGENCE_TOL_PX and abs(err_y) <= CONVERGENCE_TOL_PX else "red"
+                color = "green" if abs(err_x) <= CONVERGENCE_TOL_PX_X and abs(err_y) <= CONVERGENCE_TOL_PX_Y else "red"
                 self.pointing_tab.debug_error_label.config(
-                    text=f"[Iter {iteration}]  err_x={err_x:.1f}px  err_y={err_y:.1f}px  |err|={err_mag:.1f}px  (tol={CONVERGENCE_TOL_PX}px)",
+                    text=f"[Iter {iteration}]  err_x={err_x:.1f}px  err_y={err_y:.1f}px  |err|={err_mag:.1f}px  (tol=({CONVERGENCE_TOL_PX_X}, {CONVERGENCE_TOL_PX_Y})px)",
                     fg=color
                 )
         except Exception as e:
