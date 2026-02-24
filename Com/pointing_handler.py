@@ -18,8 +18,8 @@ import os
 CENTERING_GAIN_PAN = 0.03    # deg/px (기본값, 역산으로 대체됨)
 CENTERING_GAIN_TILT = 0.03   # deg/px
 CONVERGENCE_TOL_PX = 7       # 수렴 판정 임계값 (px)
-OBJECT_SIZE_CM = 5.0         # 객체 크기 (cm) - offset 계산용
-TARGET_OFFSET_CM = -9.0      # 객체 중심 아래 9cm
+OBJECT_SIZE_CM = 5.5         # 객체 크기 (cm) - offset 계산용
+TARGET_OFFSET_CM = -12.25    # 객체 중심 아래 12.25cm (2.75 + 5.5 + 4)
 LASER_DIFF_THRESHOLD = 150   # 레이저 diff threshold (산란광 제거)
 MAX_STEP_DEG = 5.0           # 최대 보정 각도 (deg/step)
 
@@ -580,7 +580,7 @@ class PointingHandlerMixin:
                     all_bboxes = []
                     continue
                 
-                # 타겟 오프셋 적용 (객체 중심 아래 9cm)
+                # 타겟 오프셋 적용 (객체 중심 아래 TARGET_OFFSET_CM)
                 obj_cx_raw, obj_cy_raw = target_cx, target_cy
                 if bbox:
                     bx, by, bw, bh = bbox
