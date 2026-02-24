@@ -14,12 +14,5 @@ class AppHelpersMixin:
         h = self.test_tab.preview_h.get()
         fps = self.test_tab.preview_fps.get()
         q = self.test_tab.preview_q.get()
-        
-        self.ctrl.send({
-            "cmd": "preview",
-            "enable": True,
-            "width": w,
-            "height": h,
-            "fps": fps,
-            "quality": q
-        })
+        # 상태 추적/라벨 갱신이 같이 되도록 toggle_preview 경유
+        self.toggle_preview(True, w, h, fps, q)

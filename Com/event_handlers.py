@@ -109,6 +109,10 @@ class EventHandlersMixin:
                 f.write(data)
             print(f"[SAVE] {save_path}")
             self.info_label.config(text=f"💾 저장됨: {name}")
+
+            # 수동 Snap 완료 콜백 (Preview 자동 복구용)
+            if name.startswith("snap_") and hasattr(self, '_on_manual_snap_saved'):
+                self._on_manual_snap_saved(name)
         
         # ⭐ 프리뷰 표시 (Scan 이미지도 보임!)
         self._set_preview(data)

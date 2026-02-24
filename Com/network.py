@@ -16,6 +16,19 @@ import queue
 ui_q: queue.Queue[tuple[str, object]] = queue.Queue()
 
 
+def _recv_exact(sock: socket.socket, size: int):
+    """Receive exactly `size` bytes. Return None only on clean EOF before any bytes."""
+    buf = bytearray()
+    while len(buf) < size:
+        chunk = sock.recv(size - len(buf))
+        if not chunk:
+            if not buf:
+                return None
+            raise ConnectionError(f"socket closed during recv_exact({size})")
+        buf += chunk
+    return bytes(buf)
+
+
 class GuiCtrlClient(threading.Thread):
     """제어 소켓 - 명령 전송 + 이벤트 수신 (자동 재연결)"""
     
@@ -96,23 +109,23 @@ class GuiImgClient(threading.Thread):
                 ui_q.put(("toast", f"IMG connected {self.host}:{self.port}"))
                 
                 while True:
-                    hdr = s.recv(2)
-                    if not hdr:
+                    hdr = _recv_exact(s, 2)
+                    if hdr is None:
                         break
                     (nlen,) = struct.unpack("<H", hdr)
-                    name = s.recv(nlen).decode("utf-8", "ignore")
-                    (dlen,) = struct.unpack("<I", s.recv(4))
-                    
-                    buf = bytearray()
-                    remain = dlen
-                    while remain > 0:
-                        chunk = s.recv(min(65536, remain))
-                        if not chunk:
-                            raise ConnectionError("img closed")
-                        buf += chunk
-                        remain -= len(chunk)
-                    
-                    data = bytes(buf)
+                    name_bytes = _recv_exact(s, nlen)
+                    if name_bytes is None:
+                        raise ConnectionError("img closed during name recv")
+                    name = name_bytes.decode("utf-8", "ignore")
+
+                    dlen_buf = _recv_exact(s, 4)
+                    if dlen_buf is None:
+                        raise ConnectionError("img closed during length recv")
+                    (dlen,) = struct.unpack("<I", dlen_buf)
+
+                    data = _recv_exact(s, dlen)
+                    if data is None:
+                        raise ConnectionError("img closed during payload recv")
                     
                     # 프리뷰는 ui_q로
                     if name.startswith("_preview_"):

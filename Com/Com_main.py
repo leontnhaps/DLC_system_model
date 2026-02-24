@@ -109,6 +109,11 @@ class ComApp(EventHandlersMixin, PointingHandlerMixin, AppHelpersMixin):
         
         # Preview 상태 추적
         self.preview_active = False
+        self._resume_preview_after_scan = False
+        self._resume_preview_after_snap = False
+        self._scan_preview_cfg = None
+        self._snap_preview_cfg = None
+        self._snap_restore_token = 0
         
         # YOLO Processor
         self.yolo_processor = YOLOProcessor()
@@ -163,18 +168,65 @@ class ComApp(EventHandlersMixin, PointingHandlerMixin, AppHelpersMixin):
         print("[INIT] ✅ 초기화 완료: Preview=OFF, LED=0, Laser=OFF, Pan/Tilt=0,0, IR-CUT=Normal")
     
     # ========== Scan Callbacks ==========
+    def _get_preview_cfg(self):
+        """현재 Preview UI 설정을 (w, h, fps, q)로 반환"""
+        return (
+            int(self.test_tab.preview_w.get()),
+            int(self.test_tab.preview_h.get()),
+            int(self.test_tab.preview_fps.get()),
+            int(self.test_tab.preview_q.get())
+        )
+
+    def _restore_preview(self, cfg, reason="restore"):
+        """저장된 설정으로 Preview 복구"""
+        if cfg is None:
+            cfg = self._get_preview_cfg()
+        w, h, fps, q = cfg
+        print(f"[PREVIEW] Auto-restore ({reason}): {w}x{h} @ {fps}fps")
+        self.toggle_preview(True, w, h, fps, q)
+
+    def _send_scan_run(self, cmd, session):
+        """scan_run 실제 전송 (after 지연 전송용 분리)"""
+        self.ctrl.send(cmd)
+        self.info_label.config(text=f"🔄 스캔 시작: {session}")
+
+    def _on_manual_snap_saved(self, name):
+        """수동 Snap 저장 완료 후 Preview 복구"""
+        if not self._resume_preview_after_snap:
+            return
+        cfg = self._snap_preview_cfg
+        self._resume_preview_after_snap = False
+        self._snap_preview_cfg = None
+        print(f"[SNAP] Saved: {name} -> restoring preview")
+        self.root.after(150, lambda c=cfg: self._restore_preview(c, reason="snap"))
+
+    def _snap_restore_watchdog(self, token):
+        """Snap 이미지 수신 누락 시에도 Preview 복구"""
+        if token != self._snap_restore_token:
+            return
+        if not self._resume_preview_after_snap:
+            return
+        cfg = self._snap_preview_cfg
+        self._resume_preview_after_snap = False
+        self._snap_preview_cfg = None
+        print("[SNAP] Restore watchdog triggered -> restoring preview")
+        self._restore_preview(cfg, reason="snap-timeout")
+
     def start_scan(self, params):
         """스캔 시작"""
         # ⭐ 버튼 상태 변경 (Start -> Disabled, Stop -> Normal)
         self.scan_tab.set_scan_state(True)
-        
-        # ⭐ Preview가 켜져있으면 자동 중지
-        if self.preview_active:
-            print("[SCAN] Preview 자동 중지...")
-            self.toggle_preview(False, 640, 480, 10, 80)
-            self.preview_active = False
-            # Preview 완전히 중지될 때까지 대기
-            self.root.after(300)
+
+        preview_was_on = self.preview_active
+        if preview_was_on:
+            self._resume_preview_after_scan = True
+            self._scan_preview_cfg = self._get_preview_cfg()
+            print("[SCAN] Preview was ON -> pause during scan")
+            w, h, fps, q = self._scan_preview_cfg
+            self.toggle_preview(False, w, h, fps, q)
+        else:
+            self._resume_preview_after_scan = False
+            self._scan_preview_cfg = None
         
         # YOLO weights 경로 추출
         yolo_weights = params.pop('yolo_weights', None)
@@ -196,8 +248,12 @@ class ComApp(EventHandlersMixin, PointingHandlerMixin, AppHelpersMixin):
             "session": session,
             **params
         }
-        self.ctrl.send(cmd)
-        self.info_label.config(text=f"🔄 스캔 시작: {session}")
+        if preview_was_on:
+            # preview 중지 명령이 먼저 적용되도록 짧게 지연
+            self.info_label.config(text=f"🔄 스캔 준비 중: {session}")
+            self.root.after(300, lambda c=cmd, s=session: self._send_scan_run(c, s))
+        else:
+            self._send_scan_run(cmd, session)
     
     def stop_scan(self):
         """스캔 중지"""
@@ -222,6 +278,13 @@ class ComApp(EventHandlersMixin, PointingHandlerMixin, AppHelpersMixin):
         else:
              self.info_label.config(text="⏹️ 스캔 중지 (No result)")
              self.scan_tab.set_scan_state(False)
+
+        # Scan 전 Preview가 켜져 있었다면 자동 복구
+        if self._resume_preview_after_scan:
+            cfg = self._scan_preview_cfg
+            self._resume_preview_after_scan = False
+            self._scan_preview_cfg = None
+            self.root.after(300, lambda c=cfg: self._restore_preview(c, reason="scan"))
     
     # ========== Manual Callbacks ==========
     def apply_move(self, pan, tilt, speed, acc):
@@ -300,11 +363,20 @@ class ComApp(EventHandlersMixin, PointingHandlerMixin, AppHelpersMixin):
         """Snap 캡처 - Preview 해상도 사용"""
         w = self.test_tab.preview_w.get()
         h = self.test_tab.preview_h.get()
+        preview_was_on = self.preview_active
         
         # 노출 제어 파라미터 가져오기
         shutter, gain = self.test_tab.get_exposure_params()
         
         print(f"[SNAP] Capturing {w}x{h}, Shutter={shutter}, Gain={gain}")
+
+        if preview_was_on:
+            self._resume_preview_after_snap = True
+            self._snap_preview_cfg = self._get_preview_cfg()
+            self._snap_restore_token += 1
+            token = self._snap_restore_token
+            # 이미지 수신 누락 시에도 복구되도록 watchdog
+            self.root.after(7000, lambda t=token: self._snap_restore_watchdog(t))
         
         # 타임스탬프
         ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
