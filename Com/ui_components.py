@@ -454,6 +454,21 @@ class PointingTab:
         self.aim_status_label.grid(row=r, column=0, columnspan=3, sticky="w", padx=10, pady=5)
         r += 1
 
+        # Aiming 모드 선택 (기본: rough)
+        Label(self.frame, text="Aiming Mode:").grid(row=r, column=0, sticky="w", padx=(5, 10), pady=3)
+        self.pointing_mode = StringVar(value="rough")
+        self.mode_combo = ttk.Combobox(
+            self.frame,
+            textvariable=self.pointing_mode,
+            state="readonly",
+            width=18,
+            values=("rough", "legacy"),
+        )
+        self.mode_combo.grid(row=r, column=1, sticky="w", padx=2)
+        self.mode_combo.bind("<<ComboboxSelected>>", lambda _e: self._on_mode_changed())
+        self._on_mode_changed()
+        r += 1
+
         # 선택된 타깃에 대해 Start로 정밀 조준 시작
         self._selected_track_id = None
         self.btn_start_aim = Button(
@@ -508,6 +523,10 @@ class PointingTab:
     def _on_compute(self):
         if self.callbacks.get('pointing_compute'):
             self.callbacks['pointing_compute']()
+
+    def _on_mode_changed(self):
+        if self.callbacks.get('set_pointing_mode'):
+            self.callbacks['set_pointing_mode'](self.pointing_mode.get())
     
     def _on_stop_aiming(self):
         if self.callbacks.get('stop_aiming'):
@@ -526,6 +545,7 @@ class PointingTab:
         # 기존 버튼 제거
         for widget in self.buttons_frame.winfo_children():
             widget.destroy()
+        self.target_value_labels = {}
 
         self._selected_track_id = None
         if hasattr(self, 'btn_start_aim'):
@@ -555,6 +575,16 @@ class PointingTab:
             # Tooltip (Pan/Tilt 표시)
             label = Label(self.buttons_frame, text=f"({pan}°, {tilt}°)", font=("", 8), fg="gray")
             label.pack(side="left", padx=(0, 10))
+            self.target_value_labels[track_id] = label
+
+    def update_target_value(self, track_id, pan, tilt):
+        """특정 Track ID의 좌표 라벨만 갱신"""
+        if not hasattr(self, "target_value_labels"):
+            return
+        label = self.target_value_labels.get(track_id)
+        if label is None:
+            return
+        label.config(text=f"({pan}°, {tilt}°)")
     
     def _on_aim_target(self, track_id):
         """ID 버튼 클릭 → 초기 위치 이동만 수행"""

@@ -74,6 +74,7 @@ class ComApp(EventHandlersMixin, PointingHandlerMixin, AppHelpersMixin):
         pointing_callbacks = {
             'pointing_choose_csv': self.pointing_choose_csv,
             'pointing_compute': self.pointing_compute,
+            'set_pointing_mode': self.set_pointing_mode,
             'move_to_target': self.move_to_target,
             'start_aiming': self.start_aiming,
             'stop_aiming': self.stop_aiming
@@ -129,6 +130,7 @@ class ComApp(EventHandlersMixin, PointingHandlerMixin, AppHelpersMixin):
         # Pointing related initializations (from PointingHandlerMixin)
         self._pointing_gains = {}
         self._pointing_img_event = threading.Event()
+        self.pointing_mode = "rough"  # rough | legacy
         
         # Frame count (for preview)
         self.frame_count = 0

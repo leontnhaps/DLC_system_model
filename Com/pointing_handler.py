@@ -23,6 +23,15 @@ OBJECT_SIZE_CM = 5.5         # 객체 크기 (cm) - offset 계산용
 TARGET_OFFSET_CM = -12.25    # 객체 중심 아래 12.25cm (2.75 + 5.5 + 4)
 LASER_DIFF_THRESHOLD = 150   # 레이저 diff threshold (산란광 제거)
 MAX_STEP_DEG = 5.0           # 최대 보정 각도 (deg/step)
+ROUGH_CAM_TO_LASER_CM = 6.0  # 카메라 기준 레이저 수직 오프셋 (cm)
+ROUGH_TARGET_BELOW_CM = 12.5 # YOLO 인식 중심 아래 타겟 오프셋 (cm)
+ROUGH_PHASE1_TOL_X_PX = 15  # Rough Phase 1 X 수렴 임계값 (px)
+ROUGH_PHASE1_TOL_Y_PX = 15  # Rough Phase 1 Y 수렴 임계값 (px)
+ROUGH_PHASE1_STUCK_WINDOW = 8        # Phase 1 진동 감지 윈도우(2-level repeat)
+ROUGH_PHASE2_START_TILT_UP_DEG = 2.0  # Phase 2 시작 전 기본 상향 오프셋
+ROUGH_PHASE2_TILT_STEP_DEG = 1.0      # Phase 2 tilt 탐색 스텝 (하강)
+ROUGH_PHASE2_DROP_RATIO = 0.65        # 현재/이전 밝기 비율이 이 값 이하이면 급락 판정
+ROUGH_PHASE2_DROP_DELTA = 8.0         # 이전-현재 평균 밝기 절대 감소량 임계
 
 
 class PointingHandlerMixin:
@@ -364,6 +373,15 @@ class PointingHandlerMixin:
         }
 
     # ========== Laser Fine-Aiming ==========
+
+    def set_pointing_mode(self, mode):
+        """Pointing 모드 선택: rough | legacy"""
+        mode = str(mode or "").strip().lower()
+        if mode not in ("rough", "legacy"):
+            print(f"[Pointing] 알 수 없는 모드: {mode} (사용 가능: rough, legacy)")
+            return
+        self.pointing_mode = mode
+        print(f"[Pointing] 모드 변경: {mode}")
     
     def move_to_target(self, track_id):
         """
@@ -423,7 +441,11 @@ class PointingHandlerMixin:
         else:
             self._aiming_preview_cfg = None
 
-        print(f"[Pointing] ===== Track {track_id} Fine-Aiming 시작 =====")
+        mode = getattr(self, "pointing_mode", "rough")
+        if mode not in ("rough", "legacy"):
+            mode = "rough"
+
+        print(f"[Pointing] ===== Track {track_id} Fine-Aiming 시작 (mode={mode}) =====")
         print(f"[Pointing] 기준 위치: pan={pan_t}°, tilt={tilt_t}°")
 
         # IR Mode로 전환 (IR Laser 가시화)
@@ -441,7 +463,8 @@ class PointingHandlerMixin:
         self._pointing_img_event = threading.Event()
         self._pointing_img_data = None
         
-        t = threading.Thread(target=self._fine_aim_thread, args=(track_id,), daemon=True)
+        thread_target = self._fine_aim_thread_rough if mode == "rough" else self._fine_aim_thread
+        t = threading.Thread(target=thread_target, args=(track_id,), daemon=True)
         t.start()
         return True
 
@@ -541,6 +564,405 @@ class PointingHandlerMixin:
             print(f"[Pointing] 이미지 디코딩 실패: {e}")
             self._pointing_img_event.set()
 
+    def _fine_aim_thread_rough(self, track_id):
+        """
+        Rough 조준 Thread:
+          Phase 1) YOLO 중심 X를 화면 중심 X에 정렬 (X만 사용)
+          Phase 2) 시작 시 tilt +2deg 후, Laser ON/OFF(shutter=100) diff의
+                   YOLO bbox 평균 밝기를 비교하며 tilt를 1deg씩 내림.
+                   이전 대비 급락 시 조준 성공으로 판정.
+        """
+        try:
+            settle = self.scan_tab.settle.get()
+            led_settle = self.scan_tab.led_settle.get()
+
+            gains = self._pointing_gains.get(track_id, (CENTERING_GAIN_PAN, CENTERING_GAIN_TILT))
+            k_pan, k_tilt = gains
+
+            tol_phase1_x = ROUGH_PHASE1_TOL_X_PX
+            phase = 1
+            last_px_per_cm = None
+            phase1_pan_hist = []
+            phase1_err_hist = []
+            phase1_best_pan = float(getattr(self, "_curr_pan", 0.0))
+            phase1_best_abs_err = float("inf")
+            phase2_prev_mean = None
+            phase2_prev_tilt = None
+
+            print(
+                f"[Pointing-Rough] 파라미터: settle={settle}s, led_settle={led_settle}s, "
+                f"k_pan={k_pan:.5f}, k_tilt={k_tilt:.5f}, "
+                f"tol_p1_x={tol_phase1_x}px, phase2_start_up={ROUGH_PHASE2_START_TILT_UP_DEG}deg, "
+                f"phase2_step={ROUGH_PHASE2_TILT_STEP_DEG}deg, drop_ratio={ROUGH_PHASE2_DROP_RATIO}, "
+                f"drop_delta={ROUGH_PHASE2_DROP_DELTA}"
+            )
+
+            time.sleep(max(settle, 1.0))
+            self.ctrl.send({"cmd": "laser", "value": 0})
+            self._update_aiming_status(track_id, 0, "Rough 시작: YOLO 중심 기반 조준")
+
+            now_str = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            log_dir = f"Captures/Pointing/{now_str}_Track_{track_id}_rough"
+            os.makedirs(log_dir, exist_ok=True)
+            print(f"[Pointing-Rough] Logging to: {log_dir}")
+
+            iteration = 0
+            while self._aiming_active:
+                iteration += 1
+                phase_name = "CenterX" if phase == 1 else "Brightness"
+                print(f"\n[Pointing-Rough] ===== Iteration {iteration} / Phase {phase_name} =====")
+                self._update_aiming_status(track_id, iteration, f"Rough 반복 {iteration} ({phase_name})")
+
+                # Step 1: YOLO 객체 중심 검출(LED diff)
+                self.ctrl.send({"cmd": "led", "value": 255})
+                time.sleep(led_settle)
+                img_led_on = self._snap_and_wait(
+                    f"pointing_rough_led_on_{iteration}",
+                    shutter_speed=100000,
+                    analogue_gain=None,
+                )
+                if img_led_on is None:
+                    self.ctrl.send({"cmd": "led", "value": 0})
+                    print("[Pointing-Rough] ⚠️ LED ON 이미지 수신 실패")
+                    continue
+
+                self.ctrl.send({"cmd": "led", "value": 0})
+                time.sleep(led_settle)
+                img_led_off = self._snap_and_wait(
+                    f"pointing_rough_led_off_{iteration}",
+                    shutter_speed=100000,
+                    analogue_gain=None,
+                )
+                if img_led_off is None:
+                    print("[Pointing-Rough] ⚠️ LED OFF 이미지 수신 실패")
+                    continue
+
+                try:
+                    cv2.imwrite(f"{log_dir}/iter_{iteration}_led_on.jpg", img_led_on)
+                    cv2.imwrite(f"{log_dir}/iter_{iteration}_led_off.jpg", img_led_off)
+                except Exception as e:
+                    print(f"[Pointing-Rough] Log save failed: {e}")
+
+                obj_cx, obj_cy, bbox, all_bboxes = self._find_object_center(img_led_on, img_led_off)
+                if obj_cx is None:
+                    print("[Pointing-Rough] ⚠️ 객체 검출 실패")
+                    continue
+
+                H, W = img_led_on.shape[:2]
+                frame_cx = W / 2.0
+                frame_cy = H / 2.0
+
+                if bbox and bbox[2] > 0:
+                    px_per_cm = float(bbox[2]) / OBJECT_SIZE_CM
+                    last_px_per_cm = px_per_cm
+                elif last_px_per_cm is not None:
+                    px_per_cm = last_px_per_cm
+                else:
+                    # bbox가 없는 첫 프레임 fallback
+                    px_per_cm = 10.0
+
+                if phase == 1:
+                    # Phase 1: YOLO 중심 X를 화면 중심 X에 맞춤 (X only)
+                    target_x = frame_cx
+                    target_y = frame_cy
+                    ref_x = obj_cx
+                    ref_y = obj_cy
+                    err_x = obj_cx - frame_cx
+
+                    print(f"[Pointing-Rough] CenterX: err_x={err_x:.1f}px, px_per_cm={px_per_cm:.3f}")
+
+                    self._draw_debug_image(
+                        img_led_on,
+                        target_x,
+                        target_y,
+                        (int(ref_x), int(ref_y)),
+                        bbox,
+                        all_bboxes,
+                        err_x,
+                        0.0,
+                        iteration,
+                        None,
+                        None,
+                        log_dir,
+                        tol_x=tol_phase1_x,
+                        tol_y=9999,
+                    )
+
+                    self._update_aiming_status(
+                        track_id,
+                        iteration,
+                        f"Rough CenterX: err_x={err_x:.1f}px (tol_x={tol_phase1_x}px)",
+                    )
+
+                    # Phase 1 진동(예: 26/27 반복) 감지용 히스토리
+                    cur_pan_int = int(self._curr_pan)
+                    phase1_pan_hist.append(cur_pan_int)
+                    phase1_err_hist.append(float(err_x))
+                    if len(phase1_pan_hist) > ROUGH_PHASE1_STUCK_WINDOW:
+                        phase1_pan_hist.pop(0)
+                        phase1_err_hist.pop(0)
+
+                    cur_abs_err = abs(err_x)
+                    if cur_abs_err < phase1_best_abs_err:
+                        phase1_best_abs_err = cur_abs_err
+                        phase1_best_pan = float(self._curr_pan)
+
+                    phase1_stuck = False
+                    if len(phase1_pan_hist) >= ROUGH_PHASE1_STUCK_WINDOW:
+                        p = phase1_pan_hist[-ROUGH_PHASE1_STUCK_WINDOW:]
+                        is_two_level_repeat = len(set(p)) == 2
+                        transitions = sum(1 for i in range(1, len(p)) if p[i] != p[i - 1])
+                        returned_to_start = p[0] == p[-1]
+                        level_counts_ok = all(p.count(v) >= 2 for v in set(p))
+                        all_not_converged = all(abs(e) > tol_phase1_x for e in phase1_err_hist[-ROUGH_PHASE1_STUCK_WINDOW:])
+                        phase1_stuck = (
+                            is_two_level_repeat
+                            and transitions >= 2
+                            and returned_to_start
+                            and level_counts_ok
+                            and all_not_converged
+                        )
+
+                    if cur_abs_err <= tol_phase1_x or phase1_stuck:
+                        if phase1_stuck:
+                            lock_pan = float(int(phase1_best_pan))
+                            self._curr_pan = lock_pan
+                            self.ctrl.send(
+                                {
+                                    "cmd": "move",
+                                    "pan": lock_pan,
+                                    "tilt": self._curr_tilt,
+                                    "speed": 100,
+                                    "acc": 1.0,
+                                }
+                            )
+                            print(
+                                f"[Pointing-Rough] ⚠️ Phase 1 진동 감지(2-level repeat), "
+                                f"best pan={lock_pan:.0f}, best |err_x|={phase1_best_abs_err:.1f}px로 고정"
+                            )
+                            self._update_aiming_status(
+                                track_id,
+                                iteration,
+                                f"Phase1 진동 감지 -> best pan={lock_pan:.0f} 고정 후 Phase2",
+                            )
+                        phase = 2
+                        # Phase 2 시작 전 기본 상향 오프셋(+2deg)
+                        self._curr_tilt = self._curr_tilt + ROUGH_PHASE2_START_TILT_UP_DEG
+                        self.ctrl.send(
+                            {
+                                "cmd": "move",
+                                "pan": self._curr_pan,
+                                "tilt": self._curr_tilt,
+                                "speed": 100,
+                                "acc": 1.0,
+                            }
+                        )
+                        phase2_prev_mean = None
+                        phase2_prev_tilt = None
+                        print(
+                            "[Pointing-Rough] ✅ Phase 1(X) 수렴 -> Phase 2 시작 "
+                            f"(tilt +{ROUGH_PHASE2_START_TILT_UP_DEG}deg)"
+                        )
+                        self._update_aiming_status(track_id, iteration, "Phase 1(X) 수렴, tilt +2 후 Phase 2 시작")
+                        time.sleep(settle)
+                        continue
+
+                    d_pan = err_x * k_pan
+                    d_pan = max(min(d_pan, MAX_STEP_DEG), -MAX_STEP_DEG)
+                    d_tilt = 0.0
+                    next_pan = self._curr_pan + d_pan
+                    next_tilt = self._curr_tilt
+                    next_pan = max(-180, min(180, next_pan))
+
+                    self._curr_pan = next_pan
+                    self._curr_tilt = next_tilt
+
+                    self.ctrl.send(
+                        {
+                            "cmd": "move",
+                            "pan": next_pan,
+                            "tilt": next_tilt,
+                            "speed": 100,
+                            "acc": 1.0,
+                        }
+                    )
+
+                    try:
+                        with open(f"{log_dir}/log.txt", "a", encoding="utf-8") as f:
+                            f.write(
+                                "Iter {it} Phase CenterX: ObjX={ox:.1f} ErrX={ex:.1f} "
+                                "d_pan={dp:.3f} Next=({np:.3f},{nt:.3f})\n".format(
+                                    it=iteration,
+                                    ox=obj_cx,
+                                    ex=err_x,
+                                    dp=d_pan,
+                                    np=next_pan,
+                                    nt=next_tilt,
+                                )
+                            )
+                    except Exception as e:
+                        print(f"[Pointing-Rough] Log write failed: {e}")
+
+                    time.sleep(settle)
+                    continue
+
+                # Phase 2: Laser ON/OFF diff에서 YOLO bbox 영역 평균 밝기 기반
+                print("[Pointing-Rough] Phase 2: Laser ON...")
+                self.ctrl.send({"cmd": "laser", "value": 1})
+                time.sleep(led_settle)
+                img_laser_on = self._snap_and_wait(
+                    f"pointing_rough_laser_on_{iteration}",
+                    shutter_speed=100,
+                    analogue_gain=1.0,
+                )
+                if img_laser_on is None:
+                    print("[Pointing-Rough] ⚠️ Laser ON 이미지 수신 실패")
+                    continue
+
+                print("[Pointing-Rough] Phase 2: Laser OFF...")
+                self.ctrl.send({"cmd": "laser", "value": 0})
+                time.sleep(led_settle)
+                img_laser_off = self._snap_and_wait(
+                    f"pointing_rough_laser_off_{iteration}",
+                    shutter_speed=100,
+                    analogue_gain=1.0,
+                )
+                if img_laser_off is None:
+                    print("[Pointing-Rough] ⚠️ Laser OFF 이미지 수신 실패")
+                    continue
+
+                try:
+                    cv2.imwrite(f"{log_dir}/iter_{iteration}_laser_on.jpg", img_laser_on)
+                    cv2.imwrite(f"{log_dir}/iter_{iteration}_laser_off.jpg", img_laser_off)
+                except Exception as e:
+                    print(f"[Pointing-Rough] Log save failed: {e}")
+
+                laser_diff = cv2.absdiff(img_laser_on, img_laser_off)
+                laser_gray = cv2.cvtColor(laser_diff, cv2.COLOR_BGR2GRAY)
+
+                if not bbox:
+                    print("[Pointing-Rough] ⚠️ Phase 2: YOLO bbox 없음, 밝기 비교 스킵")
+                    time.sleep(settle)
+                    continue
+
+                bx, by, bw, bh = [int(v) for v in bbox]
+                x1 = max(0, bx)
+                y1 = max(0, by)
+                x2 = min(W, bx + bw)
+                y2 = min(H, by + bh)
+                if x2 <= x1 or y2 <= y1:
+                    print("[Pointing-Rough] ⚠️ Phase 2: YOLO bbox ROI 유효하지 않음")
+                    time.sleep(settle)
+                    continue
+
+                roi = laser_gray[y1:y2, x1:x2]
+                mean_bright = float(np.mean(roi)) if roi.size > 0 else 0.0
+
+                print(
+                    f"[Pointing-Rough] Brightness(BBox ROI {x1}:{x2}, {y1}:{y2}) "
+                    f"mean={mean_bright:.2f}"
+                )
+
+                self._update_aiming_status(
+                    track_id,
+                    iteration,
+                    f"Rough Brightness: mean={mean_bright:.1f} (bbox)",
+                )
+
+                # 직전 tilt 대비 밝기 급락이면 직전 tilt를 조준 성공으로 판정
+                if phase2_prev_mean is not None:
+                    drop_delta = phase2_prev_mean - mean_bright
+                    drop_ratio = mean_bright / max(phase2_prev_mean, 1e-6)
+                    is_drop = (drop_ratio <= ROUGH_PHASE2_DROP_RATIO) and (drop_delta >= ROUGH_PHASE2_DROP_DELTA)
+
+                    if is_drop:
+                        final_pan = self._curr_pan
+                        final_tilt = phase2_prev_tilt if phase2_prev_tilt is not None else self._curr_tilt
+                        self._curr_pan = final_pan
+                        self._curr_tilt = final_tilt
+                        self.ctrl.send(
+                            {
+                                "cmd": "move",
+                                "pan": final_pan,
+                                "tilt": final_tilt,
+                                "speed": 100,
+                                "acc": 1.0,
+                            }
+                        )
+                        self.computed_targets[track_id] = (round(final_pan, 3), round(final_tilt, 3))
+                        self._update_target_button_value(track_id, round(final_pan, 3), round(final_tilt, 3))
+                        self.ctrl.send({"cmd": "laser", "value": 1})
+                        print(
+                            f"[Pointing-Rough] ✅ Phase 2 완료: 밝기 급락 감지 "
+                            f"(prev={phase2_prev_mean:.2f}, cur={mean_bright:.2f}, "
+                            f"ratio={drop_ratio:.3f}, delta={drop_delta:.2f})"
+                        )
+                        self._update_aiming_status(track_id, iteration, "✅ Rough 완료: 밝기 급락 감지")
+                        try:
+                            with open(f"{log_dir}/log.txt", "a", encoding="utf-8") as f:
+                                f.write(
+                                    "Iter {it} Phase Brightness-FinalDrop: Prev={pm:.2f} Cur={cm:.2f} "
+                                    "Ratio={rr:.3f} Delta={dd:.2f} Final=({fp:.3f},{ft:.3f}) "
+                                    "ROI=({x1},{y1},{x2},{y2})\n".format(
+                                        it=iteration,
+                                        pm=phase2_prev_mean,
+                                        cm=mean_bright,
+                                        rr=drop_ratio,
+                                        dd=drop_delta,
+                                        fp=final_pan,
+                                        ft=final_tilt,
+                                        x1=x1, y1=y1, x2=x2, y2=y2,
+                                    )
+                                )
+                        except Exception as e:
+                            print(f"[Pointing-Rough] Log write failed: {e}")
+                        break
+
+                # 다음 비교를 위해 현재값 저장 후 tilt를 1도 내려 탐색 계속
+                phase2_prev_mean = mean_bright
+                phase2_prev_tilt = self._curr_tilt
+                next_pan = self._curr_pan
+                next_tilt = self._curr_tilt - ROUGH_PHASE2_TILT_STEP_DEG
+                self._curr_pan = next_pan
+                self._curr_tilt = next_tilt
+                self.ctrl.send(
+                    {
+                        "cmd": "move",
+                        "pan": next_pan,
+                        "tilt": next_tilt,
+                        "speed": 100,
+                        "acc": 1.0,
+                    }
+                )
+
+                try:
+                    with open(f"{log_dir}/log.txt", "a", encoding="utf-8") as f:
+                        f.write(
+                            "Iter {it} Phase Brightness-Search: Mean={mb:.2f} "
+                            "NextTilt={nt:.3f} ROI=({x1},{y1},{x2},{y2})\n".format(
+                                it=iteration,
+                                mb=mean_bright,
+                                nt=next_tilt,
+                                x1=x1, y1=y1, x2=x2, y2=y2,
+                            )
+                        )
+                except Exception as e:
+                    print(f"[Pointing-Rough] Log write failed: {e}")
+
+                time.sleep(settle)
+
+        except Exception as e:
+            print(f"[Pointing-Rough] ❌ 오류: {e}")
+            import traceback
+            traceback.print_exc()
+            self._update_aiming_status(track_id, 0, f"❌ 오류: {e}")
+
+        finally:
+            self._aiming_active = False
+            self._aiming_track_id = None
+            self._restore_preview_after_aiming(reason="aiming-end")
+            print("[Pointing-Rough] Thread 종료")
+
     def _fine_aim_thread(self, track_id):
         """
         정밀 조준 Thread (blocking 방식) - 반복 횟수 제한 없음
@@ -629,7 +1051,7 @@ class PointingHandlerMixin:
                 time.sleep(led_settle)
                 
                 img_laser_on = self._snap_and_wait(f"pointing_laser_on_{iteration}", 
-                                                   shutter_speed=500, analogue_gain=1.0)
+                                                   shutter_speed=2500, analogue_gain=1.0)
                 if img_laser_on is None:
                     print("[Pointing] ⚠️ Laser ON 이미지 수신 실패")
                     continue
@@ -639,7 +1061,7 @@ class PointingHandlerMixin:
                 time.sleep(led_settle)
                 
                 img_laser_off = self._snap_and_wait(f"pointing_laser_off_{iteration}", 
-                                                    shutter_speed=500, analogue_gain=1.0)
+                                                    shutter_speed=2500, analogue_gain=1.0)
                 if img_laser_off is None:
                     print("[Pointing] ⚠️ Laser OFF 이미지 수신 실패")
                     continue
@@ -684,6 +1106,11 @@ class PointingHandlerMixin:
                 if abs(err_x) <= CONVERGENCE_TOL_PX_X and abs(err_y) <= CONVERGENCE_TOL_PX_Y:
                     # 수렴 위치를 해당 Track의 기준 위치로 저장(다음에 ID 버튼 클릭 시 바로 이동)
                     self.computed_targets[track_id] = (
+                        round(self._curr_pan, 3),
+                        round(self._curr_tilt, 3),
+                    )
+                    self._update_target_button_value(
+                        track_id,
                         round(self._curr_pan, 3),
                         round(self._curr_tilt, 3),
                     )
@@ -762,10 +1189,22 @@ class PointingHandlerMixin:
                 ))
         except Exception:
             pass
+
+    def _update_target_button_value(self, track_id, pan, tilt):
+        """Pointing 탭 ID 옆 좌표 라벨 갱신 (thread-safe)"""
+        try:
+            if hasattr(self, 'pointing_tab') and hasattr(self.pointing_tab, 'update_target_value'):
+                self.root.after(
+                    0,
+                    lambda tid=track_id, p=pan, t=tilt: self.pointing_tab.update_target_value(tid, p, t),
+                )
+        except Exception:
+            pass
     
-    def _draw_debug_image(self, base_img, target_cx, target_cy, laser_pos, 
+    def _draw_debug_image(self, base_img, target_cx, target_cy, laser_pos,
                           best_bbox, all_bboxes, err_x, err_y, iteration,
-                          img_laser_on=None, img_laser_off=None, log_dir=None):
+                          img_laser_on=None, img_laser_off=None, log_dir=None,
+                          tol_x=None, tol_y=None):
         """
         디버그 시각화 이미지 생성 → Pointing 탭에 표시 + 로깅
         """
@@ -804,12 +1243,17 @@ class PointingHandlerMixin:
                     cv2.rectangle(debug, (int(mx), int(my)), 
                                   (int(mx+mw), int(my+mh)), (128, 128, 128), 2)
             
+            if tol_x is None:
+                tol_x = CONVERGENCE_TOL_PX_X
+            if tol_y is None:
+                tol_y = CONVERGENCE_TOL_PX_Y
+
             # 오차 정보
-            converged = abs(err_x) <= CONVERGENCE_TOL_PX_X and abs(err_y) <= CONVERGENCE_TOL_PX_Y
+            converged = abs(err_x) <= tol_x and abs(err_y) <= tol_y
             color = (0, 255, 0) if converged else (0, 0, 255)
             cv2.putText(debug, f"Iter {iteration}  Err: ({err_x:.1f}, {err_y:.1f}) = {err_mag:.1f}px",
                         (30, 50), cv2.FONT_HERSHEY_SIMPLEX, 1.0, color, 2)
-            cv2.putText(debug, f"Tol: ({CONVERGENCE_TOL_PX_X}, {CONVERGENCE_TOL_PX_Y})px",
+            cv2.putText(debug, f"Tol: ({tol_x}, {tol_y})px",
                         (30, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (200, 200, 200), 2)
             # 현재 Pan/Tilt 표시
             cur_pan = getattr(self, '_curr_pan', 0.0)
@@ -826,8 +1270,11 @@ class PointingHandlerMixin:
             crop = debug[y1c:y2c, x1c:x2c]
             
             # UI로 전송 (thread-safe)
-            self.root.after(0, lambda img=crop.copy(), ex=err_x, ey=err_y, em=err_mag, it=iteration: 
-                            self._show_debug_preview(img, ex, ey, em, it))
+            self.root.after(
+                0,
+                lambda img=crop.copy(), ex=err_x, ey=err_y, em=err_mag, it=iteration, tx=tol_x, ty=tol_y:
+                self._show_debug_preview(img, ex, ey, em, it, tx, ty),
+            )
             
             # ⭐ Laser Diff 이미지 생성 + UI 전송
             if img_laser_on is not None and img_laser_off is not None:
@@ -901,7 +1348,8 @@ class PointingHandlerMixin:
         except Exception as e:
             print(f"[Pointing] Debug 이미지 생성 오류: {e}")
     
-    def _show_debug_preview(self, img_bgr, err_x=0, err_y=0, err_mag=0, iteration=0):
+    def _show_debug_preview(self, img_bgr, err_x=0, err_y=0, err_mag=0, iteration=0,
+                            tol_x=None, tol_y=None):
         """디버그 프리뷰 이미지를 Pointing 탭에 표시 (main thread)"""
         try:
             from PIL import Image, ImageTk
@@ -915,9 +1363,13 @@ class PointingHandlerMixin:
             
             # 오차 텍스트 업데이트
             if hasattr(self, 'pointing_tab') and hasattr(self.pointing_tab, 'debug_error_label'):
-                color = "green" if abs(err_x) <= CONVERGENCE_TOL_PX_X and abs(err_y) <= CONVERGENCE_TOL_PX_Y else "red"
+                if tol_x is None:
+                    tol_x = CONVERGENCE_TOL_PX_X
+                if tol_y is None:
+                    tol_y = CONVERGENCE_TOL_PX_Y
+                color = "green" if abs(err_x) <= tol_x and abs(err_y) <= tol_y else "red"
                 self.pointing_tab.debug_error_label.config(
-                    text=f"[Iter {iteration}]  err_x={err_x:.1f}px  err_y={err_y:.1f}px  |err|={err_mag:.1f}px  (tol=({CONVERGENCE_TOL_PX_X}, {CONVERGENCE_TOL_PX_Y})px)",
+                    text=f"[Iter {iteration}]  err_x={err_x:.1f}px  err_y={err_y:.1f}px  |err|={err_mag:.1f}px  (tol=({tol_x}, {tol_y})px)",
                     fg=color
                 )
         except Exception as e:
@@ -1047,10 +1499,13 @@ class PointingHandlerMixin:
         roi_on = img_on[roi_y1:roi_y2, roi_x1:roi_x2]
         roi_off = img_off[roi_y1:roi_y2, roi_x1:roi_x2]
         
-        # Diff & Threshold
+        # Diff & band-pass threshold (100~200 구간만 사용)
         diff = cv2.absdiff(roi_on, roi_off)
         gray = cv2.cvtColor(diff, cv2.COLOR_BGR2GRAY)
-        _, mask = cv2.threshold(gray, 40, 255, cv2.THRESH_BINARY)
+        thr_low = 100.0
+        thr_high = 150.0
+        weight = gray.astype(np.float32)
+        weight[(weight < thr_low) | (weight > thr_high)] = 0.0
         
         # 마스킹 (객체 영역 제거)
         if exclude_bboxes:
@@ -1061,15 +1516,20 @@ class PointingHandlerMixin:
                 ry2 = min(roi_y2 - roi_y1, by + bh - roi_y1)
                 
                 if rx1 < rx2 and ry1 < ry2:
-                    mask[ry1:ry2, rx1:rx2] = 0
+                    weight[ry1:ry2, rx1:rx2] = 0.0
 
-        # 무게중심
-        ys, xs = np.where(mask > 0)
+        # 밝기 가중 무게중심 (Intensity-weighted centroid)
+        ys, xs = np.nonzero(weight > 0)
         if len(xs) == 0:
             return None
-            
-        roi_cx = int(np.mean(xs))
-        roi_cy = int(np.mean(ys))
+
+        w = weight[ys, xs].astype(np.float64)
+        w_sum = float(np.sum(w))
+        if w_sum <= 0.0:
+            return None
+
+        roi_cx = int(np.sum(xs * w) / w_sum)
+        roi_cy = int(np.sum(ys * w) / w_sum)
         
         return (roi_cx + roi_x1, roi_cy + roi_y1)
 
