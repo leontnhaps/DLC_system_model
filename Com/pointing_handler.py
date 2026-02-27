@@ -676,7 +676,7 @@ class PointingHandlerMixin:
                 time.sleep(led_settle)
                 img_led_on = self._snap_and_wait(
                     f"pointing_rough_led_on_{iteration}",
-                    shutter_speed=100000,
+                    shutter_speed=10000,
                     analogue_gain=None,
                 )
                 if img_led_on is None:
@@ -688,7 +688,7 @@ class PointingHandlerMixin:
                 time.sleep(led_settle)
                 img_led_off = self._snap_and_wait(
                     f"pointing_rough_led_off_{iteration}",
-                    shutter_speed=100000,
+                    shutter_speed=10000,
                     analogue_gain=None,
                 )
                 if img_led_off is None:
@@ -1062,7 +1062,7 @@ class PointingHandlerMixin:
                 self.ctrl.send({"cmd": "led", "value": 255})
                 time.sleep(led_settle)
                 
-                img_led_on = self._snap_and_wait(f"pointing_led_on_{iteration}", shutter_speed=100000, analogue_gain=None)
+                img_led_on = self._snap_and_wait(f"pointing_led_on_{iteration}", shutter_speed=10000, analogue_gain=None)
                 if img_led_on is None:
                     print("[Pointing] ⚠️ LED ON 이미지 수신 실패")
                     self.ctrl.send({"cmd": "led", "value": 0})
@@ -1072,7 +1072,7 @@ class PointingHandlerMixin:
                 self.ctrl.send({"cmd": "led", "value": 0})
                 time.sleep(led_settle)
                 
-                img_led_off = self._snap_and_wait(f"pointing_led_off_{iteration}", shutter_speed=100000, analogue_gain=None)
+                img_led_off = self._snap_and_wait(f"pointing_led_off_{iteration}", shutter_speed=10000, analogue_gain=None)
                 if img_led_off is None:
                     print("[Pointing] ⚠️ LED OFF 이미지 수신 실패")
                     continue
