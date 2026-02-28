@@ -476,19 +476,11 @@ class PointingTab:
         self.aim_status_label.grid(row=r, column=0, columnspan=3, sticky="w", padx=10, pady=5)
         r += 1
 
-        # Aiming 모드 선택 (기본: rough)
+        # Aiming 모드 (고정: adaptive)
         Label(self.frame, text="Aiming Mode:").grid(row=r, column=0, sticky="w", padx=(5, 10), pady=3)
-        self.pointing_mode = StringVar(value="rough")
-        self.mode_combo = ttk.Combobox(
-            self.frame,
-            textvariable=self.pointing_mode,
-            state="readonly",
-            width=18,
-            values=("rough", "legacy"),
-        )
-        self.mode_combo.grid(row=r, column=1, sticky="w", padx=2)
-        self.mode_combo.bind("<<ComboboxSelected>>", lambda _e: self._on_mode_changed())
-        self._on_mode_changed()
+        Label(self.frame, text="adaptive (fixed)", fg="#666").grid(row=r, column=1, sticky="w", padx=2)
+        if self.callbacks.get('set_pointing_mode'):
+            self.callbacks['set_pointing_mode']("adaptive")
         r += 1
 
         # 선택된 타깃에 대해 Start로 정밀 조준 시작
@@ -546,10 +538,6 @@ class PointingTab:
         if self.callbacks.get('pointing_compute'):
             self.callbacks['pointing_compute']()
 
-    def _on_mode_changed(self):
-        if self.callbacks.get('set_pointing_mode'):
-            self.callbacks['set_pointing_mode'](self.pointing_mode.get())
-    
     def _on_stop_aiming(self):
         if self.callbacks.get('stop_aiming'):
             self.callbacks['stop_aiming']()
@@ -670,9 +658,14 @@ class SchedulingTab:
         )
         r += 1
 
-        self.dwell_seconds = DoubleVar(value=10.0)
-        Label(self.frame, text="Shoot Dwell (s)").grid(row=r, column=0, sticky="w", padx=8, pady=4)
+        self.dwell_seconds = DoubleVar(value=20.0)
+        Label(self.frame, text="Shoot Timer (s)").grid(row=r, column=0, sticky="w", padx=8, pady=4)
         ttk.Entry(self.frame, textvariable=self.dwell_seconds, width=10).grid(row=r, column=1, sticky="w", padx=8, pady=4)
+        r += 1
+        
+        self.led_probe_seconds = DoubleVar(value=10.0)
+        Label(self.frame, text="Battery Check (s)").grid(row=r, column=0, sticky="w", padx=8, pady=4)
+        ttk.Entry(self.frame, textvariable=self.led_probe_seconds, width=10).grid(row=r, column=1, sticky="w", padx=8, pady=4)
         r += 1
 
         self.btn_roundrobin = Button(
@@ -727,5 +720,11 @@ class SchedulingTab:
     def get_dwell_seconds(self):
         try:
             return max(0.2, float(self.dwell_seconds.get()))
+        except Exception:
+            return 20.0
+    
+    def get_led_probe_seconds(self):
+        try:
+            return max(0.5, float(self.led_probe_seconds.get()))
         except Exception:
             return 10.0
