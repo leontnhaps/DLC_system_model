@@ -7,6 +7,8 @@ import pathlib
 import datetime
 import time
 from tkinter import Tk, Label, Frame, ttk
+import cv2
+import numpy as np
 
 from network import GuiCtrlClient, GuiImgClient
 from event_handlers import EventHandlersMixin
@@ -15,6 +17,7 @@ from app_helpers import AppHelpersMixin
 from ui_components import PreviewFrame, ScanTab, TestSettingsTab, PointingTab, SchedulingTab
 from scan_controller import ScanController
 from yolo_utils import YOLOProcessor
+from led_filter import classify_from_single_roi, get_default_led_filter_params
 import threading
 
 SERVER_HOST = "127.0.0.1"
@@ -23,7 +26,7 @@ GUI_IMG_PORT = 7601
 
 # 저장 디렉토리
 SAVE_DIR = pathlib.Path("captures")
-ROUNDROBIN_DWELL_S = 10.0
+ROUNDROBIN_DWELL_S = 20.0
 ROUNDROBIN_AIM_TIMEOUT_S = 120.0
 
 
@@ -142,14 +145,30 @@ class ComApp(EventHandlersMixin, PointingHandlerMixin, AppHelpersMixin):
         self._scheduling_active = False
         self._scheduling_thread = None
         self._scheduling_stop_event = threading.Event()
+        self._scheduling_led_latest = {}
+        self._scheduling_led_history = []
+        self._track_led_roi = {}  # {track_id: (x,y,w,h)}
+        
+        # Blocking snap wait state (Scheduling probe 등에서 사용)
+        self._blocking_snap_lock = threading.Lock()
+        self._blocking_snap_event = threading.Event()
+        self._blocking_snap_expected_name = None
+        self._blocking_snap_data = None
+        
+        # LED filter params (shared with scan/pointing/scheduling)
+        self.led_filter_params = get_default_led_filter_params()
         
         # Scan Controller
-        self.scan_ctrl = ScanController(SAVE_DIR, self.yolo_processor)
+        self.scan_ctrl = ScanController(
+            SAVE_DIR,
+            self.yolo_processor,
+            led_filter_params=self.led_filter_params,
+        )
 
         # Pointing related initializations (from PointingHandlerMixin)
         self._pointing_gains = {}
         self._pointing_img_event = threading.Event()
-        self.pointing_mode = "rough"  # rough | legacy
+        self.pointing_mode = "adaptive"
         
         # Frame count (for preview)
         self.frame_count = 0
@@ -211,13 +230,14 @@ class ComApp(EventHandlersMixin, PointingHandlerMixin, AppHelpersMixin):
         print(f"[PREVIEW] Auto-restore ({reason}): {w}x{h} @ {fps}fps")
         self.toggle_preview(True, w, h, fps, q)
 
-    def _set_preview_overlay(self, current_id=None, phase="Idle", dwell_elapsed=None, dwell_total=None):
+    def _set_preview_overlay(self, current_id=None, phase="Idle", dwell_elapsed=None, dwell_total=None, led_state=None):
         """프리뷰 오버레이(현재 ID + Phase + Shoot Dwell 진행률) 갱신"""
         cid = "-" if current_id is None else str(current_id)
+        led_txt = "-" if led_state in (None, "") else str(led_state)
         if dwell_elapsed is not None and dwell_total is not None and dwell_total > 0:
-            text = f"Shoot Dwell: {dwell_elapsed:.1f}/{dwell_total:.1f}s | ID: {cid} | {phase}"
+            text = f"Shoot Timer: {dwell_elapsed:.1f}/{dwell_total:.1f}s | ID: {cid} | LED: {led_txt} | {phase}"
         else:
-            text = f"Shoot Dwell: - | ID: {cid} | {phase}"
+            text = f"Shoot Timer: - | ID: {cid} | LED: {led_txt} | {phase}"
         if hasattr(self, "preview_frame") and hasattr(self.preview_frame, "set_overlay_text"):
             self.root.after(0, lambda t=text: self.preview_frame.set_overlay_text(t))
 
@@ -278,6 +298,10 @@ class ComApp(EventHandlersMixin, PointingHandlerMixin, AppHelpersMixin):
         else:
             self._resume_preview_after_scan = False
             self._scan_preview_cfg = None
+        
+        # LED 인식은 Normal(가시광선) 모드 기반으로 처리
+        self.set_ir_cut("night")
+        time.sleep(0.05)
         
         # YOLO weights 경로 추출
         yolo_weights = params.pop('yolo_weights', None)
@@ -366,6 +390,128 @@ class ComApp(EventHandlersMixin, PointingHandlerMixin, AppHelpersMixin):
         if "error" in holder:
             raise holder["error"]
         return holder.get("result")
+    
+    def _notify_blocking_snap_saved(self, name, data):
+        """
+        saved 이벤트에서 blocking-snap 대기자에게 데이터 전달.
+        반환값은 소비 여부가 아니라 '대기자에게 전달했는지'만 의미.
+        """
+        with self._blocking_snap_lock:
+            expected = self._blocking_snap_expected_name
+            if not expected:
+                return False
+            if name != expected:
+                return False
+            self._blocking_snap_data = data
+            self._blocking_snap_event.set()
+            return True
+    
+    def _blocking_snap_and_wait(self, save_name, timeout=10.0, shutter_speed=None, analogue_gain=None):
+        """Scheduling 등에서 사용할 blocking snap helper (thread-safe)."""
+        if not save_name.lower().endswith(".jpg"):
+            save_name = f"{save_name}.jpg"
+
+        with self._blocking_snap_lock:
+            self._blocking_snap_expected_name = save_name
+            self._blocking_snap_data = None
+            self._blocking_snap_event.clear()
+
+        w = self.scan_tab.width.get()
+        h = self.scan_tab.height.get()
+        q = self.scan_tab.quality.get()
+        cmd = {
+            "cmd": "snap",
+            "width": int(w),
+            "height": int(h),
+            "quality": int(q),
+            "save": save_name,
+        }
+        if shutter_speed is not None:
+            cmd["shutter_speed"] = int(shutter_speed)
+        if analogue_gain is not None:
+            cmd["analogue_gain"] = float(analogue_gain)
+        self.ctrl.send(cmd)
+
+        deadline = time.monotonic() + float(timeout)
+        try:
+            while True:
+                remain = deadline - time.monotonic()
+                if remain <= 0:
+                    print(f"[Scheduling] Snap timeout: {save_name}")
+                    return None
+                if self._scheduling_stop_event.is_set():
+                    return None
+                if self._blocking_snap_event.wait(timeout=min(0.1, remain)):
+                    with self._blocking_snap_lock:
+                        data = self._blocking_snap_data
+                    if not data:
+                        return None
+                    arr = np.frombuffer(data, np.uint8)
+                    img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+                    return img
+        finally:
+            with self._blocking_snap_lock:
+                self._blocking_snap_expected_name = None
+                self._blocking_snap_data = None
+                self._blocking_snap_event.clear()
+
+    def _probe_led_state_for_track(self, track_id, probe_interval_s=2.0):
+        """
+        Scheduling shoot loop 중 K초 주기 LED 상태 프로브.
+        LED ON/OFF 없이, 저장된 ROI에서 단일 프레임으로 LED 상태를 판정한다.
+        카메라 모드는 shoot loop의 현재 상태를 그대로 유지한다.
+        """
+        ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        snap_name = f"sched_led_single_id{track_id}_{ts}.jpg"
+
+        preview_was_on = bool(self._call_on_ui_thread(lambda: self.preview_active, timeout=2.0))
+        pred = "NONE"
+        score = {"R": 0, "G": 0, "B": 0}
+        roi = None
+        try:
+            roi = self._track_led_roi.get(track_id)
+            if roi is None:
+                print(f"[Scheduling] LED probe skipped (ID {track_id}): no stored ROI")
+                return "NONE"
+
+            img = self._blocking_snap_and_wait(snap_name, timeout=10.0, shutter_speed=10000, analogue_gain=None)
+            if img is None:
+                return "NONE"
+
+            pred, score, roi_used = classify_from_single_roi(
+                img,
+                roi,
+                params=self.led_filter_params,
+            )
+            if roi_used is not None:
+                self._track_led_roi[track_id] = tuple(int(v) for v in roi_used)
+            roi = roi_used
+
+            self._scheduling_led_latest[track_id] = pred
+            self._scheduling_led_history.append({
+                "ts": ts,
+                "track_id": int(track_id),
+                "pred": pred,
+                "r": int(score["R"]),
+                "g": int(score["G"]),
+                "b": int(score["B"]),
+                "roi": tuple(int(v) for v in roi) if roi is not None else None,
+                "mode": "single_roi",
+                "probe_interval_s": float(probe_interval_s),
+            })
+            return pred
+        except Exception as e:
+            print(f"[Scheduling] LED probe failed (ID {track_id}): {e}")
+            return "NONE"
+        finally:
+            if preview_was_on:
+                try:
+                    self._call_on_ui_thread(
+                        lambda: self.toggle_preview(True, *self._get_preview_cfg()),
+                        timeout=4.0,
+                    )
+                except Exception:
+                    pass
 
     def _set_scheduling_ui_state(self, is_running):
         def _update():
@@ -439,6 +585,13 @@ class ComApp(EventHandlersMixin, PointingHandlerMixin, AppHelpersMixin):
                 timeout=2.0
             ))
             dwell_s = max(0.2, dwell_s)
+            led_probe_s = float(self._call_on_ui_thread(
+                lambda: self.scheduling_tab.get_led_probe_seconds() if hasattr(self, "scheduling_tab") else 10.0,
+                timeout=2.0
+            ))
+            led_probe_s = max(0.5, led_probe_s)
+            self._scheduling_led_latest = {}
+            self._scheduling_led_history = []
 
             if final_targets:
                 self._set_scheduling_status(
@@ -476,7 +629,7 @@ class ComApp(EventHandlersMixin, PointingHandlerMixin, AppHelpersMixin):
 
                 ordered_ids = sorted(targets.keys())
                 self._set_scheduling_status(
-                    f"🎯 RoundRobin: {len(ordered_ids)}개 ID Rough 수렴 시작",
+                    f"🎯 RoundRobin: {len(ordered_ids)}개 ID Adaptive 수렴 시작",
                     fg="blue",
                 )
 
@@ -484,7 +637,7 @@ class ComApp(EventHandlersMixin, PointingHandlerMixin, AppHelpersMixin):
                 self._call_on_ui_thread(lambda: self.set_ir_cut("day"), timeout=3.0)
                 time.sleep(0.1)
 
-                # Phase A: 모든 ID를 rough aiming으로 수렴
+                # Phase A: 모든 ID를 adaptive aiming으로 수렴
                 for idx, track_id in enumerate(ordered_ids, start=1):
                     if self._scheduling_stop_event.is_set():
                         final_message = "⛔ Scheduling 중지됨"
@@ -492,18 +645,22 @@ class ComApp(EventHandlersMixin, PointingHandlerMixin, AppHelpersMixin):
                         return
 
                     self._set_scheduling_status(
-                        f"🎯 Rough [{idx}/{len(ordered_ids)}] ID {track_id} 수렴 중...",
+                        f"🎯 Adaptive [{idx}/{len(ordered_ids)}] ID {track_id} 수렴 중...",
                         fg="blue",
                     )
-                    self._set_preview_overlay(current_id=track_id, phase="Rough")
+                    self._set_preview_overlay(
+                        current_id=track_id,
+                        phase="Adaptive",
+                        led_state=self._scheduling_led_latest.get(track_id, "-"),
+                    )
 
-                    self._call_on_ui_thread(lambda: self.set_pointing_mode("rough"), timeout=2.0)
+                    self._call_on_ui_thread(lambda: self.set_pointing_mode("adaptive"), timeout=2.0)
                     self._call_on_ui_thread(lambda tid=track_id: self.move_to_target(tid), timeout=3.0)
                     time.sleep(settle_s)
 
                     started = bool(self._call_on_ui_thread(lambda tid=track_id: self.start_aiming(tid), timeout=3.0))
                     if not started:
-                        print(f"[Scheduling] Rough start failed for ID {track_id}, skip")
+                        print(f"[Scheduling] Adaptive start failed for ID {track_id}, skip")
                         continue
 
                     aim_deadline = time.monotonic() + ROUNDROBIN_AIM_TIMEOUT_S
@@ -511,7 +668,7 @@ class ComApp(EventHandlersMixin, PointingHandlerMixin, AppHelpersMixin):
                         if not getattr(self, "_aiming_active", False):
                             break
                         if time.monotonic() >= aim_deadline:
-                            print(f"[Scheduling] Rough timeout for ID {track_id} -> stop_aiming")
+                            print(f"[Scheduling] Adaptive timeout for ID {track_id} -> stop_aiming")
                             self.stop_aiming()
                             break
                         time.sleep(0.2)
@@ -525,17 +682,28 @@ class ComApp(EventHandlersMixin, PointingHandlerMixin, AppHelpersMixin):
                     self.ctrl.send({"cmd": "laser", "value": 0})
                     self.laser_state = False
                     time.sleep(0.2)
+                    # adaptive 중 수집된 최신 LED 예측이 있으면 반영
+                    led_hint = getattr(self, "_last_object_led_info", {}).get("pred")
+                    if led_hint:
+                        self._scheduling_led_latest[track_id] = str(led_hint)
+                    roi_hint = getattr(self, "_last_object_led_info", {}).get("roi")
+                    if roi_hint is not None:
+                        try:
+                            self._track_led_roi[track_id] = tuple(int(v) for v in roi_hint)
+                        except Exception:
+                            pass
 
                 final_targets = dict(getattr(self, "computed_targets", {}) or {})
                 if not final_targets:
-                    raise RuntimeError("Rough 수렴 후 사용 가능한 ID가 없습니다.")
+                    raise RuntimeError("Adaptive 수렴 후 사용 가능한 ID가 없습니다.")
 
             final_ids = sorted(final_targets.keys())
             if not final_ids:
                 raise RuntimeError("Scheduling용 타깃이 없습니다.")
 
             self._set_scheduling_status(
-                f"🔴 RoundRobin Shoot: {len(final_ids)}개 ID 순환 조사 시작 ({dwell_s:.1f}초/ID, Stop까지 계속)",
+                f"🔴 RoundRobin Shoot: {len(final_ids)}개 ID 순환 조사 시작 "
+                f"({dwell_s:.1f}초/ID, Battery check {led_probe_s:.1f}초, Stop까지 계속)",
                 fg="blue",
             )
             self._set_preview_overlay(current_id=None, phase="Shoot", dwell_elapsed=0.0, dwell_total=dwell_s)
@@ -548,7 +716,7 @@ class ComApp(EventHandlersMixin, PointingHandlerMixin, AppHelpersMixin):
                     timeout=4.0,
                 )
                 time.sleep(0.2)
-
+            
             # Phase B: ID 순환 조사 (Stop까지 반복)
             loop_count = 0
             while not self._scheduling_stop_event.is_set():
@@ -572,26 +740,62 @@ class ComApp(EventHandlersMixin, PointingHandlerMixin, AppHelpersMixin):
                         f"🔴 Shoot loop {loop_count} [{idx}/{len(final_ids)}] ID {track_id}",
                         fg="blue",
                     )
-                    self._set_preview_overlay(current_id=track_id, phase="Shoot", dwell_elapsed=0.0, dwell_total=dwell_s)
+                    led_state = self._scheduling_led_latest.get(track_id, "-")
+                    self._set_preview_overlay(
+                        current_id=track_id,
+                        phase="Shoot",
+                        dwell_elapsed=0.0,
+                        dwell_total=dwell_s,
+                        led_state=led_state,
+                    )
                     self._call_on_ui_thread(
                         lambda tid=track_id: self.move_to_target(tid, use_tilt_approach=True),
                         timeout=5.0,
                     )
                     time.sleep(settle_s)
 
+                    # Per-ID policy: first few seconds in IR, then keep Normal mode.
+                    ir_head_s = 3.0
+                    current_mode = "day"  # day=IR mode, night=Normal mode
+                    self._call_on_ui_thread(lambda m=current_mode: self.set_ir_cut(m), timeout=3.0)
+
                     self.ctrl.send({"cmd": "laser", "value": 1})
                     self.laser_state = True
 
                     start_t = time.monotonic()
+                    # Battery check 기준은 각 ID shoot elapsed(=start_t 기준)로 통일
+                    next_probe_elapsed = led_probe_s
+                    edge_eps = 1e-3  # 경계(시작/끝) 체크 제외용
                     while (time.monotonic() - start_t) < dwell_s:
                         if self._scheduling_stop_event.is_set():
                             break
                         elapsed = time.monotonic() - start_t
+                        while elapsed >= next_probe_elapsed:
+                            probe_elapsed = next_probe_elapsed
+                            next_probe_elapsed += led_probe_s
+
+                            # "시작/끝 제외": 현재 ID 구간 내부 시점에서만 체크
+                            if probe_elapsed <= edge_eps or probe_elapsed >= (dwell_s - edge_eps):
+                                continue
+
+                            probe_pred = self._probe_led_state_for_track(
+                                track_id,
+                                probe_interval_s=led_probe_s,
+                            )
+                            self._scheduling_led_latest[track_id] = probe_pred
+                            # 한 루프에서 과도한 연속 체크 방지
+                            break
+
+                        desired_mode = "day" if elapsed < ir_head_s else "night"
+                        if desired_mode != current_mode:
+                            self._call_on_ui_thread(lambda m=desired_mode: self.set_ir_cut(m), timeout=3.0)
+                            current_mode = desired_mode
                         self._set_preview_overlay(
                             current_id=track_id,
                             phase="Shoot",
                             dwell_elapsed=min(elapsed, dwell_s),
                             dwell_total=dwell_s,
+                            led_state=self._scheduling_led_latest.get(track_id, "-"),
                         )
                         time.sleep(0.1)
 
