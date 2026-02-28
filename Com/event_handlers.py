@@ -106,6 +106,10 @@ class EventHandlersMixin:
                 self._set_preview(data)
                 return
         
+        # Scheduling 등 blocking snap 대기자에게도 알림 (소비하지는 않음)
+        if hasattr(self, "_notify_blocking_snap_saved"):
+            self._notify_blocking_snap_saved(name, data)
+        
         # Scan 이미지 자동 저장 (ScanController 사용)
         if self.scan_ctrl.is_active():
             saved_path = self.scan_ctrl.save_image(name, data)
