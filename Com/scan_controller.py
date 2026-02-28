@@ -12,11 +12,16 @@ from datetime import datetime
 import cv2
 import numpy as np
 from mot import ObjectTracker
+from led_filter import (
+    classify_from_single_roi,
+    expand_led_roi_from_bbox,
+    get_default_led_filter_params,
+)
 
 
 class ScanController:
     """실시간 스캔 처리 관리자 - Worker Thread pattern"""
-    def __init__(self, save_dir, yolo_processor=None):
+    def __init__(self, save_dir, yolo_processor=None, led_filter_params=None):
         """
         Args:
             save_dir: 베이스 저장 디렉토리 (pathlib.Path)
@@ -25,6 +30,7 @@ class ScanController:
         self.save_dir = pathlib.Path(save_dir)
         self.save_dir.mkdir(exist_ok=True)
         self.yolo_processor = yolo_processor
+        self.led_filter_params = dict(led_filter_params or get_default_led_filter_params())
         
         # MOT Tracker
         self.mot_tracker = ObjectTracker(roi_size=300, grid_size=(11, 11))
@@ -150,6 +156,34 @@ class ScanController:
                     
                     # MOT tracking
                     if boxes:
+                        led_infos = []
+                        for (x, y, w, h) in boxes:
+                            # LED 판정은 항상 LED OFF 단일 프레임 기준으로 수행
+                            led_roi_seed = expand_led_roi_from_bbox(
+                                (x, y, w, h),
+                                pair['off'].shape,
+                                top_ratio=1.0 / 3.0,
+                            )
+                            pred, score, roi = classify_from_single_roi(
+                                pair['off'],
+                                led_roi_seed,
+                                params=self.led_filter_params,
+                            )
+                            if roi is None:
+                                rx = ry = rw = rh = 0
+                            else:
+                                rx, ry, rw, rh = roi
+                            led_infos.append({
+                                "pred": pred,
+                                "r": int(score["R"]),
+                                "g": int(score["G"]),
+                                "b": int(score["B"]),
+                                "rx": int(rx),
+                                "ry": int(ry),
+                                "rw": int(rw),
+                                "rh": int(rh),
+                            })
+
                         # Timestamp 생성 (pan, tilt 기반)
                         timestamp = f"{pan:+04d}_{tilt:+03d}"
                         
@@ -164,10 +198,16 @@ class ScanController:
                         # CSV 저장 (track_id 포함)
                         if self.csv_writer:
                             for i, (x, y, w, h) in enumerate(boxes):
+                                led = led_infos[i] if i < len(led_infos) else {
+                                    "pred": "NONE", "r": 0, "g": 0, "b": 0,
+                                    "rx": 0, "ry": 0, "rw": 0, "rh": 0,
+                                }
                                 self.csv_writer.writerow([
                                     pan, tilt, x+w/2, y+h/2, w, h,
                                     float(scores[i]), int(classes[i]), W, H,
-                                    track_ids[i]  # ⭐ track_id 추가
+                                    track_ids[i],  # ⭐ track_id 추가
+                                    led["pred"], led["r"], led["g"], led["b"],
+                                    led["rx"], led["ry"], led["rw"], led["rh"],
                                 ])
                                 self.detected_count += 1
                             self.csv_file.flush()
@@ -206,7 +246,12 @@ class ScanController:
             try:
                 self.csv_file = open(self.csv_path, "w", newline="", encoding="utf-8")
                 self.csv_writer = csv.writer(self.csv_file)
-                self.csv_writer.writerow(["pan_deg", "tilt_deg", "cx", "cy", "w", "h", "conf", "cls", "W", "H", "track_id"])
+                self.csv_writer.writerow([
+                    "pan_deg", "tilt_deg", "cx", "cy", "w", "h",
+                    "conf", "cls", "W", "H", "track_id",
+                    "led_pred", "led_r_score", "led_g_score", "led_b_score",
+                    "led_roi_x", "led_roi_y", "led_roi_w", "led_roi_h",
+                ])
                 print(f"[ScanController] CSV created: {self.csv_path}")
             except Exception as e:
                 print(f"[ScanController] CSV creation failed: {e}")
