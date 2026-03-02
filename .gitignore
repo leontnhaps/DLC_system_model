@@ -230,3 +230,5 @@ mot_output_*/**/*.log
 Captures/**
 # CSV files
 *.csv
+
+.vscode
