@@ -40,6 +40,7 @@ cython_debug/
 .env
 .envrc
 .venv
+.uv-cache/
 env/
 venv/
 ENV/
@@ -139,6 +140,7 @@ mot_output_*/**/*.log
 captures/
 Captures/
 captures_server_*
+Com_refactor/tests/_scratch/
 Captures/**
 *.csv
 *.jpg
