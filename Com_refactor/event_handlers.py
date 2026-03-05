@@ -15,9 +15,10 @@ class EventHandlersMixin:
     
     def _poll(self):
         """통합 이벤트 루프 - ui_q에서 모든 이벤트 처리"""
+        q = self.bus if hasattr(self, "bus") else ui_q
         try:
             while True:
-                tag, payload = ui_q.get_nowait()
+                tag, payload = q.get_nowait()
                 
                 if tag == "evt":
                     self._handle_event(payload)
@@ -96,29 +97,31 @@ class EventHandlersMixin:
     def _handle_saved_image(self, payload):
         """저장된 이미지 처리"""
         name, data = payload
-        
-        # ⭐ Pointing 조준 중이면 이미지를 pointing handler로 전달
+        from image_router import route_saved_image
+
+        try:
+            route_saved_image(self, name, data)
+            return
+        except Exception as e:
+            print(f"[ROUTER] route_saved_image fallback: {e}")
+
+        # Legacy fallback path (preserve original inline behavior)
         if hasattr(self, '_aiming_active') and self._aiming_active:
             if name.startswith("pointing_"):
                 print(f"[POINTING_IMG] Routing to pointing handler: {name}")
                 self._on_pointing_image_received(name, data)
-                # 프리뷰에도 표시
                 self._set_preview(data)
                 return
-        
-        # Scheduling 등 blocking snap 대기자에게도 알림 (소비하지는 않음)
+
         if hasattr(self, "_notify_blocking_snap_saved"):
             self._notify_blocking_snap_saved(name, data)
-        
-        # Scan 이미지 자동 저장 (ScanController 사용)
+
         if self.scan_ctrl.is_active():
             saved_path = self.scan_ctrl.save_image(name, data)
             if saved_path:
                 print(f"[SCAN_SAVE] {saved_path}")
-                # done 이후 finalize idle 기준 갱신
                 self._last_scan_image_ts = time.monotonic()
         else:
-            # Snap 등 일반 저장 (SAVE_DIR에)
             from pathlib import Path
             SAVE_DIR = Path("captures")
             SAVE_DIR.mkdir(exist_ok=True)
@@ -128,9 +131,7 @@ class EventHandlersMixin:
             print(f"[SAVE] {save_path}")
             self.info_label.config(text=f"💾 저장됨: {name}")
 
-            # 수동 Snap 완료 콜백 (Preview 자동 복구용)
             if name.startswith("snap_") and hasattr(self, '_on_manual_snap_saved'):
                 self._on_manual_snap_saved(name)
-        
-        # ⭐ 프리뷰 표시 (Scan 이미지도 보임!)
+
         self._set_preview(data)

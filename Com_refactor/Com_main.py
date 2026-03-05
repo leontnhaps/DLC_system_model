@@ -3,14 +3,16 @@
 Com Client - Modular architecture with mixins
 """
 
-import pathlib
 import datetime
 import time
 from tkinter import Tk, Label, Frame, ttk
 import cv2
 import numpy as np
 
-from network import GuiCtrlClient, GuiImgClient
+from app_config import SERVER_HOST, GUI_CTRL_PORT, GUI_IMG_PORT, SAVE_DIR
+from app_state import AppState
+from infra_event_bus import EventBus
+from network import GuiCtrlClient, GuiImgClient, ui_q
 from event_handlers import EventHandlersMixin
 from pointing_handler import PointingHandlerMixin
 from app_helpers import AppHelpersMixin
@@ -20,21 +22,32 @@ from yolo_utils import YOLOProcessor
 from led_filter import classify_from_single_roi, get_default_led_filter_params
 import threading
 
-SERVER_HOST = "127.0.0.1"
-GUI_CTRL_PORT = 7600
-GUI_IMG_PORT = 7601
-
-# 저장 디렉토리
-SAVE_DIR = pathlib.Path("captures")
 ROUNDROBIN_DWELL_S = 20.0
 ROUNDROBIN_AIM_TIMEOUT_S = 120.0
 
 
 class ComApp(EventHandlersMixin, PointingHandlerMixin, AppHelpersMixin):
     """메인 앱 - 믹스인 패턴으로 이벤트 처리 분리"""
+
+    @property
+    def laser_state(self) -> bool:
+        return self.state.laser_state
+
+    @laser_state.setter
+    def laser_state(self, value: bool) -> None:
+        self.state.laser_state = value
+
+    @property
+    def preview_active(self) -> bool:
+        return self.state.preview_active
+
+    @preview_active.setter
+    def preview_active(self, value: bool) -> None:
+        self.state.preview_active = value
     
     def __init__(self, root: Tk):
         self.root = root
+        self.state = AppState()
         root.title("IR-CUT Camera System")
         root.geometry("1200x800")
         
@@ -172,12 +185,15 @@ class ComApp(EventHandlersMixin, PointingHandlerMixin, AppHelpersMixin):
         
         # Frame count (for preview)
         self.frame_count = 0
+
+        # Event bus (wrap existing ui_q for backward compatibility)
+        self.bus = EventBus(ui_q)
         
         # Network Clients
-        self.ctrl = GuiCtrlClient(SERVER_HOST, GUI_CTRL_PORT)
+        self.ctrl = GuiCtrlClient(SERVER_HOST, GUI_CTRL_PORT, bus=self.bus)
         self.ctrl.start()
         
-        self.img = GuiImgClient(SERVER_HOST, GUI_IMG_PORT, SAVE_DIR)
+        self.img = GuiImgClient(SERVER_HOST, GUI_IMG_PORT, SAVE_DIR, bus=self.bus)
         self.img.start()
         
         # Start polling (from EventHandlersMixin)

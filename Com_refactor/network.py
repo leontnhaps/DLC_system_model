@@ -52,11 +52,18 @@ def _recv_exact(sock: socket.socket, size: int):
 class GuiCtrlClient(threading.Thread):
     """제어 소켓 - 명령 전송 + 이벤트 수신 (자동 재연결)"""
     
-    def __init__(self, host, port):
+    def __init__(self, host, port, bus=None):
         super().__init__(daemon=True)
         self.host = host
         self.port = port
         self.sock = None
+        self.bus = bus
+
+    def _publish(self, tag, payload):
+        if self.bus is not None:
+            self.bus.publish(tag, payload)
+        else:
+            ui_q.put((tag, payload))
     
     def run(self):
         """자동 재연결 루프"""
@@ -66,7 +73,7 @@ class GuiCtrlClient(threading.Thread):
                 s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
                 s.connect((self.host, self.port))
                 self.sock = s
-                ui_q.put(("toast", f"CTRL connected {self.host}:{self.port}"))
+                self._publish("toast", f"CTRL connected {self.host}:{self.port}")
                 
                 # 이벤트 수신 루프
                 buf = b""
@@ -86,11 +93,11 @@ class GuiCtrlClient(threading.Thread):
                             continue
                         try:
                             evt = json.loads(line)
-                            ui_q.put(("evt", evt))
+                            self._publish("evt", evt)
                         except:
                             continue
             except Exception as e:
-                ui_q.put(("toast", f"CTRL err: {e}. Retry in 3s..."))
+                self._publish("toast", f"CTRL err: {e}. Retry in 3s...")
                 if self.sock:
                     try:
                         self.sock.close()
@@ -112,12 +119,19 @@ class GuiCtrlClient(threading.Thread):
 class GuiImgClient(threading.Thread):
     """이미지 소켓 - 이미지 수신 (자동 재연결)"""
     
-    def __init__(self, host, port, outdir: pathlib.Path):
+    def __init__(self, host, port, outdir: pathlib.Path, bus=None):
         super().__init__(daemon=True)
         self.host = host
         self.port = port
         self.outdir = outdir
         self.sock = None
+        self.bus = bus
+
+    def _publish(self, tag, payload):
+        if self.bus is not None:
+            self.bus.publish(tag, payload)
+        else:
+            ui_q.put((tag, payload))
     
     def run(self):
         """자동 재연결 루프"""
@@ -126,7 +140,7 @@ class GuiImgClient(threading.Thread):
                 s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                 s.connect((self.host, self.port))
                 self.sock = s
-                ui_q.put(("toast", f"IMG connected {self.host}:{self.port}"))
+                self._publish("toast", f"IMG connected {self.host}:{self.port}")
                 
                 while True:
                     hdr = _recv_exact(s, 2)
@@ -152,9 +166,9 @@ class GuiImgClient(threading.Thread):
                         set_latest_preview(data)
                     else:
                         # 일반 이미지는 ui_q로만 전달 (저장은 event_handlers에서)
-                        ui_q.put(("saved", (name, data)))
+                        self._publish("saved", (name, data))
             except Exception as e:
-                ui_q.put(("toast", f"IMG err: {e}. Retry in 3s..."))
+                self._publish("toast", f"IMG err: {e}. Retry in 3s...")
                 if self.sock:
                     try:
                         self.sock.close()
