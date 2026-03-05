@@ -136,6 +136,9 @@ mot_output_*/**/*.txt
 mot_output_*/**/*.log
 
 # Captures & Data Files
+captures/
+Captures/
+captures_server_*
 Captures/**
 *.csv
 *.jpg
