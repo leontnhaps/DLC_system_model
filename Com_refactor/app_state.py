@@ -1,9 +1,5 @@
-"""Application runtime state container."""
+"""Compatibility wrapper for app runtime state."""
 
-from dataclasses import dataclass
+from app.state import AppState
 
-
-@dataclass
-class AppState:
-    laser_state: bool = False
-    preview_active: bool = False
+__all__ = ["AppState"]

@@ -1,9 +1,5 @@
-"""Application configuration constants."""
+"""Compatibility wrapper for app configuration constants."""
 
-import pathlib
+from app.config import SERVER_HOST, GUI_CTRL_PORT, GUI_IMG_PORT, SAVE_DIR
 
-
-SERVER_HOST = "127.0.0.1"
-GUI_CTRL_PORT = 7600
-GUI_IMG_PORT = 7601
-SAVE_DIR = pathlib.Path("captures")
+__all__ = ["SERVER_HOST", "GUI_CTRL_PORT", "GUI_IMG_PORT", "SAVE_DIR"]
