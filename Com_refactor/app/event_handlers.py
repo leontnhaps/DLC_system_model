@@ -12,6 +12,10 @@ from network import ui_q, pop_latest_preview
 
 class EventHandlersMixin:
     """이벤트 처리 믹스인 - _poll 및 이벤트 핸들링"""
+
+    def _get_scan_backend(self):
+        """Prefer ScanWorkflow when present, fallback to ScanController."""
+        return self.scan_workflow if hasattr(self, "scan_workflow") else self.scan_ctrl
     
     def _poll(self):
         """통합 이벤트 루프 - ui_q에서 모든 이벤트 처리"""
@@ -49,7 +53,8 @@ class EventHandlersMixin:
         
         if evt == "start":
             total = event.get("total", 0)
-            self.scan_ctrl.update_progress(0, total)
+            scan = self._get_scan_backend()
+            scan.update_progress(0, total)
             self.scan_tab.prog.configure(value=0, maximum=total)
             self.scan_tab.prog_lbl.config(text=f"0 / {total}")
             print(f"[EVENT] Scan started: {total} images")
@@ -58,14 +63,16 @@ class EventHandlersMixin:
             done = event.get("done", 0)
             total = event.get("total", 100)
             name = event.get("name", "")
-            
-            self.scan_ctrl.update_progress(done, total)
+
+            scan = self._get_scan_backend()
+            scan.update_progress(done, total)
             self.scan_tab.prog.configure(value=done, maximum=total)
             self.scan_tab.prog_lbl.config(text=f"{done} / {total}")
             print(f"[EVENT] Progress: {done}/{total} - {name}")
         
         elif evt == "done":
-            done, total = self.scan_ctrl.get_progress()
+            scan = self._get_scan_backend()
+            done, total = scan.get_progress()
             print(f"[EVENT] Scan completed: {done}/{total}")
             self.info_label.config(text=f"✅ 스캔 완료: {done}/{total}")
             
@@ -116,8 +123,9 @@ class EventHandlersMixin:
         if hasattr(self, "_notify_blocking_snap_saved"):
             self._notify_blocking_snap_saved(name, data)
 
-        if self.scan_ctrl.is_active():
-            saved_path = self.scan_ctrl.save_image(name, data)
+        scan = self._get_scan_backend()
+        if scan.is_active():
+            saved_path = scan.save_image(name, data)
             if saved_path:
                 print(f"[SCAN_SAVE] {saved_path}")
                 self._last_scan_image_ts = time.monotonic()

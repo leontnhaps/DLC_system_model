@@ -18,6 +18,8 @@ from pointing_handler import PointingHandlerMixin
 from app_helpers import AppHelpersMixin
 from ui_components import PreviewFrame, ScanTab, TestSettingsTab, PointingTab, SchedulingTab
 from scan_controller import ScanController
+from workflows.scan_workflow import ScanWorkflow
+from workflows.scheduling_workflow import SchedulingWorkflow
 from yolo_utils import YOLOProcessor
 from led_filter import classify_from_single_roi, get_default_led_filter_params
 import threading
@@ -177,6 +179,10 @@ class ComApp(EventHandlersMixin, PointingHandlerMixin, AppHelpersMixin):
             self.yolo_processor,
             led_filter_params=self.led_filter_params,
         )
+        self.scan_workflow = ScanWorkflow(self.scan_ctrl)
+        self.scheduling_workflow = SchedulingWorkflow()
+        if hasattr(self.scheduling_workflow, "set_context"):
+            self.scheduling_workflow.set_context(app=self)
 
         # Pointing related initializations (from PointingHandlerMixin)
         self._pointing_gains = {}
@@ -535,6 +541,10 @@ class ComApp(EventHandlersMixin, PointingHandlerMixin, AppHelpersMixin):
                 self.scheduling_tab.set_running_state(is_running)
         self.root.after(0, _update)
 
+    def _get_scheduling_backend(self):
+        """Return scheduling workflow backend when available."""
+        return self.scheduling_workflow if hasattr(self, "scheduling_workflow") else None
+
     def _set_scheduling_status(self, text, fg="#333"):
         def _update():
             if hasattr(self, "scheduling_tab"):
@@ -554,6 +564,10 @@ class ComApp(EventHandlersMixin, PointingHandlerMixin, AppHelpersMixin):
 
     def start_roundrobin(self):
         """RoundRobin 스케줄 시작"""
+        backend = self._get_scheduling_backend()
+        if backend and hasattr(backend, "set_context"):
+            backend.set_context(app=self)
+
         if self._scheduling_active:
             self._set_scheduling_status("⚠️ Scheduling already running", fg="orange")
             return False
