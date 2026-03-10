@@ -27,6 +27,15 @@ CONVERGENCE_TOL_PX_Y = 25      #   Y (px)
 OBJECT_SIZE_CM = 5.5         #   (cm) - offset 
 TARGET_OFFSET_CM = -12.25    #    12.25cm (2.75 + 5.5 + 4)
 LASER_DIFF_THRESHOLD = 150   #  diff threshold ()
+PHASE3_TARGET_BELOW_CM = 11.75  # 타겟 중심에서 아래(+y) 기준점(cm)
+PHASE3_MAX_ITERS = 12
+PHASE3_TOL_X_PX = 6
+PHASE3_TOL_Y_PX = 6
+PHASE3_DIFF_TOZERO_THRESH = 70.0
+PHASE3_ROI_HALF_SIZE_PX = 120
+PHASE3_ROI_MARGIN_FROM_TARGET_PX = 10
+PHASE3_STEP_DEG = 1.0
+PHASE3_ERR_COMPARE_EPS = 0.5
 MAX_STEP_DEG = 5.0           #    (deg/step)
 ROUGH_CAM_TO_LASER_CM = 6.0  #    (cm)
 ROUGH_TARGET_BELOW_CM = 12.5 # YOLO    (cm)
@@ -678,7 +687,7 @@ class PointingHandlerMixin:
         Adaptive  Thread:
           Phase 1) YOLO  X  X (X)
           Phase 2)  tilt +2deg  Laser ON/OFF(shutter=100) diff                   YOLO bbox   tilt1deg.
-                       .
+          Phase 3) Phase2 완료 지점에서 레이저 중심-목표점 오차 최소화 보정.
         """
         try:
             settle = self.scan_tab.settle.get()
@@ -1039,6 +1048,47 @@ class PointingHandlerMixin:
                         self.computed_targets[track_id] = (pan_q, tilt_q)
                         self._update_target_button_value(track_id, pan_q, tilt_q)
                         self.ctrl.send({"cmd": "laser", "value": 1})
+                        phase3_target_x = float(obj_cx)
+                        phase3_target_y = float(obj_cy + (PHASE3_TARGET_BELOW_CM * px_per_cm))
+                        print(
+                            "[Pointing-Adaptive] Phase 3 start: "
+                            f"target=({phase3_target_x:.1f},{phase3_target_y:.1f}), "
+                            f"px_per_cm={px_per_cm:.3f}"
+                        )
+                        phase3_ok, phase3_best = self._phase3_refine_laser_target(
+                            track_id=track_id,
+                            target_x=phase3_target_x,
+                            target_y=phase3_target_y,
+                            all_bboxes=all_bboxes,
+                            k_pan=k_pan,
+                            k_tilt=k_tilt,
+                            settle=settle,
+                            led_settle=led_settle,
+                            log_dir=log_dir,
+                            base_iteration=iteration,
+                            initial_px_per_cm=px_per_cm,
+                        )
+                        if phase3_best is not None:
+                            best_pan, best_tilt, best_err_x, best_err_y, best_err = phase3_best
+                            self._curr_pan = float(best_pan)
+                            self._curr_tilt = float(best_tilt)
+                            self.ctrl.send(
+                                {
+                                    "cmd": "move",
+                                    "pan": self._curr_pan,
+                                    "tilt": self._curr_tilt,
+                                    "speed": 100,
+                                    "acc": 1.0,
+                                }
+                            )
+                            pan_q, tilt_q = self._quantize_pan_tilt(self._curr_pan, self._curr_tilt)
+                            self.computed_targets[track_id] = (pan_q, tilt_q)
+                            self._update_target_button_value(track_id, pan_q, tilt_q)
+                            print(
+                                "[Pointing-Adaptive] Phase 3 best: "
+                                f"err=({best_err_x:.1f},{best_err_y:.1f}), |e|={best_err:.1f}px, "
+                                f"pose=({self._curr_pan:.2f},{self._curr_tilt:.2f}), ok={phase3_ok}"
+                            )
                         print(
                             f"[Pointing-Adaptive] Phase 2 :    "
                             f"(prev={phase2_prev_mean:.2f}, cur={mean_bright:.2f}, "
@@ -1448,30 +1498,60 @@ class PointingHandlerMixin:
         return target_center[0], target_center[1], target_bbox, all_bboxes
 
     def _find_laser_center(self, img_on, img_off, exclude_bboxes=None):
-        """  """
+        """Laser ON/OFF diff 기반 레이저 중심 추정 (blob 미사용, THRESH_TOZERO+moments)."""
+        return self._find_laser_center_with_roi(
+            img_on=img_on,
+            img_off=img_off,
+            exclude_bboxes=exclude_bboxes,
+            roi_center=None,
+            roi_half_size=300,
+            tozero_threshold=PHASE3_DIFF_TOZERO_THRESH,
+        )
+
+    def _find_laser_center_with_roi(
+        self,
+        img_on,
+        img_off,
+        exclude_bboxes=None,
+        roi_center=None,
+        roi_half_size=300,
+        tozero_threshold=70.0,
+    ):
+        """Laser ON/OFF diff에서 지정 ROI 중심의 레이저 좌표를 moments로 계산."""
         if img_on is None or img_off is None:
             return None
             
         H, W = img_on.shape[:2]
-        
-        # ROI 
-        crop_size = 300
-        cy, cx = H // 2, W // 2
-        roi_y1 = max(0, cy - crop_size - 100) 
-        roi_y2 = min(H, cy + crop_size - 100)
-        roi_x1 = max(0, cx - crop_size)
-        roi_x2 = min(W, cx + crop_size)
+
+        if roi_center is None:
+            cy, cx = H // 2, W // 2
+            roi_y1 = max(0, cy - roi_half_size - 100)
+            roi_y2 = min(H, cy + roi_half_size - 100)
+            roi_x1 = max(0, cx - roi_half_size)
+            roi_x2 = min(W, cx + roi_half_size)
+        else:
+            cx = int(round(float(roi_center[0])))
+            cy = int(round(float(roi_center[1])))
+            roi_y1 = max(0, cy - roi_half_size)
+            roi_y2 = min(H, cy + roi_half_size)
+            roi_x1 = max(0, cx - roi_half_size)
+            roi_x2 = min(W, cx + roi_half_size)
+        if roi_y2 <= roi_y1 or roi_x2 <= roi_x1:
+            return None
         
         roi_on = img_on[roi_y1:roi_y2, roi_x1:roi_x2]
         roi_off = img_off[roi_y1:roi_y2, roi_x1:roi_x2]
         
-        # Diff & band-pass threshold (100~200 )
+        # Diff + THRESH_TOZERO: 임계값 이하 제거 (view_diff/diff_laser 방식)
         diff = cv2.absdiff(roi_on, roi_off)
         gray = cv2.cvtColor(diff, cv2.COLOR_BGR2GRAY)
-        thr_low = 100.0
-        thr_high = 150.0
-        weight = gray.astype(np.float32)
-        weight[(weight < thr_low) | (weight > thr_high)] = 0.0
+        _, weight = cv2.threshold(
+            gray,
+            float(tozero_threshold),
+            255,
+            cv2.THRESH_TOZERO,
+        )
+        weight = weight.astype(np.float32)
         
         # (  )
         if exclude_bboxes:
@@ -1498,6 +1578,293 @@ class PointingHandlerMixin:
         roi_cy = int(np.sum(ys * w) / w_sum)
         
         return (roi_cx + roi_x1, roi_cy + roi_y1)
+
+    def _phase3_refine_laser_target(
+        self,
+        track_id,
+        target_x,
+        target_y,
+        all_bboxes,
+        k_pan,
+        k_tilt,
+        settle,
+        led_settle,
+        log_dir,
+        base_iteration,
+        initial_px_per_cm=None,
+    ):
+        """Phase2 완료 후 Phase3: pan 3점(현재, -1, +1) 측정 후 최소 오차 선택."""
+        px_per_cm_hint = float(initial_px_per_cm) if initial_px_per_cm else None
+        last_bboxes = all_bboxes
+        last_target_x = float(target_x)
+        last_target_y = float(target_y)
+        base_pan = float(self._curr_pan)
+        base_tilt = float(self._curr_tilt)
+        candidates = []
+
+        def _measure_at_pan(pan_value, phase3_iter, tag):
+            nonlocal px_per_cm_hint, last_bboxes, last_target_x, last_target_y
+            self._curr_pan = float(pan_value)
+            self._curr_tilt = float(base_tilt)
+            self.ctrl.send(
+                {
+                    "cmd": "move",
+                    "pan": self._curr_pan,
+                    "tilt": self._curr_tilt,
+                    "speed": 100,
+                    "acc": 1.0,
+                }
+            )
+            time.sleep(settle)
+
+            meas, px_per_cm_hint, last_bboxes = self._phase3_measure_error(
+                track_id=track_id,
+                base_iteration=base_iteration,
+                phase3_iter=phase3_iter,
+                phase3_tag=tag,
+                log_dir=log_dir,
+                led_settle=led_settle,
+                fallback_target=(last_target_x, last_target_y),
+                fallback_bboxes=last_bboxes,
+                px_per_cm_hint=px_per_cm_hint,
+            )
+            if meas is not None:
+                last_target_x, last_target_y = meas["target_x"], meas["target_y"]
+            return meas
+
+        # 1) base
+        meas_base = _measure_at_pan(base_pan, 1, "base")
+        if meas_base is not None:
+            candidates.append(meas_base)
+            print(
+                f"[Pointing-Adaptive] Phase 3-3pt base: pan={meas_base['pan']:.2f}, "
+                f"err=({meas_base['err_x']:.1f},{meas_base['err_y']:.1f}), |e|={meas_base['err_mag']:.1f}"
+            )
+
+        # 2) pan -1
+        pan_minus = float(max(-180.0, min(180.0, base_pan - PHASE3_STEP_DEG)))
+        if abs(pan_minus - base_pan) > 1e-6:
+            meas_minus = _measure_at_pan(pan_minus, 2, "minus")
+            if meas_minus is not None:
+                candidates.append(meas_minus)
+                print(
+                    f"[Pointing-Adaptive] Phase 3-3pt minus: pan={meas_minus['pan']:.2f}, "
+                    f"err=({meas_minus['err_x']:.1f},{meas_minus['err_y']:.1f}), |e|={meas_minus['err_mag']:.1f}"
+                )
+
+        # 3) pan +1
+        pan_plus = float(max(-180.0, min(180.0, base_pan + PHASE3_STEP_DEG)))
+        if abs(pan_plus - base_pan) > 1e-6:
+            meas_plus = _measure_at_pan(pan_plus, 3, "plus")
+            if meas_plus is not None:
+                candidates.append(meas_plus)
+                print(
+                    f"[Pointing-Adaptive] Phase 3-3pt plus: pan={meas_plus['pan']:.2f}, "
+                    f"err=({meas_plus['err_x']:.1f},{meas_plus['err_y']:.1f}), |e|={meas_plus['err_mag']:.1f}"
+                )
+
+        if not candidates:
+            self._curr_pan = base_pan
+            self._curr_tilt = base_tilt
+            self.ctrl.send(
+                {
+                    "cmd": "move",
+                    "pan": self._curr_pan,
+                    "tilt": self._curr_tilt,
+                    "speed": 100,
+                    "acc": 1.0,
+                }
+            )
+            self.ctrl.send({"cmd": "laser", "value": 1})
+            return False, None
+
+        # |err_x| 최소 우선, 동률이면 |err| 최소
+        best_meas = min(candidates, key=lambda m: (abs(float(m["err_x"])), float(m["err_mag"])))
+
+        self._curr_pan = float(best_meas["pan"])
+        self._curr_tilt = float(base_tilt)
+        self.ctrl.send(
+            {
+                "cmd": "move",
+                "pan": self._curr_pan,
+                "tilt": self._curr_tilt,
+                "speed": 100,
+                "acc": 1.0,
+            }
+        )
+        pan_q, tilt_q = self._quantize_pan_tilt(self._curr_pan, self._curr_tilt)
+        self.computed_targets[track_id] = (pan_q, tilt_q)
+        self._update_target_button_value(track_id, pan_q, tilt_q)
+
+        print(
+            f"[Pointing-Adaptive] Phase 3-3pt best: pan={self._curr_pan:.2f}, "
+            f"err=({best_meas['err_x']:.1f},{best_meas['err_y']:.1f}), |e|={best_meas['err_mag']:.1f}"
+        )
+        self.ctrl.send({"cmd": "laser", "value": 1})
+        return True, (
+            float(best_meas["pan"]),
+            float(best_meas["tilt"]),
+            float(best_meas["err_x"]),
+            float(best_meas["err_y"]),
+            float(best_meas["err_mag"]),
+        )
+
+    def _phase3_measure_error(
+        self,
+        track_id,
+        base_iteration,
+        phase3_iter,
+        phase3_tag,
+        log_dir,
+        led_settle,
+        fallback_target,
+        fallback_bboxes,
+        px_per_cm_hint,
+    ):
+        """Phase3 단일 측정: 타겟 재검출 + 레이저 중심 + 오차 계산."""
+        try:
+            self.set_ir_cut("night")
+            time.sleep(0.05)
+
+            self.ctrl.send({"cmd": "led", "value": 255})
+            time.sleep(led_settle)
+            img_led_on = self._snap_and_wait(
+                f"pointing_phase3_led_on_{base_iteration}_{phase3_iter}_{phase3_tag}",
+            )
+            self.ctrl.send({"cmd": "led", "value": 0})
+            if img_led_on is None:
+                self.set_ir_cut("day")
+                return None, px_per_cm_hint, fallback_bboxes
+
+            time.sleep(led_settle)
+            img_led_off = self._snap_and_wait(
+                f"pointing_phase3_led_off_{base_iteration}_{phase3_iter}_{phase3_tag}",
+            )
+            self.set_ir_cut("day")
+            if img_led_off is None:
+                return None, px_per_cm_hint, fallback_bboxes
+
+            obj_cx, obj_cy, bbox, all_bboxes = self._find_object_center(img_led_on, img_led_off)
+            if obj_cx is None:
+                target_x, target_y = fallback_target
+                all_bboxes = fallback_bboxes
+            else:
+                if bbox and bbox[2] > 0:
+                    px_per_cm_hint = float(bbox[2]) / OBJECT_SIZE_CM
+                elif not px_per_cm_hint:
+                    px_per_cm_hint = 10.0
+                target_x = float(obj_cx)
+                target_y = float(obj_cy + (PHASE3_TARGET_BELOW_CM * float(px_per_cm_hint)))
+                if all_bboxes is None:
+                    all_bboxes = fallback_bboxes
+
+            self.ctrl.send({"cmd": "laser", "value": 1})
+            time.sleep(led_settle)
+            img_laser_on = self._snap_and_wait(
+                f"pointing_phase3_laser_on_{base_iteration}_{phase3_iter}_{phase3_tag}",
+            )
+            self.ctrl.send({"cmd": "laser", "value": 0})
+            if img_laser_on is None:
+                return None, px_per_cm_hint, all_bboxes
+
+            time.sleep(led_settle)
+            img_laser_off = self._snap_and_wait(
+                f"pointing_phase3_laser_off_{base_iteration}_{phase3_iter}_{phase3_tag}",
+            )
+            if img_laser_off is None:
+                return None, px_per_cm_hint, all_bboxes
+
+            roi_half_size = self._phase3_get_roi_half_size(target_x, target_y, all_bboxes)
+            laser_pos = self._find_laser_center_with_roi(
+                img_on=img_laser_on,
+                img_off=img_laser_off,
+                exclude_bboxes=all_bboxes,
+                roi_center=(target_x, target_y),
+                roi_half_size=roi_half_size,
+                tozero_threshold=PHASE3_DIFF_TOZERO_THRESH,
+            )
+            if laser_pos is None:
+                return None, px_per_cm_hint, all_bboxes
+
+            err_x = float(laser_pos[0] - target_x)
+            err_y = float(laser_pos[1] - target_y)
+            err_mag = float((err_x ** 2 + err_y ** 2) ** 0.5)
+
+            try:
+                with open(f"{log_dir}/log.txt", "a", encoding="utf-8") as f:
+                    f.write(
+                        "Iter {it} Phase3-{p3}-{tag}: Laser=({lx},{ly}) Target=({tx:.1f},{ty:.1f}) "
+                        "Err=({ex:.2f},{ey:.2f}) |E|={em:.2f} Pose=({cp:.3f},{ct:.3f})\n".format(
+                            it=base_iteration,
+                            p3=phase3_iter,
+                            tag=phase3_tag,
+                            lx=int(laser_pos[0]),
+                            ly=int(laser_pos[1]),
+                            tx=target_x,
+                            ty=target_y,
+                            ex=err_x,
+                            ey=err_y,
+                            em=err_mag,
+                            cp=float(self._curr_pan),
+                            ct=float(self._curr_tilt),
+                        )
+                    )
+            except Exception as e:
+                print(f"[Pointing-Adaptive] Log write failed: {e}")
+
+            return {
+                "laser_x": int(laser_pos[0]),
+                "laser_y": int(laser_pos[1]),
+                "target_x": float(target_x),
+                "target_y": float(target_y),
+                "err_x": err_x,
+                "err_y": err_y,
+                "err_mag": err_mag,
+                "pan": float(self._curr_pan),
+                "tilt": float(self._curr_tilt),
+            }, px_per_cm_hint, all_bboxes
+        except Exception as e:
+            print(f"[Pointing-Adaptive] Phase 3 measure failed: {e}")
+            return None, px_per_cm_hint, fallback_bboxes
+
+    def _phase3_get_roi_half_size(self, aim_x, aim_y, bboxes):
+        """조준점 중심 ROI가 타겟 bbox에 닿지 않도록 half-size를 자동 조정."""
+        default_half = int(PHASE3_ROI_HALF_SIZE_PX)
+        if not bboxes:
+            return default_half
+
+        ax = float(aim_x)
+        ay = float(aim_y)
+        margin = int(PHASE3_ROI_MARGIN_FROM_TARGET_PX)
+        max_allowed = float("inf")
+
+        for bx, by, bw, bh in bboxes:
+            x1 = float(bx)
+            y1 = float(by)
+            x2 = float(bx + bw)
+            y2 = float(by + bh)
+
+            # 조준점이 bbox 아래/위에 있을 때 수직 간격 기반으로 ROI 상하 경계 제한
+            if ay >= y2:
+                gap = ay - y2
+            elif ay <= y1:
+                gap = y1 - ay
+            else:
+                # 조준점 y가 bbox 범위에 겹치면 매우 작은 ROI만 허용
+                gap = 0.0
+
+            allowed = gap - margin
+            if allowed < max_allowed:
+                max_allowed = allowed
+
+        if max_allowed == float("inf"):
+            return default_half
+
+        if max_allowed <= 8:
+            return 8
+        if max_allowed < default_half:
+            return int(max_allowed)
+        return default_half
 
     def _calculate_angle_delta(self, err_x, err_y, k_pan, k_tilt):
         """Convert pixel error to pan/tilt step with max-step clamp."""
