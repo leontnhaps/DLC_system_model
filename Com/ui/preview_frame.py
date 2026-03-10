@@ -37,6 +37,17 @@ class PreviewFrame:
             img = Image.open(io.BytesIO(jpeg_bytes))
 
             img.thumbnail((self.width, self.height), Image.Resampling.LANCZOS)
+            draw = ImageDraw.Draw(img)
+            cx = img.width // 2
+            cy = img.height // 2
+            arm = max(8, min(img.width, img.height) // 30)
+
+            # High-contrast crosshair: black outline + white inner lines.
+            draw.line((cx - arm, cy, cx + arm, cy), fill="black", width=4)
+            draw.line((cx, cy - arm, cx, cy + arm), fill="black", width=4)
+            draw.line((cx - arm, cy, cx + arm, cy), fill="white", width=2)
+            draw.line((cx, cy - arm, cx, cy + arm), fill="white", width=2)
+
             tk_img = ImageTk.PhotoImage(img)
             self.label.config(image=tk_img)
             self.label.image = tk_img
