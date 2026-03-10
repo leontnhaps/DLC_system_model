@@ -92,7 +92,7 @@ static long readVcc_mV() {
 }
 
 // ===================== 배터리 전압 읽기(mV) =====================
-static long readBattery_mV() {
+static long readBattery_mV(bool printDebug = false) {
   long vcc = readVcc_mV();
 
   long sum = 0;
@@ -101,6 +101,14 @@ static long readBattery_mV() {
     delay(2);
   }
   float adc = sum / 8.0f;
+
+  // printDebug가 true일 때만 VCC와 아날로그 읽기(평균) 값을 출력합니다.
+  if (printDebug) {
+    Serial.print("[DEBUG] 내부 VCC: ");
+    Serial.print(vcc);
+    Serial.print(" mV, 아날로그 리드(평균): ");
+    Serial.println(adc);
+  }
 
   float vA0_mV  = (adc * (float)vcc) / 1023.0f;
   float vBat_mV = vA0_mV * DIV_GAIN;
@@ -264,7 +272,7 @@ void loop() {
   // ---- EEPROM 로깅(LOG_INTERVAL_S마다) ----
   if (now - lastLogMs >= (unsigned long)LOG_INTERVAL_S * 1000UL) {
     lastLogMs = now;
-    long vbat = readBattery_mV();
+    long vbat = readBattery_mV(true);
     int pct = voltageToPercent(vbat); // 퍼센트 계산 추가
     
     appendSample(vbat);
