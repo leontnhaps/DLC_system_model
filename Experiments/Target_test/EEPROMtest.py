@@ -2,7 +2,7 @@ import serial
 import time
 
 PORT = "COM5"      # 너 PC의 COM 번호로 수정
-BAUD = 19200
+BAUD = 9600
 OUT  = "battery_log.csv"
 
 with serial.Serial(PORT, BAUD, timeout=2) as ser:
