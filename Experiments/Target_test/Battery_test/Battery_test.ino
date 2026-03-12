@@ -7,7 +7,7 @@ int recordCount = 0;
 int maxRecords = 125; // 2개씩 저장하므로 최대 개수가 125개로 줄어듭니다.
 
 void setup() {
-  Serial.begin(9600);
+  Serial.begin(19200);
   EEPROM.get(0, recordCount);
   
   if (recordCount < 0 || recordCount > maxRecords) {
