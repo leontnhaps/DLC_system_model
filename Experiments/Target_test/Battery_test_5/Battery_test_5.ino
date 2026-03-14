@@ -4,12 +4,12 @@ int count = 0;
 float sum_aR = 0.0;  
 
 int recordCount = 0; 
-int maxRecords = 125; // 2개씩 저장하므로 최대 개수가 125개로 줄어듭니다.
+int maxRecords = 125; // 2개씩(8바이트) 저장하므로 최대 125개
 
 void setup() {
-  Serial.begin(19200);
+  Serial.begin(9600);
   
-  // ★ 핵심 1: 아두이노의 측정 잣대를 내부 1.1V로 단단히 고정합니다.
+  // ★ 아두이노의 측정 잣대를 내부 1.1V로 고정
   analogReference(INTERNAL); 
   
   EEPROM.get(0, recordCount);
@@ -32,7 +32,7 @@ void loop() {
     else if (cmd == 'D') { 
       // 파이썬 덤프 요청 시 두 가지 값을 쉼표로 구분하여 전송
       for (int i = 0; i < recordCount; i++) {
-        float v_3v3, v_1v1; // 변수명 변경 (v_wrong -> v_1v1)
+        float v_3v3, v_1v1; 
         int addr = 4 + (i * 8); 
         
         EEPROM.get(addr, v_3v3);
@@ -46,7 +46,7 @@ void loop() {
     }
   }
 
-  // 2. A0핀 읽기 누적
+  // 2. A1핀 읽기 누적 (두 번째 코드의 배선에 맞춰 A1 사용)
   float aR = analogRead(A1);
   sum_aR = sum_aR + aR; 
   count++;
@@ -55,25 +55,24 @@ void loop() {
   if (count >= 10) {
     float avg_aR = sum_aR / 10.0;
     
-    // [주의] 잣대가 1.1V로 바뀌었으므로, 이 식은 이제 의미 없는 엉터리 값이 나옵니다.
+    // 3.3V 기준 계산식 (잣대가 1.1V로 고정되었으므로 실제 전압과 오차가 있음)
     float voltage_3v3 = avg_aR * (3.3 / 1023.0) * 2.0; 
     
-    // ★ 핵심 2: 새로운 계산식 (1.1V 잣대 * 5.7배 뻥튀기)
-    // 470k와 100k 분배 비율: (470+100)/100 = 5.7
+    // 1.1V 내부 기준 + 저항 분배(470k, 100k) 계산식 -> 실제 배터리 전압
     float voltage_1v1 = avg_aR * (1.1 / 1023.0) * 5.7; 
 
     // EEPROM에 두 값 모두 저장
     if (recordCount < maxRecords) {
       int addr = 4 + (recordCount * 8); 
-      EEPROM.put(addr, voltage_3v3);
-      EEPROM.put(addr + 4, voltage_1v1); // 5V 자리에 진짜 전압 기록
+      EEPROM.put(addr, voltage_3v3);     // 첫 번째 4바이트: 3.3V식
+      EEPROM.put(addr + 4, voltage_1v1); // 두 번째 4바이트: 1.1V식
       
       recordCount++;
       EEPROM.put(0, recordCount);
       
-      Serial.print("Saved -> 3.3V식(무시): ");
+      Serial.print("Saved -> 3.3V식: ");
       Serial.print(voltage_3v3);
-      Serial.print("V / 진짜 배터리(1.1V+저항): ");
+      Serial.print("V / 1.1V식: ");
       Serial.print(voltage_1v1);
       Serial.println("V");
     }

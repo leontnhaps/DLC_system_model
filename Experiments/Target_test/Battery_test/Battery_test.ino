@@ -8,6 +8,10 @@ int maxRecords = 125; // 2개씩 저장하므로 최대 개수가 125개로 줄�
 
 void setup() {
   Serial.begin(9600);
+  
+  // ★ 핵심 1: 아두이노의 측정 잣대를 내부 1.1V로 단단히 고정합니다.
+  analogReference(INTERNAL); 
+  
   EEPROM.get(0, recordCount);
   
   if (recordCount < 0 || recordCount > maxRecords) {
@@ -28,22 +32,22 @@ void loop() {
     else if (cmd == 'D') { 
       // 파이썬 덤프 요청 시 두 가지 값을 쉼표로 구분하여 전송
       for (int i = 0; i < recordCount; i++) {
-        float v_3v3, v_wrong;
+        float v_3v3, v_1v1; // 변수명을 5V(wrong)에서 1.1V로 변경
         int addr = 4 + (i * 8); // 8바이트 간격으로 읽기
         
         EEPROM.get(addr, v_3v3);
-        EEPROM.get(addr + 4, v_wrong);
+        EEPROM.get(addr + 4, v_1v1); 
         
         Serial.print(v_3v3);
         Serial.print(",");
-        Serial.println(v_wrong);
+        Serial.println(v_1v1);
       }
       Serial.println("END"); 
     }
   }
 
-  // 2. A0핀 읽기 누적 (스위치 전환이 없으므로 잔상 문제 없음)
-  float aR = analogRead(A0);
+  // 2. A0핀 읽기 누적 (기존 첫 번째 코드의 배선에 맞춰 A0 유지)
+  float aR = analogRead(A1);
   sum_aR = sum_aR + aR; 
   count++;
 
@@ -51,23 +55,26 @@ void loop() {
   if (count >= 10) {
     float avg_aR = sum_aR / 10.0;
     
-    // 두 가지 방식으로 전압 계산
-    float voltage_3v3 = avg_aR * (3.3 / 1023.0) * 2.0; // 3.3V 보드 기준 계산
-    float voltage_wrong = avg_aR * (5.0 / 1023.0) * 2.0; // 5V 기준 계산
+    // [주의] 잣대가 1.1V로 고정되었으므로 이 3.3V 식은 참고용(오차 있음)입니다.
+    float voltage_3v3 = avg_aR * (3.3 / 1023.0) * 2.0; 
+    
+    // ★ 핵심 2: 두 번째 코드의 계산식 적용 (1.1V 잣대 * 5.7배 뻥튀기)
+    // 470k와 100k 분배 비율: (470+100)/100 = 5.7
+    float voltage_1v1 = avg_aR * (1.1 / 1023.0) * 5.7; 
 
     // EEPROM에 두 값 모두 저장
     if (recordCount < maxRecords) {
-      int addr = 4 + (recordCount * 8); // 한 세트당 8바이트(4+4) 차지
+      int addr = 4 + (recordCount * 8); 
       EEPROM.put(addr, voltage_3v3);
-      EEPROM.put(addr + 4, voltage_wrong);
+      EEPROM.put(addr + 4, voltage_1v1); // 5V 자리에 1.1V 기준 전압 기록
       
       recordCount++;
       EEPROM.put(0, recordCount);
       
-      Serial.print("Saved -> 3.3V기준: ");
+      Serial.print("Saved -> 3.3V기준(무시): ");
       Serial.print(voltage_3v3);
-      Serial.print("V / 잘못된기준: ");
-      Serial.print(voltage_wrong);
+      Serial.print("V / 1.1V기준(실제): ");
+      Serial.print(voltage_1v1);
       Serial.println("V");
     }
     
