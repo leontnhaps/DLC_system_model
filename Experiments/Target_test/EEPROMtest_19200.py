@@ -1,15 +1,25 @@
 import serial
 import time
+import os
+import re
 
-PORT = "COM5"      # 너 PC의 COM 번호로 수정
-BAUD = 19200
-OUT  = "battery_log.csv"
+PORT = "COM5"      # COM 번호 수정
+BAUD = 9600
+
+def get_next_filename():
+    files = [f for f in os.listdir(".") if re.fullmatch(r"\d+\.csv", f)]
+    nums = [int(f[:-4]) for f in files]
+    next_num = max(nums, default=0) + 1
+    return f"{next_num}.csv"
+
+out_file = get_next_filename()
 
 with serial.Serial(PORT, BAUD, timeout=2) as ser:
-    time.sleep(1.0)            # 포트 열면 보드 리셋될 수 있어 잠깐 대기
-    ser.write(b"D")            # 덤프 명령
+    time.sleep(1.5)   # 보드 리셋 대기
+    ser.reset_input_buffer()
+    ser.write(b"D")
 
-    with open(OUT, "w", newline="", encoding="utf-8") as f:
+    with open(out_file, "w", newline="", encoding="utf-8") as f:
         while True:
             line = ser.readline().decode(errors="ignore")
             if not line:
@@ -18,4 +28,4 @@ with serial.Serial(PORT, BAUD, timeout=2) as ser:
             if line.strip() == "END":
                 break
 
-print("Saved:", OUT)
+print("Saved:", out_file)
