@@ -1,59 +1,44 @@
+import pandas as pd
 import matplotlib.pyplot as plt
-import numpy as np
 
-# 1. 데이터 설정 (가운데 5x5를 제외하고 None과 11x11만 추출)
-x_labels = ['None', '11x11']
-x = np.arange(len(x_labels))  # 라벨 위치 (0, 1)
-width = 0.3  # 막대 두께
+# 1. 불러올 파일 이름 리스트 (1~4번 아두이노)
+file_names = [
+    "1.csv", 
+    "2.csv", 
+    "3.csv", 
+    "4.csv"
+]
 
-# ID Purity 데이터 (None, 11x11)
-purity_scan = [32.7, 100.0]
-purity_maxage = [31.8, 100.0]
+plt.figure(figsize=(10, 6))
 
-# AssA 데이터 (None, 11x11)
-assa_scan = [0.25, 0.76]
-assa_maxage = [0.24, 0.58]
+for i, file in enumerate(file_names):
+    try:
+        # 아두이노가 첫 줄에 'idx,time_s,vbat_mV,percent' 헤더를 던져주므로 header=0 사용
+        # on_bad_lines='skip'을 통해 중간에 섞인 이상한 에러 문자 무시
+        df = pd.read_csv(file, header=0, on_bad_lines='skip')
+        
+        # 파일 맨 끝에 있는 "END" 문자열이나, 중간에 섞일 수 있는 "[LOG] Vbat..." 문자열 처리
+        # 숫자로 변환 안 되는 값들은 NaN으로 강제 변환 후 제거
+        df['time_s'] = pd.to_numeric(df['time_s'], errors='coerce')
+        df['vbat_mV'] = pd.to_numeric(df['vbat_mV'], errors='coerce')
+        df = df.dropna(subset=['time_s', 'vbat_mV'])
+        
+        # X축: 시간(초), Y축: 배터리 전압(mV)
+        plt.plot(df['time_s'], df['vbat_mV'], label=f'Arduino {i+1}', linewidth=1.5)
 
-# ---------------------------------------------------------
-# Figure 1: ID Purity (None vs 11x11)
-# ---------------------------------------------------------
-plt.figure(1, figsize=(6, 6))
-plt.bar(x - width/2, purity_scan, width, label='Scan Topology Based', color='teal', alpha=0.8)
-plt.bar(x + width/2, purity_maxage, width, label='Max Age = 5', color='orange', alpha=0.8)
+    except FileNotFoundError:
+        print(f"⚠️ {file} 파일이 없습니다.")
+    except Exception as e:
+        print(f"⚠️ {file} 처리 중 오류: {e}")
 
-plt.ylabel('ID Purity (%)', fontsize=12)
-plt.xticks(x, x_labels)
-plt.grid(axis='y', linestyle=':', alpha=0.6)
-plt.legend(loc='upper left')
-plt.ylim(0, 120)
+# 3. 그래프 스타일 설정
+plt.title('Battery Voltage Over Time (4 Arduinos)')
+plt.xlim(3500, 7000)  # 4000~7000
 
-# 값 표시
-for i in range(len(x)):
-    plt.text(x[i] - width/2, purity_scan[i] + 2, f'{purity_scan[i]}%', ha='center', va='bottom', fontweight='bold')
-    plt.text(x[i] + width/2, purity_maxage[i] + 2, f'{purity_maxage[i]}%', ha='center', va='bottom', fontweight='bold')
-
+plt.xlabel('Time (Seconds)')
+plt.ylabel('Voltage (mV)')
+plt.grid(True, linestyle='--', alpha=0.7)
+plt.legend()
 plt.tight_layout()
-plt.savefig('figure1_id_purity_comparison.png', dpi=300)
-
-# ---------------------------------------------------------
-# Figure 2: AssA (None vs 11x11)
-# ---------------------------------------------------------
-plt.figure(2, figsize=(6, 6))
-plt.bar(x - width/2, assa_scan, width, label='Scan Topology Based', color='darkred', alpha=0.8)
-plt.bar(x + width/2, assa_maxage, width, label='Max Age = 5', color='gray', alpha=0.8)
-
-plt.ylabel('AssA Score', fontsize=12)
-plt.xticks(x, x_labels)
-plt.grid(axis='y', linestyle=':', alpha=0.6)
-plt.legend(loc='upper left')
-plt.ylim(0, 1.0)
-
-# 값 표시
-for i in range(len(x)):
-    plt.text(x[i] - width/2, assa_scan[i] + 0.02, f'{assa_scan[i]}', ha='center', va='bottom', fontweight='bold')
-    plt.text(x[i] + width/2, assa_maxage[i] + 0.02, f'{assa_maxage[i]}', ha='center', va='bottom', fontweight='bold')
-
-plt.tight_layout()
-plt.savefig('figure2_assa_comparison.png', dpi=300)
 
 plt.show()

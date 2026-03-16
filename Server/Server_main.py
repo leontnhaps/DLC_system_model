@@ -25,6 +25,18 @@ gui_ctrl_clients = set()         # set[socket.socket]
 gui_img_lock = threading.Lock()
 gui_img_clients = set()          # set[socket.socket]
 
+def _recv_exact(sock: socket.socket, size: int):
+    """Receive exactly `size` bytes. Return None only on clean EOF before any bytes."""
+    buf = bytearray()
+    while len(buf) < size:
+        chunk = sock.recv(size - len(buf))
+        if not chunk:
+            if not buf:
+                return None
+            raise ConnectionError(f"socket closed during recv_exact({size})")
+        buf += chunk
+    return bytes(buf)
+
 def _send_line(sock, obj):
     data = (json.dumps(obj, separators=(",",":"))+"\n").encode()
     sock.sendall(data)
@@ -99,18 +111,23 @@ class AgentImageHandler(socketserver.BaseRequestHandler):
         sock = self.request
         try:
             while True:
-                hdr = sock.recv(2)
-                if not hdr: break
+                hdr = _recv_exact(sock, 2)
+                if hdr is None:
+                    break
                 (name_len,) = struct.unpack("<H", hdr)
-                name = sock.recv(name_len).decode("utf-8","ignore")
-                (dlen,) = struct.unpack("<I", sock.recv(4))
-                buf = bytearray()
-                remain = dlen
-                while remain>0:
-                    chunk = sock.recv(min(65536, remain))
-                    if not chunk: raise ConnectionError("agent image socket closed")
-                    buf += chunk; remain -= len(chunk)
-                data = bytes(buf)
+                name_bytes = _recv_exact(sock, name_len)
+                if name_bytes is None:
+                    raise ConnectionError("agent image socket closed during name recv")
+                name = name_bytes.decode("utf-8","ignore")
+
+                dlen_buf = _recv_exact(sock, 4)
+                if dlen_buf is None:
+                    raise ConnectionError("agent image socket closed during length recv")
+                (dlen,) = struct.unpack("<I", dlen_buf)
+
+                data = _recv_exact(sock, dlen)
+                if data is None:
+                    raise ConnectionError("agent image socket closed during payload recv")
 
                 # optional save on server
                 if SAVE_ON_SERVER and not name.startswith("_preview_"):
