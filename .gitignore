@@ -96,6 +96,7 @@ instance/
 .webassets-cache
 
 # Data Science / Notebooks
+*.ipynb
 .ipynb_checkpoints
 profile_default/
 ipython_config.py
