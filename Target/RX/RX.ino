@@ -16,7 +16,7 @@ const float REF_VOLTAGE_mV = 1100.0f; // 아두이노 내부 1.1V (1100mV) 기�
 
 // ===================== 배터리 % 매핑 (대략) =====================
 const long V_FULL_mV  = 4200;  // 4.20V
-const long V_EMPTY_mV = 3300;  // 3.30V (보수적)
+const long V_EMPTY_mV = 3000;  // 3.30V (보수적)
 
 // LED 구간(%)
 const int PCT_LOW = 35;
