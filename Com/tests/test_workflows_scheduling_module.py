@@ -46,6 +46,21 @@ class WorkflowsSchedulingModuleTest(unittest.TestCase):
         self.assertIs(returned, fake)
         self.assertIs(wf.scheduler, fake)
 
+    def test_order_target_ids_sorts_by_pan(self):
+        from workflows.scheduling_workflow import SchedulingWorkflow
+
+        wf = SchedulingWorkflow()
+        targets = {
+            3: (20.0, 1.0),
+            1: (-15.0, 0.0),
+            4: (20.0, 2.0),
+            2: (5.0, -1.0),
+        }
+
+        ordered = wf.order_target_ids(targets)
+
+        self.assertEqual(ordered, [1, 2, 3, 4])
+
 
 if __name__ == "__main__":
     unittest.main()

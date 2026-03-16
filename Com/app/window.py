@@ -545,6 +545,16 @@ class ComApp(EventHandlersMixin, PointingHandlerMixin, AppHelpersMixin):
         """Return scheduling workflow backend when available."""
         return self.scheduling_workflow if hasattr(self, "scheduling_workflow") else None
 
+    def _order_scheduling_target_ids(self, targets):
+        """RoundRobin target order: pan 오름차순으로 한 방향 순회."""
+        backend = self._get_scheduling_backend()
+        if backend and hasattr(backend, "order_target_ids"):
+            return backend.order_target_ids(targets)
+        return [track_id for track_id, _ in sorted(
+            (targets or {}).items(),
+            key=lambda item: (float(item[1][0]), int(item[0])),
+        )]
+
     def _set_scheduling_status(self, text, fg="#333"):
         def _update():
             if hasattr(self, "scheduling_tab"):
@@ -657,7 +667,7 @@ class ComApp(EventHandlersMixin, PointingHandlerMixin, AppHelpersMixin):
                 if not targets:
                     raise RuntimeError("계산된 타깃이 없습니다. Scan/YOLO 결과를 확인하세요.")
 
-                ordered_ids = sorted(targets.keys())
+                ordered_ids = self._order_scheduling_target_ids(targets)
                 self._set_scheduling_status(
                     f"🎯 RoundRobin: {len(ordered_ids)}개 ID Adaptive 수렴 시작",
                     fg="blue",
@@ -727,7 +737,7 @@ class ComApp(EventHandlersMixin, PointingHandlerMixin, AppHelpersMixin):
                 if not final_targets:
                     raise RuntimeError("Adaptive 수렴 후 사용 가능한 ID가 없습니다.")
 
-            final_ids = sorted(final_targets.keys())
+            final_ids = self._order_scheduling_target_ids(final_targets)
             if not final_ids:
                 raise RuntimeError("Scheduling용 타깃이 없습니다.")
 
