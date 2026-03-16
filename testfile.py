@@ -3,10 +3,10 @@ import matplotlib.pyplot as plt
 
 # 1. 불러올 파일 이름 리스트 (1~4번 아두이노)
 file_names = [
-    "battery_log_1.csv", 
-    "battery_log_2.csv", 
-    "battery_log_3.csv", 
-    "battery_log_4.csv"
+    "1.csv", 
+    "2.csv", 
+    "3.csv", 
+    "4.csv"
 ]
 
 plt.figure(figsize=(10, 6))
@@ -33,6 +33,8 @@ for i, file in enumerate(file_names):
 
 # 3. 그래프 스타일 설정
 plt.title('Battery Voltage Over Time (4 Arduinos)')
+plt.xlim(3500, 7000)  # 4000~7000
+
 plt.xlabel('Time (Seconds)')
 plt.ylabel('Voltage (mV)')
 plt.grid(True, linestyle='--', alpha=0.7)
