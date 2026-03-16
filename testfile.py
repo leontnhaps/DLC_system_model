@@ -33,7 +33,6 @@ for i, file in enumerate(file_names):
 
 # 3. 그래프 스타일 설정
 plt.title('Battery Voltage Over Time (4 Arduinos)')
-plt.xlim(3500, 7000)  # 4000~7000
 
 plt.xlabel('Time (Seconds)')
 plt.ylabel('Voltage (mV)')
