@@ -276,7 +276,7 @@ class ObjectTracker:
                 sim = similarity_matrix[obj_idx, cand_idx]
                 
                 # ⭐ 모든 후보에 대해 동일한 threshold (0.4) 적용
-                threshold = 0.35
+                threshold = 0.4
                 
                 # 후보 소스 판단 (로깅용)
                 if cand_idx < len(direct_candidates):
