@@ -100,15 +100,15 @@ class PointingTab:
         self.debug_error_label.grid(row=r, column=0, columnspan=3)
         r += 1
         
-        # ⭐ Laser Diff Preview (400x300)
-        Label(self.frame, text="🔴 Laser Diff", font=("", 10, "bold")).grid(row=r, column=0, columnspan=3, pady=(10,2))
+        # ⭐ Phase 3 Debug Preview (400x300)
+        Label(self.frame, text="🔴 Phase 3 Debug", font=("", 10, "bold")).grid(row=r, column=0, columnspan=3, pady=(10,2))
         r += 1
         laser_frame = Frame(self.frame, width=400, height=300, bg="#111",
                             highlightthickness=1, highlightbackground="#333")
         laser_frame.grid(row=r, column=0, columnspan=3, pady=5)
         laser_frame.pack_propagate(False)
         self.laser_diff_label = Label(laser_frame, bg="#111", fg="#666",
-                                       text="(Waiting for laser diff...)")
+                                       text="(Waiting for Phase 3 debug...)")
         self.laser_diff_label.pack(fill="both", expand=True)
     
     def _on_choose_csv(self):
