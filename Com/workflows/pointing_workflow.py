@@ -28,6 +28,7 @@ OBJECT_SIZE_CM = 5.5         #   (cm) - offset
 TARGET_OFFSET_CM = -12.25    #    12.25cm (2.75 + 5.5 + 4)
 LASER_DIFF_THRESHOLD = 150   #  diff threshold ()
 PHASE3_TARGET_BELOW_CM = 11.75  # 타겟 중심에서 아래(+y) 기준점(cm)
+PHASE3_ENABLED = False         # 임시: Phase 3 비활성화
 PHASE3_MAX_ITERS = 12
 PHASE3_TOL_X_PX = 6
 PHASE3_TOL_Y_PX = 6
@@ -58,6 +59,72 @@ class PointingHandlerMixin:
 
     def _quantize_pan_tilt(self, pan, tilt):
         return self._quantize_deg(pan), self._quantize_deg(tilt)
+
+    def _get_pointing_csv_path(self):
+        """Return the active pointing CSV path, if available."""
+        if not hasattr(self, "point_csv_path"):
+            return None
+        try:
+            path = self.point_csv_path.get().strip()
+        except Exception:
+            path = str(self.point_csv_path).strip()
+        return path or None
+
+    def _persist_final_target_to_csv(self, track_id, pan, tilt):
+        """Persist the final aimed pan/tilt back into the scan CSV for the source track rows."""
+        path = self._get_pointing_csv_path()
+        if not path or not os.path.exists(path):
+            return False
+
+        csv_track_ids = getattr(self, "_pointing_csv_track_ids", {}) or {}
+        target_ids = tuple(int(v) for v in csv_track_ids.get(track_id, (track_id,)))
+        pan_q, tilt_q = self._quantize_pan_tilt(pan, tilt)
+
+        try:
+            with open(path, newline="", encoding="utf-8") as f:
+                reader = csv.DictReader(f)
+                rows = list(reader)
+                fieldnames = list(reader.fieldnames or [])
+
+            if not rows:
+                return False
+
+            if "final_pan_deg" not in fieldnames:
+                fieldnames.append("final_pan_deg")
+            if "final_tilt_deg" not in fieldnames:
+                fieldnames.append("final_tilt_deg")
+
+            updated = 0
+            for row in rows:
+                try:
+                    row_track_id = int(row.get("track_id", 0))
+                except Exception:
+                    continue
+                if row_track_id not in target_ids:
+                    continue
+                row["final_pan_deg"] = f"{float(pan_q):.3f}"
+                row["final_tilt_deg"] = f"{float(tilt_q):.3f}"
+                updated += 1
+
+            if updated <= 0:
+                print(f"[Pointing] CSV final target save skipped: no matching rows for UI track {track_id} -> CSV IDs {target_ids}")
+                return False
+
+            tmp_path = f"{path}.tmp"
+            with open(tmp_path, "w", newline="", encoding="utf-8") as f:
+                writer = csv.DictWriter(f, fieldnames=fieldnames)
+                writer.writeheader()
+                writer.writerows(rows)
+            os.replace(tmp_path, path)
+
+            print(
+                f"[Pointing] Final target saved to CSV: UI track {track_id} -> CSV IDs {target_ids}, "
+                f"pan={pan_q:.1f}, tilt={tilt_q:.1f}"
+            )
+            return True
+        except Exception as e:
+            print(f"[Pointing] Failed to save final target to CSV: {e}")
+            return False
     
     # ========== CSV & Regression ==========
 
@@ -97,11 +164,27 @@ class PointingHandlerMixin:
             conf_min = 0.5  # Minimum confidence
             min_samples = 2  # Minimum samples for regression
             track_led_roi_samples = defaultdict(list)  # {track_id: [(x,y,w,h), ...]}
+            persisted_targets = {}  # {track_id: (final_pan, final_tilt)}
             
             # CSV 
             with open(path, newline="", encoding="utf-8") as f:
                 reader = csv.DictReader(f)
                 for d in reader:
+                    track_id_raw = d.get("track_id")
+                    try:
+                        track_id = int(track_id_raw)
+                    except Exception:
+                        track_id = None
+
+                    if track_id is not None:
+                        final_pan = d.get("final_pan_deg")
+                        final_tilt = d.get("final_tilt_deg")
+                        if track_id not in persisted_targets and final_pan not in ("", None) and final_tilt not in ("", None):
+                            try:
+                                persisted_targets[track_id] = self._quantize_pan_tilt(float(final_pan), float(final_tilt))
+                            except Exception:
+                                pass
+
                     if d.get("conf", "") == "":
                         continue
                     conf = float(d["conf"])
@@ -121,7 +204,8 @@ class PointingHandlerMixin:
                     H = int(d["H"]) if d.get("H") else None
                     
                     # Track ID 
-                    track_id = int(d.get("track_id", 0))
+                    if track_id is None:
+                        continue
                     
                     if W_frame is None and W:
                         W_frame = W
@@ -164,6 +248,7 @@ class PointingHandlerMixin:
             # track_id 
             self.computed_targets = {}  # {track_id: (pan, tilt)}
             self._pointing_gains = {}  # {track_id: (k_pan, k_tilt)}
+            self._pointing_csv_track_ids = {}
             
             for track_id, track_rows in grouped_by_track.items():
                 print(f"[Pointing] Computing track_id={track_id} ({len(track_rows)} detections)")
@@ -248,13 +333,27 @@ class PointingHandlerMixin:
                     if abs(avg_e) > 1e-9:
                         k_tilt = abs(1.0 / avg_e)
                 
-                # Track ID 
+                regression_target = None
                 if pan_target is not None and tilt_target is not None:
-                    pan_q, tilt_q = self._quantize_pan_tilt(pan_target, tilt_target)
+                    regression_target = self._quantize_pan_tilt(pan_target, tilt_target)
+                    print(f"[Pointing] track_id={track_id} pan={regression_target[0]:.3f}, tilt={regression_target[1]:.3f} "
+                          f"(H fits: {len(fits_h)}, V fits: {len(fits_v)}, gain: k_p={k_pan:.5f}, k_t={k_tilt:.5f})")
+
+                persisted_target = persisted_targets.get(track_id)
+                if persisted_target is not None:
+                    pan_q, tilt_q = persisted_target
                     self.computed_targets[track_id] = (pan_q, tilt_q)
                     self._pointing_gains[track_id] = (k_pan, k_tilt)
-                    print(f"[Pointing] track_id={track_id} pan={pan_q:.3f}, tilt={tilt_q:.3f} "
-                          f"(H fits: {len(fits_h)}, V fits: {len(fits_v)}, gain: k_p={k_pan:.5f}, k_t={k_tilt:.5f})")
+                    self._pointing_csv_track_ids[track_id] = (track_id,)
+                    print(
+                        f"[Pointing] track_id={track_id} loaded saved final target "
+                        f"pan={pan_q:.3f}, tilt={tilt_q:.3f}"
+                    )
+                elif regression_target is not None:
+                    pan_q, tilt_q = regression_target
+                    self.computed_targets[track_id] = (pan_q, tilt_q)
+                    self._pointing_gains[track_id] = (k_pan, k_tilt)
+                    self._pointing_csv_track_ids[track_id] = (track_id,)
                 else:
                     print(f"[Pointing] track_id={track_id}   (insufficient data)")
             
@@ -264,6 +363,7 @@ class PointingHandlerMixin:
             if merged:
                 self.computed_targets = merged['targets']
                 self._pointing_gains = merged['gains']
+                self._pointing_csv_track_ids = merged.get('members', {})
 
             # TrackLED ROI (CSVled_roi_*  
             #   track_id , trackROI 
@@ -310,6 +410,8 @@ class PointingHandlerMixin:
         new_gains = {}
         old_rois = dict(getattr(self, "_track_led_roi", {}) or {})
         new_rois = {}
+        old_csv_track_ids = dict(getattr(self, "_pointing_csv_track_ids", {}) or {})
+        new_csv_track_ids = {}
 
         for old_id in old_ids:
             new_id = id_map[old_id]
@@ -318,10 +420,12 @@ class PointingHandlerMixin:
             new_gains[new_id] = gain
             if old_id in old_rois:
                 new_rois[new_id] = old_rois[old_id]
+            new_csv_track_ids[new_id] = tuple(old_csv_track_ids.get(old_id, (old_id,)))
 
         self.computed_targets = new_targets
         self._pointing_gains = new_gains
         self._track_led_roi = new_rois
+        self._pointing_csv_track_ids = new_csv_track_ids
         print(f"[Pointing] ID renumbered: {id_map}")
     
     def _merge_similar_targets(self, targets, grouped_by_track, tol, W_frame, H_frame, min_samples):
@@ -360,9 +464,11 @@ class PointingHandlerMixin:
         print(f"[Pointing]    (tol={tol}):")
         new_targets = {}
         new_gains = {}
+        new_members = {}
         
         for group in merged_groups:
             rep_id = min(group)  #  ID 
+            new_members[rep_id] = tuple(sorted(group))
             
             if len(group) == 1:
                 #  
@@ -390,7 +496,7 @@ class PointingHandlerMixin:
                 new_targets[rep_id] = targets[rep_id]
                 new_gains[rep_id] = self._pointing_gains.get(rep_id, (CENTERING_GAIN_PAN, CENTERING_GAIN_TILT))
         
-        return {'targets': new_targets, 'gains': new_gains}
+        return {'targets': new_targets, 'gains': new_gains, 'members': new_members}
     
     def _compute_single_target(self, rows, W_frame, H_frame, min_samples):
         """  pan/tilt  ()"""
@@ -1033,6 +1139,8 @@ class PointingHandlerMixin:
                     if is_drop:
                         final_pan = self._curr_pan
                         final_tilt = self._curr_tilt
+                        if not PHASE3_ENABLED:
+                            final_pan = float(max(-180.0, min(180.0, float(final_pan) - 1.0)))
                         self._curr_pan = final_pan
                         self._curr_tilt = final_tilt
                         self.ctrl.send(
@@ -1047,47 +1155,57 @@ class PointingHandlerMixin:
                         pan_q, tilt_q = self._quantize_pan_tilt(final_pan, final_tilt)
                         self.computed_targets[track_id] = (pan_q, tilt_q)
                         self._update_target_button_value(track_id, pan_q, tilt_q)
-                        self.ctrl.send({"cmd": "laser", "value": 1})
-                        phase3_target_x = float(obj_cx)
-                        phase3_target_y = float(obj_cy + (PHASE3_TARGET_BELOW_CM * px_per_cm))
-                        print(
-                            "[Pointing-Adaptive] Phase 3 start: "
-                            f"target=({phase3_target_x:.1f},{phase3_target_y:.1f}), "
-                            f"px_per_cm={px_per_cm:.3f}"
-                        )
-                        phase3_ok, phase3_best = self._phase3_refine_laser_target(
-                            track_id=track_id,
-                            target_x=phase3_target_x,
-                            target_y=phase3_target_y,
-                            all_bboxes=all_bboxes,
-                            k_pan=k_pan,
-                            k_tilt=k_tilt,
-                            settle=settle,
-                            led_settle=led_settle,
-                            log_dir=log_dir,
-                            base_iteration=iteration,
-                            initial_px_per_cm=px_per_cm,
-                        )
-                        if phase3_best is not None:
-                            best_pan, best_tilt, best_err_x, best_err_y, best_err = phase3_best
-                            self._curr_pan = float(best_pan)
-                            self._curr_tilt = float(best_tilt)
-                            self.ctrl.send(
-                                {
-                                    "cmd": "move",
-                                    "pan": self._curr_pan,
-                                    "tilt": self._curr_tilt,
-                                    "speed": 100,
-                                    "acc": 1.0,
-                                }
-                            )
-                            pan_q, tilt_q = self._quantize_pan_tilt(self._curr_pan, self._curr_tilt)
-                            self.computed_targets[track_id] = (pan_q, tilt_q)
-                            self._update_target_button_value(track_id, pan_q, tilt_q)
+                        if PHASE3_ENABLED:
+                            self.ctrl.send({"cmd": "laser", "value": 1})
+                            phase3_target_x = float(obj_cx)
+                            phase3_target_y = float(obj_cy + (PHASE3_TARGET_BELOW_CM * px_per_cm))
                             print(
-                                "[Pointing-Adaptive] Phase 3 best: "
-                                f"err=({best_err_x:.1f},{best_err_y:.1f}), |e|={best_err:.1f}px, "
-                                f"pose=({self._curr_pan:.2f},{self._curr_tilt:.2f}), ok={phase3_ok}"
+                                "[Pointing-Adaptive] Phase 3 start: "
+                                f"target=({phase3_target_x:.1f},{phase3_target_y:.1f}), "
+                                f"px_per_cm={px_per_cm:.3f}"
+                            )
+                            phase3_ok, phase3_best = self._phase3_refine_laser_target(
+                                track_id=track_id,
+                                target_x=phase3_target_x,
+                                target_y=phase3_target_y,
+                                all_bboxes=all_bboxes,
+                                k_pan=k_pan,
+                                k_tilt=k_tilt,
+                                settle=settle,
+                                led_settle=led_settle,
+                                log_dir=log_dir,
+                                base_iteration=iteration,
+                                initial_px_per_cm=px_per_cm,
+                            )
+                            if phase3_best is not None:
+                                best_pan, best_tilt, best_err_x, best_err_y, best_err = phase3_best
+                                self._curr_pan = float(best_pan)
+                                self._curr_tilt = float(best_tilt)
+                                self.ctrl.send(
+                                    {
+                                        "cmd": "move",
+                                        "pan": self._curr_pan,
+                                        "tilt": self._curr_tilt,
+                                        "speed": 100,
+                                        "acc": 1.0,
+                                    }
+                                )
+                                pan_q, tilt_q = self._quantize_pan_tilt(self._curr_pan, self._curr_tilt)
+                                self.computed_targets[track_id] = (pan_q, tilt_q)
+                                self._update_target_button_value(track_id, pan_q, tilt_q)
+                                self._persist_final_target_to_csv(track_id, pan_q, tilt_q)
+                                print(
+                                    "[Pointing-Adaptive] Phase 3 best: "
+                                    f"err=({best_err_x:.1f},{best_err_y:.1f}), |e|={best_err:.1f}px, "
+                                    f"pose=({self._curr_pan:.2f},{self._curr_tilt:.2f}), ok={phase3_ok}"
+                                )
+                            else:
+                                self._persist_final_target_to_csv(track_id, final_pan, final_tilt)
+                        else:
+                            self._persist_final_target_to_csv(track_id, final_pan, final_tilt)
+                            print(
+                                "[Pointing-Adaptive] Phase 3 disabled -> "
+                                f"use Phase 2 final pose=({final_pan:.2f},{final_tilt:.2f})"
                             )
                         print(
                             f"[Pointing-Adaptive] Phase 2 :    "
@@ -1359,7 +1477,7 @@ class PointingHandlerMixin:
             print(f"[Pointing] Debug preview : {e}")
     
     def _show_laser_diff(self, img_bgr):
-        """Laser diff Pointing   (main thread)"""
+        """Pointing 탭 하단 보조 패널 이미지 표시 (현재 Phase 3 debug 용도)."""
         try:
             from PIL import Image, ImageTk
             rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
@@ -1371,6 +1489,127 @@ class PointingHandlerMixin:
                 self.pointing_tab.laser_diff_label.image = photo
         except Exception as e:
             print(f"[Pointing] Laser diff preview : {e}")
+
+    def _save_phase3_debug_artifacts(
+        self,
+        log_dir,
+        base_iteration,
+        phase3_iter,
+        phase3_tag,
+        img_led_on,
+        img_led_off,
+        img_laser_on,
+        img_laser_off,
+        target_x,
+        target_y,
+        laser_pos,
+        bbox,
+        all_bboxes,
+        roi_half_size,
+        err_x=None,
+        err_y=None,
+        err_mag=None,
+    ):
+        """Save Phase3 raw/diff/overlay debug images into the pointing log dir."""
+        if not log_dir:
+            return
+
+        prefix = f"{log_dir}/iter_{base_iteration}_phase3_{phase3_iter}_{phase3_tag}"
+
+        try:
+            cv2.imwrite(f"{prefix}_led_on.jpg", img_led_on)
+            cv2.imwrite(f"{prefix}_led_off.jpg", img_led_off)
+            cv2.imwrite(f"{prefix}_laser_on.jpg", img_laser_on)
+            cv2.imwrite(f"{prefix}_laser_off.jpg", img_laser_off)
+
+            led_diff = cv2.absdiff(img_led_on, img_led_off)
+            led_gray = cv2.cvtColor(led_diff, cv2.COLOR_BGR2GRAY)
+            cv2.imwrite(f"{prefix}_led_diff.jpg", led_gray)
+
+            laser_diff = cv2.absdiff(img_laser_on, img_laser_off)
+            laser_gray = cv2.cvtColor(laser_diff, cv2.COLOR_BGR2GRAY)
+            cv2.imwrite(f"{prefix}_laser_diff_raw.jpg", laser_gray)
+
+            _, laser_thresh = cv2.threshold(
+                laser_gray,
+                float(PHASE3_DIFF_TOZERO_THRESH),
+                255,
+                cv2.THRESH_TOZERO,
+            )
+            laser_vis = cv2.cvtColor(laser_thresh.astype(np.uint8), cv2.COLOR_GRAY2BGR)
+
+            tx = int(round(float(target_x)))
+            ty = int(round(float(target_y)))
+            cv2.circle(laser_vis, (tx, ty), 10, (0, 0, 255), 2)
+            cv2.drawMarker(laser_vis, (tx, ty), (0, 0, 255), cv2.MARKER_CROSS, 36, 2)
+            cv2.putText(laser_vis, f"TARGET ({tx},{ty})", (tx + 12, max(20, ty - 12)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 255), 2)
+
+            rx1 = max(0, tx - int(roi_half_size))
+            ry1 = max(0, ty - int(roi_half_size))
+            rx2 = min(laser_vis.shape[1], tx + int(roi_half_size))
+            ry2 = min(laser_vis.shape[0], ty + int(roi_half_size))
+            cv2.rectangle(laser_vis, (rx1, ry1), (rx2, ry2), (255, 255, 0), 2)
+            cv2.putText(laser_vis, "PHASE3 ROI", (rx1, max(20, ry1 - 8)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 0), 2)
+
+            if all_bboxes:
+                for mx, my, mw, mh in all_bboxes:
+                    cv2.rectangle(
+                        laser_vis,
+                        (int(mx), int(my)),
+                        (int(mx + mw), int(my + mh)),
+                        (120, 120, 120),
+                        1,
+                    )
+
+            if laser_pos is not None:
+                lx = int(laser_pos[0])
+                ly = int(laser_pos[1])
+                cv2.circle(laser_vis, (lx, ly), 10, (0, 255, 0), 2)
+                cv2.drawMarker(laser_vis, (lx, ly), (0, 255, 0), cv2.MARKER_CROSS, 36, 2)
+                cv2.putText(laser_vis, f"LASER ({lx},{ly})", (lx + 12, min(laser_vis.shape[0] - 12, ly + 24)),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 2)
+                cv2.line(laser_vis, (tx, ty), (lx, ly), (255, 255, 255), 1, cv2.LINE_AA)
+            else:
+                cv2.putText(laser_vis, "LASER NOT FOUND", (20, 36),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 165, 255), 2)
+
+            cv2.imwrite(f"{prefix}_laser_diff_thresh.jpg", laser_vis)
+
+            debug = img_laser_on.copy()
+            if bbox:
+                bx, by, bw, bh = [int(v) for v in bbox]
+                cv2.rectangle(debug, (bx, by), (bx + bw, by + bh), (0, 255, 255), 2)
+                cv2.putText(debug, "OBJECT", (bx, max(20, by - 8)),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 2)
+            if all_bboxes:
+                for mx, my, mw, mh in all_bboxes:
+                    cv2.rectangle(debug, (int(mx), int(my)),
+                                  (int(mx + mw), int(my + mh)), (100, 100, 100), 1)
+            cv2.circle(debug, (tx, ty), 12, (0, 0, 255), 2)
+            cv2.drawMarker(debug, (tx, ty), (0, 0, 255), cv2.MARKER_CROSS, 40, 2)
+            cv2.rectangle(debug, (rx1, ry1), (rx2, ry2), (255, 255, 0), 2)
+            if laser_pos is not None:
+                lx = int(laser_pos[0])
+                ly = int(laser_pos[1])
+                cv2.circle(debug, (lx, ly), 12, (0, 255, 0), 2)
+                cv2.drawMarker(debug, (lx, ly), (0, 255, 0), cv2.MARKER_CROSS, 40, 2)
+                cv2.line(debug, (tx, ty), (lx, ly), (255, 255, 255), 1, cv2.LINE_AA)
+
+            cv2.putText(debug, f"Phase3 {phase3_iter}-{phase3_tag}", (20, 36),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 200, 100), 2)
+            cv2.putText(debug, f"Pan={float(getattr(self, '_curr_pan', 0.0)):.2f} Tilt={float(getattr(self, '_curr_tilt', 0.0)):.2f}",
+                        (20, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 200, 100), 2)
+            if err_x is not None and err_y is not None and err_mag is not None:
+                cv2.putText(debug, f"Err=({float(err_x):.1f},{float(err_y):.1f}) |E|={float(err_mag):.1f}px",
+                            (20, 104), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+            cv2.imwrite(f"{prefix}_debug.jpg", debug)
+
+            # Pointing 탭 하단 패널은 Phase 3 디버그 전용으로 사용
+            self.root.after(0, lambda img=debug.copy(): self._show_laser_diff(img))
+        except Exception as e:
+            print(f"[Pointing] Phase3 debug save failed: {e}")
     
     def stop_aiming(self):
         """ """
@@ -1783,12 +2022,34 @@ class PointingHandlerMixin:
                 roi_half_size=roi_half_size,
                 tozero_threshold=PHASE3_DIFF_TOZERO_THRESH,
             )
+            if laser_pos is not None:
+                err_x = float(laser_pos[0] - target_x)
+                err_y = float(laser_pos[1] - target_y)
+                err_mag = float((err_x ** 2 + err_y ** 2) ** 0.5)
+            else:
+                err_x = err_y = err_mag = None
+
+            self._save_phase3_debug_artifacts(
+                log_dir=log_dir,
+                base_iteration=base_iteration,
+                phase3_iter=phase3_iter,
+                phase3_tag=phase3_tag,
+                img_led_on=img_led_on,
+                img_led_off=img_led_off,
+                img_laser_on=img_laser_on,
+                img_laser_off=img_laser_off,
+                target_x=target_x,
+                target_y=target_y,
+                laser_pos=laser_pos,
+                bbox=bbox,
+                all_bboxes=all_bboxes,
+                roi_half_size=roi_half_size,
+                err_x=err_x,
+                err_y=err_y,
+                err_mag=err_mag,
+            )
             if laser_pos is None:
                 return None, px_per_cm_hint, all_bboxes
-
-            err_x = float(laser_pos[0] - target_x)
-            err_y = float(laser_pos[1] - target_y)
-            err_mag = float((err_x ** 2 + err_y ** 2) ** 0.5)
 
             try:
                 with open(f"{log_dir}/log.txt", "a", encoding="utf-8") as f:
