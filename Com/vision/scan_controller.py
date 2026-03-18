@@ -208,6 +208,7 @@ class ScanController:
                                     track_ids[i],  # ⭐ track_id 추가
                                     led["pred"], led["r"], led["g"], led["b"],
                                     led["rx"], led["ry"], led["rw"], led["rh"],
+                                    "", "",
                                 ])
                                 self.detected_count += 1
                             self.csv_file.flush()
@@ -251,6 +252,7 @@ class ScanController:
                     "conf", "cls", "W", "H", "track_id",
                     "led_pred", "led_r_score", "led_g_score", "led_b_score",
                     "led_roi_x", "led_roi_y", "led_roi_w", "led_roi_h",
+                    "final_pan_deg", "final_tilt_deg",
                 ])
                 print(f"[ScanController] CSV created: {self.csv_path}")
             except Exception as e:
