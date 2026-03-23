@@ -185,20 +185,8 @@ def find_led_pairs(base_dir):
     return valid_pairs
 
 
-def select_best_box(boxes, scores):
-    """Choose one box using score first, then area as a stable tie-breaker."""
-    if not boxes:
-        return None
-
-    best_idx = max(
-        range(len(boxes)),
-        key=lambda idx: (float(scores[idx]), boxes[idx][2] * boxes[idx][3]),
-    )
-    return boxes[best_idx], float(scores[best_idx])
-
-
 def detect_film(diff_img, weights_path):
-    """Run the same tiled YOLO-style detection used in the current system."""
+    """Run tiled YOLO detection and keep every box above the system cutoff."""
     yolo = YOLOProcessor()
     model = yolo.get_model(weights_path)
     if model is None:
@@ -225,18 +213,19 @@ def detect_film(diff_img, weights_path):
         else:
             boxes, scores, classes = [], [], []
 
-    best = select_best_box(boxes, scores)
-    if best is None:
+    if not boxes:
         return None
 
-    best_box, best_score = best
-    return {
-        "box": best_box,
-        "score": best_score,
-        "boxes": boxes,
-        "scores": scores,
-        "classes": classes,
-    }
+    detections = []
+    for box, score, cls in zip(boxes, scores, classes):
+        detections.append({
+            "box": box,
+            "score": float(score),
+            "class_id": int(cls),
+        })
+
+    detections.sort(key=lambda item: (-item["score"], -(item["box"][2] * item["box"][3])))
+    return detections
 
 
 def compute_area_geometry(box):
@@ -272,49 +261,65 @@ def compute_area_geometry(box):
     }
 
 
-def draw_overlay(base_img, detection, geometry, title):
-    """Draw the detection box, center points, and requested 8cm square area."""
+def draw_overlay(base_img, annotations, title):
+    """Draw all detections above threshold with their computed area boxes."""
     canvas = base_img.copy()
-    x, y, w, h = detection["box"]
-    area_x1, area_y1, area_x2, area_y2 = geometry["area_box"]
+    color_cycle = [
+        ((0, 255, 0), (0, 165, 255)),
+        ((255, 0, 0), (255, 255, 0)),
+        ((255, 0, 255), (0, 255, 255)),
+        ((0, 128, 255), (255, 128, 0)),
+        ((128, 255, 0), (255, 0, 128)),
+    ]
 
-    film_center = (
-        int(round(geometry["film_center"][0])),
-        int(round(geometry["film_center"][1])),
-    )
-    area_center = (
-        int(round(geometry["area_center"][0])),
-        int(round(geometry["area_center"][1])),
-    )
+    for idx, item in enumerate(annotations, start=1):
+        detection = item["detection"]
+        geometry = item["geometry"]
+        box_color, area_color = color_cycle[(idx - 1) % len(color_cycle)]
 
-    cv2.rectangle(canvas, (x, y), (x + w, y + h), (0, 255, 0), 3)
-    cv2.drawMarker(
-        canvas,
-        film_center,
-        (0, 255, 0),
-        markerType=cv2.MARKER_CROSS,
-        markerSize=26,
-        thickness=2,
-    )
+        x, y, w, h = detection["box"]
+        area_x1, area_y1, area_x2, area_y2 = geometry["area_box"]
 
-    cv2.rectangle(canvas, (area_x1, area_y1), (area_x2, area_y2), (0, 165, 255), 3)
-    cv2.drawMarker(
-        canvas,
-        area_center,
-        (0, 165, 255),
-        markerType=cv2.MARKER_TILTED_CROSS,
-        markerSize=28,
-        thickness=2,
-    )
-    cv2.line(canvas, film_center, area_center, (255, 255, 0), 2)
+        film_center = (
+            int(round(geometry["film_center"][0])),
+            int(round(geometry["film_center"][1])),
+        )
+        area_center = (
+            int(round(geometry["area_center"][0])),
+            int(round(geometry["area_center"][1])),
+        )
+
+        cv2.rectangle(canvas, (x, y), (x + w, y + h), box_color, 3)
+        cv2.drawMarker(
+            canvas,
+            film_center,
+            box_color,
+            markerType=cv2.MARKER_CROSS,
+            markerSize=26,
+            thickness=2,
+        )
+
+        cv2.rectangle(canvas, (area_x1, area_y1), (area_x2, area_y2), area_color, 3)
+        cv2.drawMarker(
+            canvas,
+            area_center,
+            area_color,
+            markerType=cv2.MARKER_TILTED_CROSS,
+            markerSize=28,
+            thickness=2,
+        )
+        cv2.line(canvas, film_center, area_center, (255, 255, 255), 2)
+
+        label = f"#{idx} score={detection['score']:.3f}"
+        label_y = max(30, y - 10)
+        cv2.putText(canvas, label, (x, label_y), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 4, cv2.LINE_AA)
+        cv2.putText(canvas, label, (x, label_y), cv2.FONT_HERSHEY_SIMPLEX, 0.7, box_color, 2, cv2.LINE_AA)
 
     info_lines = [
         title,
-        f"score={detection['score']:.3f}",
-        f"bbox={w}x{h}px",
-        f"px/cm x={geometry['px_per_cm_x']:.2f}, y={geometry['px_per_cm_y']:.2f}, avg={geometry['px_per_cm']:.2f}",
+        f"detections(score >= {YOLO_SCORE_FILTER:.2f}) = {len(annotations)}",
         f"offset={AREA_CENTER_OFFSET_CM:.2f}cm, area={AREA_SIDE_CM:.2f}cm x {AREA_SIDE_CM:.2f}cm",
-        f"area_center=({area_center[0]}, {area_center[1]})",
+        "Each detection has its own film center and 8cm x 8cm area box.",
     ]
 
     y_text = 35
@@ -328,8 +333,12 @@ def draw_overlay(base_img, detection, geometry, title):
 
 def make_comparison_view(img_on, diff_img, detection, geometry):
     """Create a side-by-side result view for easier inspection."""
-    overlay_on = draw_overlay(img_on, detection, geometry, "LED ON + area overlay")
-    overlay_diff = draw_overlay(diff_img, detection, geometry, "DIFF + area overlay")
+    annotations = [
+        {"detection": det, "geometry": geo}
+        for det, geo in zip(detection, geometry)
+    ]
+    overlay_on = draw_overlay(img_on, annotations, "LED ON + area overlay")
+    overlay_diff = draw_overlay(diff_img, annotations, "DIFF + area overlay")
     return np.hstack([overlay_on, overlay_diff])
 
 
@@ -355,13 +364,13 @@ def process_pair(path_on, path_off, weights_path):
 
     diff_img = cv2.absdiff(img_on, img_off)
 
-    detection = detect_film(diff_img, weights_path)
-    if detection is None:
+    detections = detect_film(diff_img, weights_path)
+    if detections is None:
         raise RuntimeError("No film was detected on the diff image.")
 
-    geometry = compute_area_geometry(detection["box"])
-    result = make_comparison_view(img_on, diff_img, detection, geometry)
-    return diff_img, detection, geometry, result
+    geometries = [compute_area_geometry(detection["box"]) for detection in detections]
+    result = make_comparison_view(img_on, diff_img, detections, geometries)
+    return diff_img, detections, geometries, result
 
 
 def save_batch_result(output_root, input_root, pair, result_img):
@@ -385,6 +394,7 @@ def save_batch_summary(output_root, rows):
             fieldnames=[
                 "status",
                 "pair_name",
+                "det_index",
                 "relative_parent",
                 "led_on",
                 "led_off",
@@ -430,6 +440,7 @@ def run_batch_mode(input_dir, weights_path):
         row = {
             "status": "error",
             "pair_name": pair_label,
+            "det_index": "",
             "relative_parent": rel_parent_str,
             "led_on": str(pair["on"]),
             "led_off": str(pair["off"]),
@@ -446,26 +457,28 @@ def run_batch_mode(input_dir, weights_path):
         }
 
         try:
-            _, detection, geometry, result = process_pair(pair["on"], pair["off"], weights_path)
+            _, detections, geometries, result = process_pair(pair["on"], pair["off"], weights_path)
             saved_path = save_batch_result(output_root, base_dir, pair, result)
-            row.update({
-                "status": "ok",
-                "score": f"{detection['score']:.6f}",
-                "bbox": str(detection["box"]),
-                "px_per_cm_x": f"{geometry['px_per_cm_x']:.6f}",
-                "px_per_cm_y": f"{geometry['px_per_cm_y']:.6f}",
-                "px_per_cm_avg": f"{geometry['px_per_cm']:.6f}",
-                "film_center": f"({geometry['film_center'][0]:.2f}, {geometry['film_center'][1]:.2f})",
-                "area_center": f"({geometry['area_center'][0]:.2f}, {geometry['area_center'][1]:.2f})",
-                "area_box": str(geometry["area_box"]),
-                "saved_result": str(saved_path),
-            })
+            for det_index, (detection, geometry) in enumerate(zip(detections, geometries), start=1):
+                summary_rows.append({
+                    **row,
+                    "status": "ok",
+                    "det_index": det_index,
+                    "score": f"{detection['score']:.6f}",
+                    "bbox": str(detection["box"]),
+                    "px_per_cm_x": f"{geometry['px_per_cm_x']:.6f}",
+                    "px_per_cm_y": f"{geometry['px_per_cm_y']:.6f}",
+                    "px_per_cm_avg": f"{geometry['px_per_cm']:.6f}",
+                    "film_center": f"({geometry['film_center'][0]:.2f}, {geometry['film_center'][1]:.2f})",
+                    "area_center": f"({geometry['area_center'][0]:.2f}, {geometry['area_center'][1]:.2f})",
+                    "area_box": str(geometry["area_box"]),
+                    "saved_result": str(saved_path),
+                })
             success_count += 1
         except Exception as exc:
             row["message"] = str(exc)
             print(f"    [ERROR] {exc}")
-
-        summary_rows.append(row)
+            summary_rows.append(row)
 
     summary_path = save_batch_summary(output_root, summary_rows)
     print(f"[INFO] Batch complete: {success_count}/{len(pairs)} succeeded")
@@ -474,20 +487,23 @@ def run_batch_mode(input_dir, weights_path):
 
 def run_single_mode(path_on, path_off, weights_path, save_path=None):
     """Process one pair and show the visualization window."""
-    _, detection, geometry, result = process_pair(path_on, path_off, weights_path)
+    _, detections, geometries, result = process_pair(path_on, path_off, weights_path)
 
     print("=== Solar Cell Area Result ===")
     print(f"LED ON : {path_on}")
     print(f"LED OFF: {path_off}")
     print(f"YOLO   : {weights_path}")
-    print(f"Best box       : {detection['box']}")
-    print(f"Best score     : {detection['score']:.4f}")
-    print(f"px/cm (x)      : {geometry['px_per_cm_x']:.4f}")
-    print(f"px/cm (y)      : {geometry['px_per_cm_y']:.4f}")
-    print(f"px/cm (avg)    : {geometry['px_per_cm']:.4f}")
-    print(f"Film center    : ({geometry['film_center'][0]:.2f}, {geometry['film_center'][1]:.2f})")
-    print(f"Area center    : ({geometry['area_center'][0]:.2f}, {geometry['area_center'][1]:.2f})")
-    print(f"Area box       : {geometry['area_box']}")
+    print(f"Detections >= {YOLO_SCORE_FILTER:.2f}: {len(detections)}")
+    for det_index, (detection, geometry) in enumerate(zip(detections, geometries), start=1):
+        print(f"-- Detection #{det_index}")
+        print(f"   box          : {detection['box']}")
+        print(f"   score        : {detection['score']:.4f}")
+        print(f"   px/cm (x)    : {geometry['px_per_cm_x']:.4f}")
+        print(f"   px/cm (y)    : {geometry['px_per_cm_y']:.4f}")
+        print(f"   px/cm (avg)  : {geometry['px_per_cm']:.4f}")
+        print(f"   film center  : ({geometry['film_center'][0]:.2f}, {geometry['film_center'][1]:.2f})")
+        print(f"   area center  : ({geometry['area_center'][0]:.2f}, {geometry['area_center'][1]:.2f})")
+        print(f"   area box     : {geometry['area_box']}")
 
     if save_path:
         output_path = Path(save_path)
