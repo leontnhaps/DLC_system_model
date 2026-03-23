@@ -18,11 +18,16 @@ class SchedulingTab:
         )
         r += 1
 
-        self.dwell_seconds = DoubleVar(value=20.0)
-        Label(self.frame, text="Shoot Timer (s)").grid(row=r, column=0, sticky="w", padx=8, pady=4)
-        ttk.Entry(self.frame, textvariable=self.dwell_seconds, width=10).grid(row=r, column=1, sticky="w", padx=8, pady=4)
+        self.frame_seconds = DoubleVar(value=0.0)
+        Label(self.frame, text="T_frame_sec (s)").grid(row=r, column=0, sticky="w", padx=8, pady=4)
+        ttk.Entry(self.frame, textvariable=self.frame_seconds, width=10).grid(row=r, column=1, sticky="w", padx=8, pady=4)
         r += 1
-        
+
+        self.total_seconds = DoubleVar(value=0.0)
+        Label(self.frame, text="T_total_sec (s)").grid(row=r, column=0, sticky="w", padx=8, pady=4)
+        ttk.Entry(self.frame, textvariable=self.total_seconds, width=10).grid(row=r, column=1, sticky="w", padx=8, pady=4)
+        r += 1
+
         self.led_probe_seconds = DoubleVar(value=10.0)
         Label(self.frame, text="Battery Check (s)").grid(row=r, column=0, sticky="w", padx=8, pady=4)
         ttk.Entry(self.frame, textvariable=self.led_probe_seconds, width=10).grid(row=r, column=1, sticky="w", padx=8, pady=4)
@@ -77,12 +82,20 @@ class SchedulingTab:
     def update_status(self, text, fg="#333"):
         self.status_label.config(text=text, fg=fg)
 
-    def get_dwell_seconds(self):
+    def get_frame_seconds(self):
         try:
-            return max(0.2, float(self.dwell_seconds.get()))
+            value = float(self.frame_seconds.get())
         except Exception:
-            return 20.0
-    
+            return 0.0
+        return value if value > 0.0 else 0.0
+
+    def get_total_seconds(self):
+        try:
+            value = float(self.total_seconds.get())
+        except Exception:
+            return 0.0
+        return value if value > 0.0 else 0.0
+
     def get_led_probe_seconds(self):
         try:
             return max(0.5, float(self.led_probe_seconds.get()))

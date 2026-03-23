@@ -24,7 +24,9 @@ from yolo_utils import YOLOProcessor
 from led_filter import classify_from_single_roi, get_default_led_filter_params
 import threading
 
-ROUNDROBIN_DWELL_S = 20.0
+ROUNDROBIN_T_FRAME_SEC_DEFAULT = 0.0
+ROUNDROBIN_T_TOTAL_SEC_DEFAULT = 0.0
+ROUNDROBIN_T_SLICE_RR_FALLBACK_S = 20.0  # hidden fallback to preserve legacy RR timing if T_frame_sec is unset
 ROUNDROBIN_AIM_TIMEOUT_S = 120.0
 
 
@@ -555,6 +557,43 @@ class ComApp(EventHandlersMixin, PointingHandlerMixin, AppHelpersMixin):
             key=lambda item: (-float(item[1][0]), int(item[0])),
         )]
 
+    def _resolve_roundrobin_timing(self, n_targets, frame_sec=None, total_sec=None):
+        """Resolve canonical RR timing in frame-based form."""
+        N_targets = max(1, int(n_targets))
+
+        try:
+            T_frame_sec = float(frame_sec)
+        except Exception:
+            T_frame_sec = 0.0
+        if T_frame_sec <= 0.0:
+            T_frame_sec = 0.0
+
+        try:
+            T_total_sec = float(total_sec)
+        except Exception:
+            T_total_sec = 0.0
+        if T_total_sec <= 0.0:
+            T_total_sec = 0.0
+
+        if T_frame_sec > 0.0:
+            t_slice_rr = T_frame_sec / float(N_targets)
+        else:
+            t_slice_rr = float(max(0.2, ROUNDROBIN_T_SLICE_RR_FALLBACK_S))
+            T_frame_sec = t_slice_rr * float(N_targets)
+
+        K_frames = None
+        if T_total_sec > 0.0 and T_frame_sec > 0.0:
+            K_frames = max(1, int(T_total_sec / T_frame_sec))
+
+        return {
+            "T_frame_sec": float(T_frame_sec),
+            "T_total_sec": float(T_total_sec),
+            "K_frames": K_frames,
+            "N_targets": N_targets,
+            "t_slice_rr": float(t_slice_rr),
+            "dwell_s": float(t_slice_rr),  # compatibility alias for existing helper/overlay naming
+        }
+
     def _set_scheduling_status(self, text, fg="#333"):
         def _update():
             if hasattr(self, "scheduling_tab"):
@@ -620,11 +659,14 @@ class ComApp(EventHandlersMixin, PointingHandlerMixin, AppHelpersMixin):
             final_targets = dict(getattr(self, "computed_targets", {}) or {})
             settle_s = float(self._call_on_ui_thread(lambda: self.scan_tab.settle.get(), timeout=2.0))
             settle_s = max(0.1, settle_s)
-            dwell_s = float(self._call_on_ui_thread(
-                lambda: self.scheduling_tab.get_dwell_seconds() if hasattr(self, "scheduling_tab") else ROUNDROBIN_DWELL_S,
+            T_frame_sec_cfg = self._call_on_ui_thread(
+                lambda: self.scheduling_tab.get_frame_seconds() if hasattr(self, "scheduling_tab") else ROUNDROBIN_T_FRAME_SEC_DEFAULT,
                 timeout=2.0
-            ))
-            dwell_s = max(0.2, dwell_s)
+            )
+            T_total_sec_cfg = self._call_on_ui_thread(
+                lambda: self.scheduling_tab.get_total_seconds() if hasattr(self, "scheduling_tab") else ROUNDROBIN_T_TOTAL_SEC_DEFAULT,
+                timeout=2.0
+            )
             led_probe_s = float(self._call_on_ui_thread(
                 lambda: self.scheduling_tab.get_led_probe_seconds() if hasattr(self, "scheduling_tab") else 10.0,
                 timeout=2.0
@@ -741,12 +783,33 @@ class ComApp(EventHandlersMixin, PointingHandlerMixin, AppHelpersMixin):
             if not final_ids:
                 raise RuntimeError("Scheduling용 타깃이 없습니다.")
 
+            rr_timing = self._resolve_roundrobin_timing(
+                n_targets=len(final_ids),
+                frame_sec=T_frame_sec_cfg,
+                total_sec=T_total_sec_cfg,
+            )
+            self._roundrobin_timing = dict(rr_timing)
+            T_frame_sec = rr_timing["T_frame_sec"]
+            T_total_sec = rr_timing["T_total_sec"]
+            K_frames = rr_timing["K_frames"]
+            N_targets = rr_timing["N_targets"]
+            t_slice_rr = rr_timing["t_slice_rr"]
+            dwell_s = rr_timing["dwell_s"]
+
+            k_text = str(K_frames) if K_frames is not None else "manual"
+            total_text = f"{T_total_sec:.1f}s" if T_total_sec > 0.0 else "manual"
+
             self._set_scheduling_status(
                 f"🔴 RoundRobin Shoot: {len(final_ids)}개 ID 순환 조사 시작 "
-                f"({dwell_s:.1f}초/ID, Battery check {led_probe_s:.1f}초, Stop까지 계속)",
+                f"(slice={t_slice_rr:.1f}초/ID, T_frame={T_frame_sec:.1f}s, "
+                f"T_total={total_text}, K={k_text}, N={N_targets}, "
+                f"Battery check {led_probe_s:.1f}초)",
                 fg="blue",
             )
             self._set_preview_overlay(current_id=None, phase="Shoot", dwell_elapsed=0.0, dwell_total=dwell_s)
+            shoot_started_at = time.monotonic()
+            shoot_deadline = (shoot_started_at + T_total_sec) if T_total_sec > 0.0 else None
+            completed_frames = 0
 
             # Shoot loop에서 preview 강제 ON
             preview_on = bool(self._call_on_ui_thread(lambda: self.preview_active, timeout=2.0))
@@ -760,11 +823,19 @@ class ComApp(EventHandlersMixin, PointingHandlerMixin, AppHelpersMixin):
             # Phase B: ID 순환 조사 (Stop까지 반복)
             loop_count = 0
             while not self._scheduling_stop_event.is_set():
+                if shoot_deadline is not None and time.monotonic() >= shoot_deadline:
+                    final_message = "✅ RoundRobin 완료 (T_total_sec 도달)"
+                    final_color = "green"
+                    break
                 loop_count += 1
                 # 루프마다 IR 모드 재보장
                 self._call_on_ui_thread(lambda: self.set_ir_cut("day"), timeout=3.0)
                 for idx, track_id in enumerate(final_ids, start=1):
                     if self._scheduling_stop_event.is_set():
+                        break
+                    if shoot_deadline is not None and time.monotonic() >= shoot_deadline:
+                        final_message = "✅ RoundRobin 완료 (T_total_sec 도달)"
+                        final_color = "green"
                         break
 
                     # Shoot loop 중 preview가 꺼졌다면 즉시 복구
@@ -809,6 +880,8 @@ class ComApp(EventHandlersMixin, PointingHandlerMixin, AppHelpersMixin):
                     while (time.monotonic() - start_t) < dwell_s:
                         if self._scheduling_stop_event.is_set():
                             break
+                        if shoot_deadline is not None and time.monotonic() >= shoot_deadline:
+                            break
                         elapsed = time.monotonic() - start_t
                         while elapsed >= next_probe_elapsed:
                             probe_elapsed = next_probe_elapsed
@@ -843,8 +916,23 @@ class ComApp(EventHandlersMixin, PointingHandlerMixin, AppHelpersMixin):
                     self.laser_state = False
                     time.sleep(0.05)
 
-            final_message = "⛔ Scheduling 중지됨"
-            final_color = "red"
+                    if shoot_deadline is not None and time.monotonic() >= shoot_deadline:
+                        final_message = "✅ RoundRobin 완료 (T_total_sec 도달)"
+                        final_color = "green"
+                        break
+
+                if self._scheduling_stop_event.is_set():
+                    break
+
+                completed_frames += 1
+                if K_frames is not None and completed_frames >= K_frames:
+                    final_message = "✅ RoundRobin 완료 (K_frames 도달)"
+                    final_color = "green"
+                    break
+
+            if self._scheduling_stop_event.is_set():
+                final_message = "⛔ Scheduling 중지됨"
+                final_color = "red"
 
         except Exception as e:
             final_message = f"❌ RoundRobin 오류: {e}"
