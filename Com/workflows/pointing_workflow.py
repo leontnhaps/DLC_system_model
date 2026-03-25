@@ -28,7 +28,7 @@ OBJECT_SIZE_CM = 5.5         #   (cm) - offset
 TARGET_OFFSET_CM = -12.25    #    12.25cm (2.75 + 5.5 + 4)
 LASER_DIFF_THRESHOLD = 150   #  diff threshold ()
 PHASE3_TARGET_BELOW_CM = 11.75  # 타겟 중심에서 아래(+y) 기준점(cm)
-PHASE3_ENABLED = False         # 임시: Phase 3 비활성화
+PHASE3_ENABLED = True          # Phase 3 활성화
 PHASE3_MAX_ITERS = 12
 PHASE3_TOL_X_PX = 6
 PHASE3_TOL_Y_PX = 6
@@ -37,6 +37,16 @@ PHASE3_ROI_HALF_SIZE_PX = 120
 PHASE3_ROI_MARGIN_FROM_TARGET_PX = 10
 PHASE3_STEP_DEG = 1.0
 PHASE3_ERR_COMPARE_EPS = 0.5
+PHASE3_RESPONSE_TOP_RATIO = 0.10
+PHASE3_RESPONSE_COLORS = [
+    (255, 0, 0),    # Blue
+    (255, 255, 0),  # Cyan
+    (0, 255, 0),    # Green
+    (0, 255, 255),  # Yellow
+    (0, 165, 255),  # Orange
+    (0, 0, 255),    # Red
+]
+PHASE3_RESPONSE_VALUE_BINS = [0, 43, 86, 129, 172, 215, 256]
 MAX_STEP_DEG = 5.0           #    (deg/step)
 ROUGH_CAM_TO_LASER_CM = 6.0  #    (cm)
 ROUGH_TARGET_BELOW_CM = 12.5 # YOLO    (cm)
@@ -359,7 +369,15 @@ class PointingHandlerMixin:
             
             #  : 5   ID
             MERGE_TOL = 5.0  # deg
-            merged = self._merge_similar_targets(self.computed_targets, grouped_by_track, MERGE_TOL, W_frame, H_frame, min_samples)
+            merged = self._merge_similar_targets(
+                self.computed_targets,
+                grouped_by_track,
+                MERGE_TOL,
+                W_frame,
+                H_frame,
+                min_samples,
+                persisted_targets=persisted_targets,
+            )
             if merged:
                 self.computed_targets = merged['targets']
                 self._pointing_gains = merged['gains']
@@ -428,12 +446,14 @@ class PointingHandlerMixin:
         self._pointing_csv_track_ids = new_csv_track_ids
         print(f"[Pointing] ID renumbered: {id_map}")
     
-    def _merge_similar_targets(self, targets, grouped_by_track, tol, W_frame, H_frame, min_samples):
+    def _merge_similar_targets(self, targets, grouped_by_track, tol, W_frame, H_frame, min_samples, persisted_targets=None):
         """
         Merge nearby targets within tol and recompute representative target.
         """
         if len(targets) <= 1:
             return None
+
+        persisted_targets = persisted_targets or {}
         
         ids = sorted(targets.keys())
         merged_groups = []  # [[id1, id2, ...], ...]
@@ -477,6 +497,35 @@ class PointingHandlerMixin:
                 continue
             
             print(f"  IDs {group} ID {rep_id}  ")
+
+            # If any source track in the merged group already has a saved final
+            # target, keep that persisted target as the representative instead of
+            # recomputing a regression target.
+            group_persisted = {
+                tid: persisted_targets[tid]
+                for tid in sorted(group)
+                if tid in persisted_targets
+            }
+            if group_persisted:
+                saved_target = group_persisted.get(rep_id)
+                if saved_target is None:
+                    counts = defaultdict(int)
+                    first_owner = {}
+                    for tid, target in group_persisted.items():
+                        counts[target] += 1
+                        if target not in first_owner:
+                            first_owner[target] = tid
+                    saved_target = min(
+                        counts.keys(),
+                        key=lambda target: (-counts[target], first_owner[target]),
+                    )
+                new_targets[rep_id] = saved_target
+                new_gains[rep_id] = self._pointing_gains.get(rep_id, (CENTERING_GAIN_PAN, CENTERING_GAIN_TILT))
+                print(
+                    f"  -> keep saved final target pan={saved_target[0]:.3f}, "
+                    f"tilt={saved_target[1]:.3f} from CSV"
+                )
+                continue
             
             #   
             combined_rows = []
@@ -793,7 +842,7 @@ class PointingHandlerMixin:
         Adaptive  Thread:
           Phase 1) YOLO  X  X (X)
           Phase 2)  tilt +2deg  Laser ON/OFF(shutter=100) diff                   YOLO bbox   tilt1deg.
-          Phase 3) Phase2 완료 지점에서 레이저 중심-목표점 오차 최소화 보정.
+          Phase 3) Phase2 완료 지점에서 solarcell area 내부 laser response 최대 pan 선택.
         """
         try:
             settle = self.scan_tab.settle.get()
@@ -1178,7 +1227,7 @@ class PointingHandlerMixin:
                                 initial_px_per_cm=px_per_cm,
                             )
                             if phase3_best is not None:
-                                best_pan, best_tilt, best_err_x, best_err_y, best_err = phase3_best
+                                best_pan, best_tilt, best_resp_mean, best_resp_core, best_resp_max = phase3_best
                                 self._curr_pan = float(best_pan)
                                 self._curr_tilt = float(best_tilt)
                                 self.ctrl.send(
@@ -1196,7 +1245,8 @@ class PointingHandlerMixin:
                                 self._persist_final_target_to_csv(track_id, pan_q, tilt_q)
                                 print(
                                     "[Pointing-Adaptive] Phase 3 best: "
-                                    f"err=({best_err_x:.1f},{best_err_y:.1f}), |e|={best_err:.1f}px, "
+                                    f"mean={best_resp_mean:.1f}, core={best_resp_core:.1f}, "
+                                    f"max={best_resp_max:.1f}, "
                                     f"pose=({self._curr_pan:.2f},{self._curr_tilt:.2f}), ok={phase3_ok}"
                                 )
                             else:
@@ -1490,6 +1540,167 @@ class PointingHandlerMixin:
         except Exception as e:
             print(f"[Pointing] Laser diff preview : {e}")
 
+    @staticmethod
+    def _phase3_clip_box(area_box, shape):
+        """Clip a box to image bounds."""
+        height, width = shape[:2]
+        x1, y1, x2, y2 = [int(v) for v in area_box]
+        x1 = max(0, min(width, x1))
+        x2 = max(0, min(width, x2))
+        y1 = max(0, min(height, y1))
+        y2 = max(0, min(height, y2))
+        return x1, y1, x2, y2
+
+    def _phase3_build_area_geometry(self, bbox, fallback_target, px_per_cm_hint):
+        """Build the solarcell-area target geometry used for Phase 3 response scoring."""
+        if bbox and bbox[2] > 0 and bbox[3] > 0:
+            bx, by, bw, bh = [float(v) for v in bbox]
+            obj_cx = bx + (bw / 2.0)
+            obj_cy = by + (bh / 2.0)
+            px_per_cm_x = bw / OBJECT_SIZE_CM
+            px_per_cm_y = bh / OBJECT_SIZE_CM
+            px_per_cm = max(1.0, (px_per_cm_x + px_per_cm_y) / 2.0)
+            target_x = float(obj_cx)
+            target_y = float(obj_cy + (PHASE3_TARGET_BELOW_CM * px_per_cm))
+        else:
+            px_per_cm = float(px_per_cm_hint) if px_per_cm_hint else 10.0
+            target_x = float(fallback_target[0])
+            target_y = float(fallback_target[1])
+
+        area_side_px = float(8.0 * px_per_cm)
+        half_side_px = area_side_px / 2.0
+        area_box = (
+            int(round(target_x - half_side_px)),
+            int(round(target_y - half_side_px)),
+            int(round(target_x + half_side_px)),
+            int(round(target_y + half_side_px)),
+        )
+        return {
+            "target_x": float(target_x),
+            "target_y": float(target_y),
+            "px_per_cm": float(px_per_cm),
+            "area_box": area_box,
+        }
+
+    def _phase3_compute_response_metrics(self, img_laser_on, img_laser_off, area_box):
+        """Compute Phase 3 response inside the 8cm x 8cm target area."""
+        gray_on = cv2.cvtColor(img_laser_on, cv2.COLOR_BGR2GRAY).astype(np.float32)
+        gray_off = cv2.cvtColor(img_laser_off, cv2.COLOR_BGR2GRAY).astype(np.float32)
+        delta_pos = np.clip(gray_on - gray_off, 0.0, None)
+        delta_u8 = np.clip(delta_pos, 0.0, 255.0).astype(np.uint8)
+
+        x1, y1, x2, y2 = self._phase3_clip_box(area_box, delta_u8.shape)
+        if x2 <= x1 or y2 <= y1:
+            return delta_u8, {
+                "mean_delta": 0.0,
+                "core_delta": 0.0,
+                "max_delta": 0.0,
+                "peak_pos": None,
+                "clipped_area_box": (x1, y1, x2, y2),
+            }
+
+        roi = delta_pos[y1:y2, x1:x2]
+        positive = roi[roi > 0]
+
+        if positive.size <= 0:
+            metrics = {
+                "mean_delta": 0.0,
+                "core_delta": 0.0,
+                "max_delta": 0.0,
+                "peak_pos": None,
+                "clipped_area_box": (x1, y1, x2, y2),
+            }
+        else:
+            top_count = max(1, int(np.ceil(float(positive.size) * PHASE3_RESPONSE_TOP_RATIO)))
+            top_values = np.partition(positive, -top_count)[-top_count:]
+            peak_local = np.unravel_index(np.argmax(roi), roi.shape)
+            peak_pos = (int(x1 + peak_local[1]), int(y1 + peak_local[0]))
+            metrics = {
+                "mean_delta": float(np.mean(positive)),
+                "core_delta": float(np.mean(top_values)),
+                "max_delta": float(np.max(positive)),
+                "peak_pos": peak_pos,
+                "clipped_area_box": (x1, y1, x2, y2),
+            }
+
+        return delta_u8, metrics
+
+    def _phase3_render_response_overlay(
+        self,
+        led_diff_bgr,
+        area_box,
+        response_u8,
+        bbox,
+        all_bboxes,
+        target_x,
+        target_y,
+        phase3_iter,
+        phase3_tag,
+        response_metrics,
+    ):
+        """Render the LED diff panel with absolute 0..255 laser-response colors."""
+        base = led_diff_bgr.copy()
+        overlay = base.copy()
+        x1, y1, x2, y2 = response_metrics.get("clipped_area_box", self._phase3_clip_box(area_box, response_u8.shape))
+
+        if x2 > x1 and y2 > y1:
+            color_layer = np.zeros_like(base)
+            for idx in range(len(PHASE3_RESPONSE_VALUE_BINS) - 1):
+                low = PHASE3_RESPONSE_VALUE_BINS[idx]
+                high = PHASE3_RESPONSE_VALUE_BINS[idx + 1]
+                sel = np.zeros(response_u8.shape, dtype=bool)
+                roi = response_u8[y1:y2, x1:x2]
+                sel_roi = (roi >= low) & (roi < high)
+                sel[y1:y2, x1:x2] = sel_roi
+                color_layer[sel] = PHASE3_RESPONSE_COLORS[idx]
+
+            blended = cv2.addWeighted(base, 0.55, color_layer, 0.45, 0)
+            overlay[y1:y2, x1:x2] = blended[y1:y2, x1:x2]
+
+        if all_bboxes:
+            for mx, my, mw, mh in all_bboxes:
+                cv2.rectangle(
+                    overlay,
+                    (int(mx), int(my)),
+                    (int(mx + mw), int(my + mh)),
+                    (100, 100, 100),
+                    1,
+                )
+        if bbox:
+            bx, by, bw, bh = [int(v) for v in bbox]
+            cv2.rectangle(overlay, (bx, by), (bx + bw, by + bh), (0, 255, 255), 2)
+            cv2.putText(overlay, "OBJECT", (bx, max(20, by - 8)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 2)
+
+        tx = int(round(float(target_x)))
+        ty = int(round(float(target_y)))
+        cv2.drawMarker(overlay, (tx, ty), (255, 255, 255), cv2.MARKER_TILTED_CROSS, 28, 2)
+        cv2.rectangle(overlay, (x1, y1), (x2, y2), (255, 255, 255), 2)
+
+        peak = response_metrics.get("peak_pos")
+        if peak is not None:
+            cv2.circle(overlay, peak, 10, (0, 0, 255), 2)
+            cv2.drawMarker(overlay, peak, (0, 0, 255), cv2.MARKER_CROSS, 24, 2)
+
+        cv2.putText(overlay, f"Phase3 {phase3_iter}-{phase3_tag}", (20, 36),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 200, 100), 2)
+        cv2.putText(overlay, "LED DIFF + response overlay", (20, 70),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+        cv2.putText(
+            overlay,
+            "Resp mean={:.1f} core={:.1f} max={:.1f}".format(
+                float(response_metrics.get("mean_delta", 0.0)),
+                float(response_metrics.get("core_delta", 0.0)),
+                float(response_metrics.get("max_delta", 0.0)),
+            ),
+            (20, 104),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.7,
+            (255, 255, 255),
+            2,
+        )
+        return overlay
+
     def _save_phase3_debug_artifacts(
         self,
         log_dir,
@@ -1502,15 +1713,13 @@ class PointingHandlerMixin:
         img_laser_off,
         target_x,
         target_y,
-        laser_pos,
         bbox,
         all_bboxes,
-        roi_half_size,
-        err_x=None,
-        err_y=None,
-        err_mag=None,
+        area_box,
+        response_u8,
+        response_metrics,
     ):
-        """Save Phase3 raw/diff/overlay debug images into the pointing log dir."""
+        """Save Phase 3 raw images plus response-based overlays into the pointing log dir."""
         if not log_dir:
             return
 
@@ -1523,61 +1732,27 @@ class PointingHandlerMixin:
             cv2.imwrite(f"{prefix}_laser_off.jpg", img_laser_off)
 
             led_diff = cv2.absdiff(img_led_on, img_led_off)
-            led_gray = cv2.cvtColor(led_diff, cv2.COLOR_BGR2GRAY)
-            cv2.imwrite(f"{prefix}_led_diff.jpg", led_gray)
+            cv2.imwrite(f"{prefix}_led_diff.jpg", led_diff)
+            cv2.imwrite(f"{prefix}_laser_diff_raw.jpg", response_u8)
 
-            laser_diff = cv2.absdiff(img_laser_on, img_laser_off)
-            laser_gray = cv2.cvtColor(laser_diff, cv2.COLOR_BGR2GRAY)
-            cv2.imwrite(f"{prefix}_laser_diff_raw.jpg", laser_gray)
-
-            _, laser_thresh = cv2.threshold(
-                laser_gray,
-                float(PHASE3_DIFF_TOZERO_THRESH),
-                255,
-                cv2.THRESH_TOZERO,
+            response_overlay = self._phase3_render_response_overlay(
+                led_diff_bgr=led_diff,
+                area_box=area_box,
+                response_u8=response_u8,
+                bbox=bbox,
+                all_bboxes=all_bboxes,
+                target_x=target_x,
+                target_y=target_y,
+                phase3_iter=phase3_iter,
+                phase3_tag=phase3_tag,
+                response_metrics=response_metrics,
             )
-            laser_vis = cv2.cvtColor(laser_thresh.astype(np.uint8), cv2.COLOR_GRAY2BGR)
-
-            tx = int(round(float(target_x)))
-            ty = int(round(float(target_y)))
-            cv2.circle(laser_vis, (tx, ty), 10, (0, 0, 255), 2)
-            cv2.drawMarker(laser_vis, (tx, ty), (0, 0, 255), cv2.MARKER_CROSS, 36, 2)
-            cv2.putText(laser_vis, f"TARGET ({tx},{ty})", (tx + 12, max(20, ty - 12)),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 255), 2)
-
-            rx1 = max(0, tx - int(roi_half_size))
-            ry1 = max(0, ty - int(roi_half_size))
-            rx2 = min(laser_vis.shape[1], tx + int(roi_half_size))
-            ry2 = min(laser_vis.shape[0], ty + int(roi_half_size))
-            cv2.rectangle(laser_vis, (rx1, ry1), (rx2, ry2), (255, 255, 0), 2)
-            cv2.putText(laser_vis, "PHASE3 ROI", (rx1, max(20, ry1 - 8)),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 0), 2)
-
-            if all_bboxes:
-                for mx, my, mw, mh in all_bboxes:
-                    cv2.rectangle(
-                        laser_vis,
-                        (int(mx), int(my)),
-                        (int(mx + mw), int(my + mh)),
-                        (120, 120, 120),
-                        1,
-                    )
-
-            if laser_pos is not None:
-                lx = int(laser_pos[0])
-                ly = int(laser_pos[1])
-                cv2.circle(laser_vis, (lx, ly), 10, (0, 255, 0), 2)
-                cv2.drawMarker(laser_vis, (lx, ly), (0, 255, 0), cv2.MARKER_CROSS, 36, 2)
-                cv2.putText(laser_vis, f"LASER ({lx},{ly})", (lx + 12, min(laser_vis.shape[0] - 12, ly + 24)),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 2)
-                cv2.line(laser_vis, (tx, ty), (lx, ly), (255, 255, 255), 1, cv2.LINE_AA)
-            else:
-                cv2.putText(laser_vis, "LASER NOT FOUND", (20, 36),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 165, 255), 2)
-
-            cv2.imwrite(f"{prefix}_laser_diff_thresh.jpg", laser_vis)
+            cv2.imwrite(f"{prefix}_laser_diff_thresh.jpg", response_overlay)
 
             debug = img_laser_on.copy()
+            x1, y1, x2, y2 = response_metrics.get("clipped_area_box", self._phase3_clip_box(area_box, debug.shape))
+            tx = int(round(float(target_x)))
+            ty = int(round(float(target_y)))
             if bbox:
                 bx, by, bw, bh = [int(v) for v in bbox]
                 cv2.rectangle(debug, (bx, by), (bx + bw, by + bh), (0, 255, 255), 2)
@@ -1587,27 +1762,34 @@ class PointingHandlerMixin:
                 for mx, my, mw, mh in all_bboxes:
                     cv2.rectangle(debug, (int(mx), int(my)),
                                   (int(mx + mw), int(my + mh)), (100, 100, 100), 1)
-            cv2.circle(debug, (tx, ty), 12, (0, 0, 255), 2)
-            cv2.drawMarker(debug, (tx, ty), (0, 0, 255), cv2.MARKER_CROSS, 40, 2)
-            cv2.rectangle(debug, (rx1, ry1), (rx2, ry2), (255, 255, 0), 2)
-            if laser_pos is not None:
-                lx = int(laser_pos[0])
-                ly = int(laser_pos[1])
-                cv2.circle(debug, (lx, ly), 12, (0, 255, 0), 2)
-                cv2.drawMarker(debug, (lx, ly), (0, 255, 0), cv2.MARKER_CROSS, 40, 2)
-                cv2.line(debug, (tx, ty), (lx, ly), (255, 255, 255), 1, cv2.LINE_AA)
-
+            cv2.drawMarker(debug, (tx, ty), (255, 255, 255), cv2.MARKER_TILTED_CROSS, 32, 2)
+            cv2.rectangle(debug, (x1, y1), (x2, y2), (255, 255, 255), 2)
+            peak = response_metrics.get("peak_pos")
+            if peak is not None:
+                cv2.circle(debug, peak, 10, (0, 0, 255), 2)
+                cv2.drawMarker(debug, peak, (0, 0, 255), cv2.MARKER_CROSS, 24, 2)
             cv2.putText(debug, f"Phase3 {phase3_iter}-{phase3_tag}", (20, 36),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 200, 100), 2)
             cv2.putText(debug, f"Pan={float(getattr(self, '_curr_pan', 0.0)):.2f} Tilt={float(getattr(self, '_curr_tilt', 0.0)):.2f}",
                         (20, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 200, 100), 2)
-            if err_x is not None and err_y is not None and err_mag is not None:
-                cv2.putText(debug, f"Err=({float(err_x):.1f},{float(err_y):.1f}) |E|={float(err_mag):.1f}px",
-                            (20, 104), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+            cv2.putText(
+                debug,
+                "Resp mean={:.1f} core={:.1f} max={:.1f}".format(
+                    float(response_metrics.get("mean_delta", 0.0)),
+                    float(response_metrics.get("core_delta", 0.0)),
+                    float(response_metrics.get("max_delta", 0.0)),
+                ),
+                (20, 104),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.7,
+                (255, 255, 255),
+                2,
+            )
+            cv2.imwrite(f"{prefix}_response_overlay.jpg", response_overlay)
             cv2.imwrite(f"{prefix}_debug.jpg", debug)
 
             # Pointing 탭 하단 패널은 Phase 3 디버그 전용으로 사용
-            self.root.after(0, lambda img=debug.copy(): self._show_laser_diff(img))
+            self.root.after(0, lambda img=response_overlay.copy(): self._show_laser_diff(img))
         except Exception as e:
             print(f"[Pointing] Phase3 debug save failed: {e}")
     
@@ -1832,7 +2014,7 @@ class PointingHandlerMixin:
         base_iteration,
         initial_px_per_cm=None,
     ):
-        """Phase2 완료 후 Phase3: pan 3점(현재, -1, +1) 측정 후 최소 오차 선택."""
+        """Phase2 완료 후 Phase3: pan 3점(현재, -1, +1)에서 area response 최대 후보 선택."""
         px_per_cm_hint = float(initial_px_per_cm) if initial_px_per_cm else None
         last_bboxes = all_bboxes
         last_target_x = float(target_x)
@@ -1877,7 +2059,8 @@ class PointingHandlerMixin:
             candidates.append(meas_base)
             print(
                 f"[Pointing-Adaptive] Phase 3-3pt base: pan={meas_base['pan']:.2f}, "
-                f"err=({meas_base['err_x']:.1f},{meas_base['err_y']:.1f}), |e|={meas_base['err_mag']:.1f}"
+                f"mean={meas_base['response_mean']:.1f}, core={meas_base['response_core']:.1f}, "
+                f"max={meas_base['response_max']:.1f}"
             )
 
         # 2) pan -1
@@ -1888,7 +2071,8 @@ class PointingHandlerMixin:
                 candidates.append(meas_minus)
                 print(
                     f"[Pointing-Adaptive] Phase 3-3pt minus: pan={meas_minus['pan']:.2f}, "
-                    f"err=({meas_minus['err_x']:.1f},{meas_minus['err_y']:.1f}), |e|={meas_minus['err_mag']:.1f}"
+                    f"mean={meas_minus['response_mean']:.1f}, core={meas_minus['response_core']:.1f}, "
+                    f"max={meas_minus['response_max']:.1f}"
                 )
 
         # 3) pan +1
@@ -1899,7 +2083,8 @@ class PointingHandlerMixin:
                 candidates.append(meas_plus)
                 print(
                     f"[Pointing-Adaptive] Phase 3-3pt plus: pan={meas_plus['pan']:.2f}, "
-                    f"err=({meas_plus['err_x']:.1f},{meas_plus['err_y']:.1f}), |e|={meas_plus['err_mag']:.1f}"
+                    f"mean={meas_plus['response_mean']:.1f}, core={meas_plus['response_core']:.1f}, "
+                    f"max={meas_plus['response_max']:.1f}"
                 )
 
         if not candidates:
@@ -1917,8 +2102,15 @@ class PointingHandlerMixin:
             self.ctrl.send({"cmd": "laser", "value": 1})
             return False, None
 
-        # |err_x| 최소 우선, 동률이면 |err| 최소
-        best_meas = min(candidates, key=lambda m: (abs(float(m["err_x"])), float(m["err_mag"])))
+        # area 평균 반응 최대 우선, 동률이면 core/max 반응 순으로 선택
+        best_meas = max(
+            candidates,
+            key=lambda m: (
+                float(m["response_mean"]),
+                float(m["response_core"]),
+                float(m["response_max"]),
+            ),
+        )
 
         self._curr_pan = float(best_meas["pan"])
         self._curr_tilt = float(base_tilt)
@@ -1937,15 +2129,16 @@ class PointingHandlerMixin:
 
         print(
             f"[Pointing-Adaptive] Phase 3-3pt best: pan={self._curr_pan:.2f}, "
-            f"err=({best_meas['err_x']:.1f},{best_meas['err_y']:.1f}), |e|={best_meas['err_mag']:.1f}"
+            f"mean={best_meas['response_mean']:.1f}, core={best_meas['response_core']:.1f}, "
+            f"max={best_meas['response_max']:.1f}"
         )
         self.ctrl.send({"cmd": "laser", "value": 1})
         return True, (
             float(best_meas["pan"]),
             float(best_meas["tilt"]),
-            float(best_meas["err_x"]),
-            float(best_meas["err_y"]),
-            float(best_meas["err_mag"]),
+            float(best_meas["response_mean"]),
+            float(best_meas["response_core"]),
+            float(best_meas["response_max"]),
         )
 
     def _phase3_measure_error(
@@ -1960,7 +2153,7 @@ class PointingHandlerMixin:
         fallback_bboxes,
         px_per_cm_hint,
     ):
-        """Phase3 단일 측정: 타겟 재검출 + 레이저 중심 + 오차 계산."""
+        """Phase3 단일 측정: 타겟 재검출 + area response 계산."""
         try:
             self.set_ir_cut("night")
             time.sleep(0.05)
@@ -1984,18 +2177,21 @@ class PointingHandlerMixin:
                 return None, px_per_cm_hint, fallback_bboxes
 
             obj_cx, obj_cy, bbox, all_bboxes = self._find_object_center(img_led_on, img_led_off)
-            if obj_cx is None:
-                target_x, target_y = fallback_target
+            if all_bboxes is None:
                 all_bboxes = fallback_bboxes
-            else:
-                if bbox and bbox[2] > 0:
-                    px_per_cm_hint = float(bbox[2]) / OBJECT_SIZE_CM
-                elif not px_per_cm_hint:
-                    px_per_cm_hint = 10.0
-                target_x = float(obj_cx)
-                target_y = float(obj_cy + (PHASE3_TARGET_BELOW_CM * float(px_per_cm_hint)))
-                if all_bboxes is None:
-                    all_bboxes = fallback_bboxes
+
+            if obj_cx is None and not px_per_cm_hint:
+                px_per_cm_hint = 10.0
+
+            geometry = self._phase3_build_area_geometry(
+                bbox=bbox,
+                fallback_target=fallback_target,
+                px_per_cm_hint=px_per_cm_hint,
+            )
+            target_x = geometry["target_x"]
+            target_y = geometry["target_y"]
+            px_per_cm_hint = geometry["px_per_cm"]
+            area_box = geometry["area_box"]
 
             self.ctrl.send({"cmd": "laser", "value": 1})
             time.sleep(led_settle)
@@ -2013,21 +2209,11 @@ class PointingHandlerMixin:
             if img_laser_off is None:
                 return None, px_per_cm_hint, all_bboxes
 
-            roi_half_size = self._phase3_get_roi_half_size(target_x, target_y, all_bboxes)
-            laser_pos = self._find_laser_center_with_roi(
-                img_on=img_laser_on,
-                img_off=img_laser_off,
-                exclude_bboxes=all_bboxes,
-                roi_center=(target_x, target_y),
-                roi_half_size=roi_half_size,
-                tozero_threshold=PHASE3_DIFF_TOZERO_THRESH,
+            response_u8, response_metrics = self._phase3_compute_response_metrics(
+                img_laser_on=img_laser_on,
+                img_laser_off=img_laser_off,
+                area_box=area_box,
             )
-            if laser_pos is not None:
-                err_x = float(laser_pos[0] - target_x)
-                err_y = float(laser_pos[1] - target_y)
-                err_mag = float((err_x ** 2 + err_y ** 2) ** 0.5)
-            else:
-                err_x = err_y = err_mag = None
 
             self._save_phase3_debug_artifacts(
                 log_dir=log_dir,
@@ -2040,32 +2226,26 @@ class PointingHandlerMixin:
                 img_laser_off=img_laser_off,
                 target_x=target_x,
                 target_y=target_y,
-                laser_pos=laser_pos,
                 bbox=bbox,
                 all_bboxes=all_bboxes,
-                roi_half_size=roi_half_size,
-                err_x=err_x,
-                err_y=err_y,
-                err_mag=err_mag,
+                area_box=area_box,
+                response_u8=response_u8,
+                response_metrics=response_metrics,
             )
-            if laser_pos is None:
-                return None, px_per_cm_hint, all_bboxes
 
             try:
                 with open(f"{log_dir}/log.txt", "a", encoding="utf-8") as f:
                     f.write(
-                        "Iter {it} Phase3-{p3}-{tag}: Laser=({lx},{ly}) Target=({tx:.1f},{ty:.1f}) "
-                        "Err=({ex:.2f},{ey:.2f}) |E|={em:.2f} Pose=({cp:.3f},{ct:.3f})\n".format(
+                        "Iter {it} Phase3-{p3}-{tag}: Target=({tx:.1f},{ty:.1f}) "
+                        "RespMean={rm:.2f} RespCore={rc:.2f} RespMax={rx:.2f} Pose=({cp:.3f},{ct:.3f})\n".format(
                             it=base_iteration,
                             p3=phase3_iter,
                             tag=phase3_tag,
-                            lx=int(laser_pos[0]),
-                            ly=int(laser_pos[1]),
                             tx=target_x,
                             ty=target_y,
-                            ex=err_x,
-                            ey=err_y,
-                            em=err_mag,
+                            rm=float(response_metrics.get("mean_delta", 0.0)),
+                            rc=float(response_metrics.get("core_delta", 0.0)),
+                            rx=float(response_metrics.get("max_delta", 0.0)),
                             cp=float(self._curr_pan),
                             ct=float(self._curr_tilt),
                         )
@@ -2074,13 +2254,11 @@ class PointingHandlerMixin:
                 print(f"[Pointing-Adaptive] Log write failed: {e}")
 
             return {
-                "laser_x": int(laser_pos[0]),
-                "laser_y": int(laser_pos[1]),
                 "target_x": float(target_x),
                 "target_y": float(target_y),
-                "err_x": err_x,
-                "err_y": err_y,
-                "err_mag": err_mag,
+                "response_mean": float(response_metrics.get("mean_delta", 0.0)),
+                "response_core": float(response_metrics.get("core_delta", 0.0)),
+                "response_max": float(response_metrics.get("max_delta", 0.0)),
                 "pan": float(self._curr_pan),
                 "tilt": float(self._curr_tilt),
             }, px_per_cm_hint, all_bboxes
