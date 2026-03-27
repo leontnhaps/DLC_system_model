@@ -594,6 +594,95 @@ class ComApp(EventHandlersMixin, PointingHandlerMixin, AppHelpersMixin):
             "dwell_s": float(t_slice_rr),  # compatibility alias for existing helper/overlay naming
         }
 
+    @staticmethod
+    def _format_clock_label(seconds):
+        if seconds is None:
+            return "-"
+        try:
+            seconds = max(0.0, float(seconds))
+        except Exception:
+            return "-"
+        total_seconds = int(seconds)
+        hours, remainder = divmod(total_seconds, 3600)
+        minutes, secs = divmod(remainder, 60)
+        if hours > 0:
+            return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+        return f"{minutes:02d}:{secs:02d}"
+
+    @staticmethod
+    def _format_slice_label(seconds):
+        if seconds is None:
+            return "-"
+        try:
+            seconds = max(0.0, float(seconds))
+        except Exception:
+            return "-"
+        return f"{seconds:.1f}s"
+
+    def _render_scheduling_progress(self, text, fg="#555"):
+        def _update():
+            if hasattr(self, "scheduling_tab"):
+                self.scheduling_tab.update_progress_text(text, fg=fg)
+
+        self.root.after(0, _update)
+
+    def _reset_scheduling_progress(self):
+        def _update():
+            if hasattr(self, "scheduling_tab"):
+                self.scheduling_tab.reset_progress_text()
+
+        self.root.after(0, _update)
+
+    def _update_scheduling_progress(
+        self,
+        scheduling_elapsed_s=None,
+        shoot_elapsed_s=None,
+        shoot_total_s=None,
+        phase="Idle",
+        current_id=None,
+        loop_count=None,
+        current_elapsed_s=None,
+        current_total_s=None,
+        completed_frames=None,
+        total_frames=None,
+        fg="#555",
+    ):
+        overall_text = f"전체 경과: {self._format_clock_label(scheduling_elapsed_s)}"
+
+        if shoot_elapsed_s is None and not (shoot_total_s is not None and shoot_total_s > 0.0):
+            shoot_text = "Shoot 진행: 준비 중"
+        elif shoot_total_s is not None and shoot_total_s > 0.0:
+            remaining_s = max(0.0, float(shoot_total_s) - float(shoot_elapsed_s or 0.0))
+            shoot_text = (
+                f"Shoot 진행: {self._format_clock_label(shoot_elapsed_s)} / "
+                f"{self._format_clock_label(shoot_total_s)} "
+                f"(남은 {self._format_clock_label(remaining_s)})"
+            )
+        else:
+            shoot_text = f"Shoot 진행: {self._format_clock_label(shoot_elapsed_s)} / manual"
+
+        detail_parts = []
+        if phase:
+            detail_parts.append(str(phase))
+        if loop_count is not None:
+            detail_parts.append(f"Loop {int(loop_count)}")
+        if current_id is not None:
+            detail_parts.append(f"ID {current_id}")
+        if current_total_s is not None and current_total_s > 0.0:
+            detail_parts.append(
+                f"Slice {self._format_slice_label(current_elapsed_s or 0.0)}/"
+                f"{self._format_slice_label(current_total_s)}"
+            )
+        if completed_frames is not None:
+            frame_total_text = str(int(total_frames)) if total_frames is not None else "manual"
+            detail_parts.append(f"Frame {int(completed_frames)}/{frame_total_text}")
+
+        detail_text = " | ".join(detail_parts) if detail_parts else "-"
+        self._render_scheduling_progress(
+            f"{overall_text}\n{shoot_text}\n현재 작업: {detail_text}",
+            fg=fg,
+        )
+
     def _set_scheduling_status(self, text, fg="#333"):
         def _update():
             if hasattr(self, "scheduling_tab"):
@@ -630,6 +719,7 @@ class ComApp(EventHandlersMixin, PointingHandlerMixin, AppHelpersMixin):
         self._scheduling_active = True
         self._scheduling_stop_event.clear()
         self._set_scheduling_ui_state(True)
+        self._reset_scheduling_progress()
         self._set_scheduling_status("🔁 RoundRobin 시작...", fg="blue")
 
         self._scheduling_thread = threading.Thread(target=self._roundrobin_worker, daemon=True)
@@ -655,7 +745,15 @@ class ComApp(EventHandlersMixin, PointingHandlerMixin, AppHelpersMixin):
     def _roundrobin_worker(self):
         final_message = "✅ RoundRobin 완료"
         final_color = "green"
+        scheduling_started_at = None
+        shoot_started_at = None
+        T_total_sec = 0.0
+        K_frames = None
+        completed_frames = 0
+        loop_count = 0
+        dwell_s = None
         try:
+            scheduling_started_at = time.monotonic()
             final_targets = dict(getattr(self, "computed_targets", {}) or {})
             settle_s = float(self._call_on_ui_thread(lambda: self.scan_tab.settle.get(), timeout=2.0))
             settle_s = max(0.1, settle_s)
@@ -674,6 +772,12 @@ class ComApp(EventHandlersMixin, PointingHandlerMixin, AppHelpersMixin):
             led_probe_s = max(0.5, led_probe_s)
             self._scheduling_led_latest = {}
             self._scheduling_led_history = []
+            self._update_scheduling_progress(
+                scheduling_elapsed_s=0.0,
+                phase="초기화",
+                completed_frames=0,
+                total_frames=None,
+            )
 
             if final_targets:
                 self._set_scheduling_status(
@@ -689,6 +793,10 @@ class ComApp(EventHandlersMixin, PointingHandlerMixin, AppHelpersMixin):
                 self._call_on_ui_thread(lambda p=dict(params): self.start_scan(p), timeout=3.0)
 
                 while not self._scheduling_stop_event.is_set():
+                    self._update_scheduling_progress(
+                        scheduling_elapsed_s=time.monotonic() - scheduling_started_at,
+                        phase="Scan",
+                    )
                     if self._scan_finished_event.wait(timeout=0.2):
                         break
                 if self._scheduling_stop_event.is_set():
@@ -735,6 +843,14 @@ class ComApp(EventHandlersMixin, PointingHandlerMixin, AppHelpersMixin):
                         phase="Adaptive",
                         led_state=self._scheduling_led_latest.get(track_id, "-"),
                     )
+                    adaptive_started_at = time.monotonic()
+                    self._update_scheduling_progress(
+                        scheduling_elapsed_s=time.monotonic() - scheduling_started_at,
+                        phase="Adaptive",
+                        current_id=track_id,
+                        current_elapsed_s=0.0,
+                        current_total_s=ROUNDROBIN_AIM_TIMEOUT_S,
+                    )
 
                     self._call_on_ui_thread(lambda: self.set_pointing_mode("adaptive"), timeout=2.0)
                     self._call_on_ui_thread(lambda tid=track_id: self.move_to_target(tid), timeout=3.0)
@@ -749,6 +865,14 @@ class ComApp(EventHandlersMixin, PointingHandlerMixin, AppHelpersMixin):
                     while not self._scheduling_stop_event.is_set():
                         if not getattr(self, "_aiming_active", False):
                             break
+                        adaptive_elapsed_s = time.monotonic() - adaptive_started_at
+                        self._update_scheduling_progress(
+                            scheduling_elapsed_s=time.monotonic() - scheduling_started_at,
+                            phase="Adaptive",
+                            current_id=track_id,
+                            current_elapsed_s=min(adaptive_elapsed_s, ROUNDROBIN_AIM_TIMEOUT_S),
+                            current_total_s=ROUNDROBIN_AIM_TIMEOUT_S,
+                        )
                         if time.monotonic() >= aim_deadline:
                             print(f"[Scheduling] Adaptive timeout for ID {track_id} -> stop_aiming")
                             self.stop_aiming()
@@ -810,6 +934,16 @@ class ComApp(EventHandlersMixin, PointingHandlerMixin, AppHelpersMixin):
             shoot_started_at = time.monotonic()
             shoot_deadline = (shoot_started_at + T_total_sec) if T_total_sec > 0.0 else None
             completed_frames = 0
+            self._update_scheduling_progress(
+                scheduling_elapsed_s=time.monotonic() - scheduling_started_at,
+                shoot_elapsed_s=0.0,
+                shoot_total_s=T_total_sec if T_total_sec > 0.0 else None,
+                phase="Shoot 준비",
+                current_elapsed_s=0.0,
+                current_total_s=dwell_s,
+                completed_frames=completed_frames,
+                total_frames=K_frames,
+            )
 
             # Shoot loop에서 preview 강제 ON
             preview_on = bool(self._call_on_ui_thread(lambda: self.preview_active, timeout=2.0))
@@ -828,6 +962,7 @@ class ComApp(EventHandlersMixin, PointingHandlerMixin, AppHelpersMixin):
                     final_color = "green"
                     break
                 loop_count += 1
+                frame_completed = True
                 # 루프마다 IR 모드 재보장
                 self._call_on_ui_thread(lambda: self.set_ir_cut("day"), timeout=3.0)
                 for idx, track_id in enumerate(final_ids, start=1):
@@ -836,6 +971,7 @@ class ComApp(EventHandlersMixin, PointingHandlerMixin, AppHelpersMixin):
                     if shoot_deadline is not None and time.monotonic() >= shoot_deadline:
                         final_message = "✅ RoundRobin 완료 (T_total_sec 도달)"
                         final_color = "green"
+                        frame_completed = False
                         break
 
                     # Shoot loop 중 preview가 꺼졌다면 즉시 복구
@@ -852,6 +988,18 @@ class ComApp(EventHandlersMixin, PointingHandlerMixin, AppHelpersMixin):
                         fg="blue",
                     )
                     led_state = self._scheduling_led_latest.get(track_id, "-")
+                    self._update_scheduling_progress(
+                        scheduling_elapsed_s=time.monotonic() - scheduling_started_at,
+                        shoot_elapsed_s=time.monotonic() - shoot_started_at,
+                        shoot_total_s=T_total_sec if T_total_sec > 0.0 else None,
+                        phase="Shoot",
+                        current_id=track_id,
+                        loop_count=loop_count,
+                        current_elapsed_s=0.0,
+                        current_total_s=dwell_s,
+                        completed_frames=completed_frames,
+                        total_frames=K_frames,
+                    )
                     self._set_preview_overlay(
                         current_id=track_id,
                         phase="Shoot",
@@ -903,6 +1051,18 @@ class ComApp(EventHandlersMixin, PointingHandlerMixin, AppHelpersMixin):
                         if desired_mode != current_mode:
                             self._call_on_ui_thread(lambda m=desired_mode: self.set_ir_cut(m), timeout=3.0)
                             current_mode = desired_mode
+                        self._update_scheduling_progress(
+                            scheduling_elapsed_s=time.monotonic() - scheduling_started_at,
+                            shoot_elapsed_s=time.monotonic() - shoot_started_at,
+                            shoot_total_s=T_total_sec if T_total_sec > 0.0 else None,
+                            phase="Shoot",
+                            current_id=track_id,
+                            loop_count=loop_count,
+                            current_elapsed_s=min(elapsed, dwell_s),
+                            current_total_s=dwell_s,
+                            completed_frames=completed_frames,
+                            total_frames=K_frames,
+                        )
                         self._set_preview_overlay(
                             current_id=track_id,
                             phase="Shoot",
@@ -919,12 +1079,24 @@ class ComApp(EventHandlersMixin, PointingHandlerMixin, AppHelpersMixin):
                     if shoot_deadline is not None and time.monotonic() >= shoot_deadline:
                         final_message = "✅ RoundRobin 완료 (T_total_sec 도달)"
                         final_color = "green"
+                        frame_completed = False
                         break
 
                 if self._scheduling_stop_event.is_set():
                     break
+                if not frame_completed:
+                    break
 
                 completed_frames += 1
+                self._update_scheduling_progress(
+                    scheduling_elapsed_s=time.monotonic() - scheduling_started_at,
+                    shoot_elapsed_s=time.monotonic() - shoot_started_at,
+                    shoot_total_s=T_total_sec if T_total_sec > 0.0 else None,
+                    phase="프레임 완료",
+                    loop_count=loop_count,
+                    completed_frames=completed_frames,
+                    total_frames=K_frames,
+                )
                 if K_frames is not None and completed_frames >= K_frames:
                     final_message = "✅ RoundRobin 완료 (K_frames 도달)"
                     final_color = "green"
@@ -944,6 +1116,18 @@ class ComApp(EventHandlersMixin, PointingHandlerMixin, AppHelpersMixin):
                 self.laser_state = False
             except Exception:
                 pass
+            if scheduling_started_at is not None:
+                phase_label = "완료" if final_color == "green" else "중지" if "중지" in final_message else "오류"
+                end_now = time.monotonic()
+                self._update_scheduling_progress(
+                    scheduling_elapsed_s=end_now - scheduling_started_at,
+                    shoot_elapsed_s=(end_now - shoot_started_at) if shoot_started_at is not None else None,
+                    shoot_total_s=T_total_sec if T_total_sec > 0.0 else None,
+                    phase=phase_label,
+                    loop_count=loop_count if loop_count > 0 else None,
+                    completed_frames=completed_frames,
+                    total_frames=K_frames,
+                )
             self.root.after(0, lambda msg=final_message, fg=final_color: self._finalize_scheduling_ui(msg, fg))
     
     # ========== Manual Callbacks ==========
