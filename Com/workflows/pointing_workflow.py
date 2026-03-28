@@ -57,7 +57,8 @@ ROUGH_PHASE2_TILT_STEP_DEG = 1.0      # Phase 2 tilt search step (downward)
 ROUGH_PHASE2_DROP_RATIO = 0.65        # /    
 ROUGH_PHASE2_DROP_DELTA = 8.0         # -    
 FINAL_TILT_APPROACH_UP_DEG = 1.0      #   tilt+1  
-PHASE23_CENTER_ROI_SIZE_PX = 500      # 화면 중심 기준 Phase 2/3 유효 객체 ROI
+FINAL_PAN_APPROACH_RIGHT_DEG = 1.0    # scheduling test: pan+1 -> final
+PHASE23_CENTER_ROI_SIZE_PX = 800      # 화면 중심 기준 Phase 2/3 유효 객체 ROI (x축 폭)
 
 
 class PointingHandlerMixin:
@@ -73,16 +74,18 @@ class PointingHandlerMixin:
 
     @staticmethod
     def _get_center_roi_box(shape, size_px=PHASE23_CENTER_ROI_SIZE_PX):
-        """Return a centered square ROI box clipped to image bounds."""
+        """Return a centered x-only ROI band clipped to image bounds."""
         height, width = shape[:2]
         half = max(1, int(round(float(size_px) / 2.0)))
         cx = width // 2
-        cy = height // 2
         x1 = max(0, cx - half)
-        y1 = max(0, cy - half)
         x2 = min(width, cx + half)
-        y2 = min(height, cy + half)
-        return (x1, y1, x2, y2)
+        return (x1, 0, x2, height)
+
+    @staticmethod
+    def _get_center_roi_label(size_px=PHASE23_CENTER_ROI_SIZE_PX):
+        """Return a user-facing label for the Phase 2/3 center ROI."""
+        return f"CENTER ROI X {int(round(float(size_px)))}px"
 
     @staticmethod
     def _point_in_box(px, py, box):
@@ -110,7 +113,7 @@ class PointingHandlerMixin:
         return path or None
 
     def _persist_final_target_to_csv(self, track_id, pan, tilt):
-        """Persist the final aimed pan/tilt back into the scan CSV for the source track rows."""
+        """Persist the final aimed pan/tilt and final LED ROI back into the scan CSV."""
         path = self._get_pointing_csv_path()
         if not path or not os.path.exists(path):
             return False
@@ -118,6 +121,8 @@ class PointingHandlerMixin:
         csv_track_ids = getattr(self, "_pointing_csv_track_ids", {}) or {}
         target_ids = tuple(int(v) for v in csv_track_ids.get(track_id, (track_id,)))
         pan_q, tilt_q = self._quantize_pan_tilt(pan, tilt)
+        final_led_roi = (getattr(self, "_track_led_roi", {}) or {}).get(track_id)
+        final_led_roi_source_size = (getattr(self, "_track_led_roi_source_size", {}) or {}).get(track_id)
 
         try:
             with open(path, newline="", encoding="utf-8") as f:
@@ -132,6 +137,16 @@ class PointingHandlerMixin:
                 fieldnames.append("final_pan_deg")
             if "final_tilt_deg" not in fieldnames:
                 fieldnames.append("final_tilt_deg")
+            for name in (
+                "final_led_roi_x",
+                "final_led_roi_y",
+                "final_led_roi_w",
+                "final_led_roi_h",
+                "final_led_roi_src_w",
+                "final_led_roi_src_h",
+            ):
+                if name not in fieldnames:
+                    fieldnames.append(name)
 
             updated = 0
             for row in rows:
@@ -143,6 +158,22 @@ class PointingHandlerMixin:
                     continue
                 row["final_pan_deg"] = f"{float(pan_q):.3f}"
                 row["final_tilt_deg"] = f"{float(tilt_q):.3f}"
+                if final_led_roi is not None and len(final_led_roi) == 4:
+                    row["final_led_roi_x"] = str(int(final_led_roi[0]))
+                    row["final_led_roi_y"] = str(int(final_led_roi[1]))
+                    row["final_led_roi_w"] = str(int(final_led_roi[2]))
+                    row["final_led_roi_h"] = str(int(final_led_roi[3]))
+                else:
+                    row["final_led_roi_x"] = ""
+                    row["final_led_roi_y"] = ""
+                    row["final_led_roi_w"] = ""
+                    row["final_led_roi_h"] = ""
+                if final_led_roi_source_size is not None and len(final_led_roi_source_size) == 2:
+                    row["final_led_roi_src_w"] = str(int(final_led_roi_source_size[0]))
+                    row["final_led_roi_src_h"] = str(int(final_led_roi_source_size[1]))
+                else:
+                    row["final_led_roi_src_w"] = ""
+                    row["final_led_roi_src_h"] = ""
                 updated += 1
 
             if updated <= 0:
@@ -158,7 +189,8 @@ class PointingHandlerMixin:
 
             print(
                 f"[Pointing] Final target saved to CSV: UI track {track_id} -> CSV IDs {target_ids}, "
-                f"pan={pan_q:.1f}, tilt={tilt_q:.1f}"
+                f"pan={pan_q:.1f}, tilt={tilt_q:.1f}, "
+                f"roi={'set' if final_led_roi is not None else 'none'}"
             )
             return True
         except Exception as e:
@@ -204,6 +236,8 @@ class PointingHandlerMixin:
             min_samples = 2  # Minimum samples for regression
             track_led_roi_samples = defaultdict(list)  # {track_id: [(x,y,w,h), ...]}
             persisted_targets = {}  # {track_id: (final_pan, final_tilt)}
+            persisted_led_rois = {}  # {track_id: (x,y,w,h)}
+            persisted_led_roi_source_sizes = {}  # {track_id: (W,H)}
             
             # CSV 
             with open(path, newline="", encoding="utf-8") as f:
@@ -215,12 +249,29 @@ class PointingHandlerMixin:
                     except Exception:
                         track_id = None
 
+                    W = int(d["W"]) if d.get("W") else None
+                    H = int(d["H"]) if d.get("H") else None
+
                     if track_id is not None:
                         final_pan = d.get("final_pan_deg")
                         final_tilt = d.get("final_tilt_deg")
                         if track_id not in persisted_targets and final_pan not in ("", None) and final_tilt not in ("", None):
                             try:
                                 persisted_targets[track_id] = self._quantize_pan_tilt(float(final_pan), float(final_tilt))
+                            except Exception:
+                                pass
+                        if track_id not in persisted_led_rois:
+                            try:
+                                frx = int(float(d.get("final_led_roi_x", "") or 0))
+                                fry = int(float(d.get("final_led_roi_y", "") or 0))
+                                frw = int(float(d.get("final_led_roi_w", "") or 0))
+                                frh = int(float(d.get("final_led_roi_h", "") or 0))
+                                if frw > 0 and frh > 0:
+                                    persisted_led_rois[track_id] = (frx, fry, frw, frh)
+                                    src_w = int(float(d.get("final_led_roi_src_w", "") or (W or 0)))
+                                    src_h = int(float(d.get("final_led_roi_src_h", "") or (H or 0)))
+                                    if src_w > 0 and src_h > 0:
+                                        persisted_led_roi_source_sizes[track_id] = (src_w, src_h)
                             except Exception:
                                 pass
 
@@ -239,8 +290,6 @@ class PointingHandlerMixin:
                     tilt = float(tilt)
                     cx = float(d["cx"])
                     cy = float(d["cy"])
-                    W = int(d["W"]) if d.get("W") else None
-                    H = int(d["H"]) if d.get("H") else None
                     
                     # Track ID 
                     if track_id is None:
@@ -415,8 +464,31 @@ class PointingHandlerMixin:
             # TrackLED ROI (CSVled_roi_*  
             #   track_id , trackROI 
             track_led_roi = {}
+            track_led_roi_source_size = {}
             for tid in self.computed_targets.keys():
-                samples = track_led_roi_samples.get(tid, [])
+                member_ids = tuple(int(v) for v in self._pointing_csv_track_ids.get(tid, (tid,)))
+                persisted_roi = None
+                persisted_size = None
+                for member_id in member_ids:
+                    roi = persisted_led_rois.get(member_id)
+                    if roi is not None:
+                        persisted_roi = roi
+                        persisted_size = persisted_led_roi_source_sizes.get(member_id)
+                        break
+                if persisted_roi is not None:
+                    track_led_roi[int(tid)] = tuple(int(v) for v in persisted_roi)
+                    if persisted_size is not None:
+                        track_led_roi_source_size[int(tid)] = (
+                            int(persisted_size[0]),
+                            int(persisted_size[1]),
+                        )
+                    else:
+                        track_led_roi_source_size[int(tid)] = (int(W_frame), int(H_frame))
+                    continue
+
+                samples = []
+                for member_id in member_ids:
+                    samples.extend(track_led_roi_samples.get(member_id, []))
                 if not samples:
                     continue
                 arr = np.array(samples, dtype=float)
@@ -424,7 +496,9 @@ class PointingHandlerMixin:
                 roi = tuple(int(v) for v in med.tolist())
                 if roi[2] > 0 and roi[3] > 0:
                     track_led_roi[int(tid)] = roi
+                    track_led_roi_source_size[int(tid)] = (int(W_frame), int(H_frame))
             self._track_led_roi = track_led_roi
+            self._track_led_roi_source_size = track_led_roi_source_size
             # Renumber final track IDs to 1..N for UI consistency
             self._renumber_computed_targets()
             # UI  ( )
@@ -456,7 +530,9 @@ class PointingHandlerMixin:
         new_targets = {}
         new_gains = {}
         old_rois = dict(getattr(self, "_track_led_roi", {}) or {})
+        old_roi_sizes = dict(getattr(self, "_track_led_roi_source_size", {}) or {})
         new_rois = {}
+        new_roi_sizes = {}
         old_csv_track_ids = dict(getattr(self, "_pointing_csv_track_ids", {}) or {})
         new_csv_track_ids = {}
 
@@ -467,11 +543,14 @@ class PointingHandlerMixin:
             new_gains[new_id] = gain
             if old_id in old_rois:
                 new_rois[new_id] = old_rois[old_id]
+            if old_id in old_roi_sizes:
+                new_roi_sizes[new_id] = old_roi_sizes[old_id]
             new_csv_track_ids[new_id] = tuple(old_csv_track_ids.get(old_id, (old_id,)))
 
         self.computed_targets = new_targets
         self._pointing_gains = new_gains
         self._track_led_roi = new_rois
+        self._track_led_roi_source_size = new_roi_sizes
         self._pointing_csv_track_ids = new_csv_track_ids
         print(f"[Pointing] ID renumbered: {id_map}")
     
@@ -647,7 +726,13 @@ class PointingHandlerMixin:
         self.pointing_mode = "adaptive"
         print("[Pointing] mode set to adaptive")
     
-    def move_to_target(self, track_id, use_tilt_approach=False):
+    def move_to_target(
+        self,
+        track_id,
+        use_tilt_approach=False,
+        use_pan_tilt_approach=False,
+        pan_tilt_approach_wait_s=0.3,
+    ):
         """
          track_idpan/tilt  
         """
@@ -672,8 +757,15 @@ class PointingHandlerMixin:
 
         print(f"[Pointing] Track {track_id} .  : pan={pan_t}, tilt={tilt_t}")
 
+        # Scheduling test path: pan+1/tilt+1 -> final target
+        if use_pan_tilt_approach:
+            self._apply_final_pan_tilt_approach(
+                pan_t,
+                tilt_t,
+                settle_s=max(0.02, float(pan_tilt_approach_wait_s)),
+            )
         #   ( tilt+1 ->  tilt )
-        if use_tilt_approach:
+        elif use_tilt_approach:
             self._apply_final_tilt_approach(pan_t, tilt_t, settle_s=max(0.05, self.scan_tab.settle.get()))
         else:
             spd = 100
@@ -856,6 +948,32 @@ class PointingHandlerMixin:
         })
         time.sleep(wait_s)
 
+    def _apply_final_pan_tilt_approach(self, pan, tilt, settle_s=0.3):
+        """Scheduling test path: pan+1, tilt+1 -> final target."""
+        pan_f = float(pan)
+        tilt_f = float(tilt)
+        pre_pan = pan_f + FINAL_PAN_APPROACH_RIGHT_DEG
+        pre_tilt = max(-30.0, min(90.0, tilt_f + FINAL_TILT_APPROACH_UP_DEG))
+        pre_pan, pre_tilt = self._quantize_pan_tilt(pre_pan, pre_tilt)
+        wait_s = max(0.02, float(settle_s))
+
+        self.ctrl.send({
+            "cmd": "move",
+            "pan": pre_pan,
+            "tilt": pre_tilt,
+            "speed": 100,
+            "acc": 1.0,
+        })
+        time.sleep(wait_s)
+
+        self.ctrl.send({
+            "cmd": "move",
+            "pan": pan_f,
+            "tilt": tilt_f,
+            "speed": 100,
+            "acc": 1.0,
+        })
+
         # 2)  tilt
         self.ctrl.send({
             "cmd": "move",
@@ -962,13 +1080,13 @@ class PointingHandlerMixin:
                 if obj_cx is None:
                     if phase >= 2:
                         roi_msg = (
-                            f"[Iter {iteration}] Phase 2 object must stay inside center ROI "
-                            f"{PHASE23_CENTER_ROI_SIZE_PX}x{PHASE23_CENTER_ROI_SIZE_PX}"
+                            f"[Iter {iteration}] Phase 2 object must stay inside "
+                            f"center ROI x {PHASE23_CENTER_ROI_SIZE_PX}px"
                         )
                         detect_debug = img_led_on.copy()
                         rx1, ry1, rx2, ry2 = [int(v) for v in phase_center_roi_box]
                         cv2.rectangle(detect_debug, (rx1, ry1), (rx2, ry2), (255, 255, 0), 2)
-                        cv2.putText(detect_debug, "CENTER ROI 500x500", (rx1, max(20, ry1 - 10)),
+                        cv2.putText(detect_debug, self._get_center_roi_label(), (rx1, max(20, ry1 + 24)),
                                     cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 0), 2)
                         if all_bboxes:
                             for mx, my, mw, mh in all_bboxes:
@@ -987,7 +1105,7 @@ class PointingHandlerMixin:
                         self._update_aiming_status(
                             track_id,
                             iteration,
-                            f"Phase 2: center ROI {PHASE23_CENTER_ROI_SIZE_PX}x{PHASE23_CENTER_ROI_SIZE_PX} 밖 객체는 제외",
+                            f"Phase 2: center ROI x {PHASE23_CENTER_ROI_SIZE_PX}px 밖 객체는 제외",
                         )
                         next_pan = self._curr_pan
                         next_tilt = self._curr_tilt - ROUGH_PHASE2_TILT_STEP_DEG
@@ -1006,14 +1124,15 @@ class PointingHandlerMixin:
                         continue
                     print("[Pointing-Adaptive]   ")
                     continue
+                H, W = img_led_on.shape[:2]
                 led_roi = getattr(self, "_last_object_led_info", {}).get("roi")
                 if led_roi is not None and hasattr(self, "_track_led_roi"):
                     try:
                         self._track_led_roi[track_id] = tuple(int(v) for v in led_roi)
+                        if hasattr(self, "_track_led_roi_source_size"):
+                            self._track_led_roi_source_size[track_id] = (int(W), int(H))
                     except Exception:
                         pass
-
-                H, W = img_led_on.shape[:2]
                 frame_cx = W / 2.0
                 frame_cy = H / 2.0
 
@@ -1667,8 +1786,8 @@ class PointingHandlerMixin:
                 cv2.rectangle(canvas, (rx1, ry1), (rx2, ry2), (255, 255, 0), 2)
                 cv2.putText(
                     canvas,
-                    "CENTER ROI 500x500",
-                    (rx1, max(20, ry1 - 10)),
+                    self._get_center_roi_label(),
+                    (rx1, max(20, ry1 + 24)),
                     cv2.FONT_HERSHEY_SIMPLEX,
                     0.6,
                     (255, 255, 0),
@@ -1726,7 +1845,7 @@ class PointingHandlerMixin:
 
             status_text = (
                 f"[Iter {iteration}] Phase 2 mean={float(mean_bright):.1f} | "
-                f"center ROI {'OK' if roi_ok else 'OUT'}"
+                f"center ROI X {'OK' if roi_ok else 'OUT'}"
             )
             self.root.after(
                 0,
@@ -1876,7 +1995,7 @@ class PointingHandlerMixin:
         if center_roi_box:
             rx1, ry1, rx2, ry2 = [int(v) for v in center_roi_box]
             cv2.rectangle(overlay, (rx1, ry1), (rx2, ry2), (255, 255, 0), 2)
-            cv2.putText(overlay, "CENTER ROI 500x500", (rx1, max(20, ry1 - 10)),
+            cv2.putText(overlay, self._get_center_roi_label(), (rx1, max(20, ry1 + 24)),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 0), 2)
 
         tx = int(round(float(target_x)))
@@ -1974,7 +2093,7 @@ class PointingHandlerMixin:
             if center_roi_box:
                 rx1, ry1, rx2, ry2 = [int(v) for v in center_roi_box]
                 cv2.rectangle(debug, (rx1, ry1), (rx2, ry2), (255, 255, 0), 2)
-                cv2.putText(debug, "CENTER ROI 500x500", (rx1, max(20, ry1 - 10)),
+                cv2.putText(debug, self._get_center_roi_label(), (rx1, max(20, ry1 + 24)),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 0), 2)
             cv2.drawMarker(debug, (tx, ty), (255, 255, 255), cv2.MARKER_TILTED_CROSS, 32, 2)
             cv2.rectangle(debug, (x1, y1), (x2, y2), (255, 255, 255), 2)
@@ -2344,6 +2463,18 @@ class PointingHandlerMixin:
                 "acc": 1.0,
             }
         )
+        best_led_roi = best_meas.get("led_roi")
+        best_led_roi_source_size = best_meas.get("led_roi_source_size")
+        if best_led_roi is not None and hasattr(self, "_track_led_roi"):
+            try:
+                self._track_led_roi[track_id] = tuple(int(v) for v in best_led_roi)
+                if hasattr(self, "_track_led_roi_source_size") and best_led_roi_source_size is not None:
+                    self._track_led_roi_source_size[track_id] = (
+                        int(best_led_roi_source_size[0]),
+                        int(best_led_roi_source_size[1]),
+                    )
+            except Exception:
+                pass
         pan_q, tilt_q = self._quantize_pan_tilt(self._curr_pan, self._curr_tilt)
         self.computed_targets[track_id] = (pan_q, tilt_q)
         self._update_target_button_value(track_id, pan_q, tilt_q)
@@ -2410,10 +2541,13 @@ class PointingHandlerMixin:
                 px_per_cm_hint = 10.0
             if bbox is None:
                 print(
-                    "[Pointing-Adaptive] Phase 3: no object inside center ROI "
-                    f"{PHASE23_CENTER_ROI_SIZE_PX}x{PHASE23_CENTER_ROI_SIZE_PX}"
+                    "[Pointing-Adaptive] Phase 3: no object inside center ROI x "
+                    f"{PHASE23_CENTER_ROI_SIZE_PX}px"
                 )
                 return None, px_per_cm_hint, all_bboxes
+
+            led_roi = getattr(self, "_last_object_led_info", {}).get("roi")
+            led_roi_source_size = (int(img_led_on.shape[1]), int(img_led_on.shape[0]))
 
             geometry = self._phase3_build_area_geometry(
                 bbox=bbox,
@@ -2494,6 +2628,8 @@ class PointingHandlerMixin:
                 "response_max": float(response_metrics.get("max_delta", 0.0)),
                 "pan": float(self._curr_pan),
                 "tilt": float(self._curr_tilt),
+                "led_roi": tuple(int(v) for v in led_roi) if led_roi is not None else None,
+                "led_roi_source_size": led_roi_source_size,
             }, px_per_cm_hint, all_bboxes
         except Exception as e:
             print(f"[Pointing-Adaptive] Phase 3 measure failed: {e}")
