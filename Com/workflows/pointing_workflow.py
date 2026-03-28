@@ -57,6 +57,7 @@ ROUGH_PHASE2_TILT_STEP_DEG = 1.0      # Phase 2 tilt search step (downward)
 ROUGH_PHASE2_DROP_RATIO = 0.65        # /    
 ROUGH_PHASE2_DROP_DELTA = 8.0         # -    
 FINAL_TILT_APPROACH_UP_DEG = 1.0      #   tilt+1  
+PHASE23_CENTER_ROI_SIZE_PX = 500      # 화면 중심 기준 Phase 2/3 유효 객체 ROI
 
 
 class PointingHandlerMixin:
@@ -69,6 +70,34 @@ class PointingHandlerMixin:
 
     def _quantize_pan_tilt(self, pan, tilt):
         return self._quantize_deg(pan), self._quantize_deg(tilt)
+
+    @staticmethod
+    def _get_center_roi_box(shape, size_px=PHASE23_CENTER_ROI_SIZE_PX):
+        """Return a centered square ROI box clipped to image bounds."""
+        height, width = shape[:2]
+        half = max(1, int(round(float(size_px) / 2.0)))
+        cx = width // 2
+        cy = height // 2
+        x1 = max(0, cx - half)
+        y1 = max(0, cy - half)
+        x2 = min(width, cx + half)
+        y2 = min(height, cy + half)
+        return (x1, y1, x2, y2)
+
+    @staticmethod
+    def _point_in_box(px, py, box):
+        """Return True when a point lies inside the given box."""
+        if box is None:
+            return True
+        x1, y1, x2, y2 = [float(v) for v in box]
+        return x1 <= float(px) <= x2 and y1 <= float(py) <= y2
+
+    def _bbox_center_in_box(self, bbox, box):
+        """Return True when bbox center lies inside the given box."""
+        if bbox is None:
+            return False
+        bx, by, bw, bh = [float(v) for v in bbox]
+        return self._point_in_box(bx + (bw / 2.0), by + (bh / 2.0), box)
 
     def _get_pointing_csv_path(self):
         """Return the active pointing CSV path, if available."""
@@ -924,8 +953,57 @@ class PointingHandlerMixin:
                 except Exception as e:
                     print(f"[Pointing-Adaptive] Log save failed: {e}")
 
-                obj_cx, obj_cy, bbox, all_bboxes = self._find_object_center(img_led_on, img_led_off)
+                phase_center_roi_box = self._get_center_roi_box(img_led_on.shape) if phase >= 2 else None
+                obj_cx, obj_cy, bbox, all_bboxes = self._find_object_center(
+                    img_led_on,
+                    img_led_off,
+                    selection_roi_box=phase_center_roi_box,
+                )
                 if obj_cx is None:
+                    if phase >= 2:
+                        roi_msg = (
+                            f"[Iter {iteration}] Phase 2 object must stay inside center ROI "
+                            f"{PHASE23_CENTER_ROI_SIZE_PX}x{PHASE23_CENTER_ROI_SIZE_PX}"
+                        )
+                        detect_debug = img_led_on.copy()
+                        rx1, ry1, rx2, ry2 = [int(v) for v in phase_center_roi_box]
+                        cv2.rectangle(detect_debug, (rx1, ry1), (rx2, ry2), (255, 255, 0), 2)
+                        cv2.putText(detect_debug, "CENTER ROI 500x500", (rx1, max(20, ry1 - 10)),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 0), 2)
+                        if all_bboxes:
+                            for mx, my, mw, mh in all_bboxes:
+                                cv2.rectangle(
+                                    detect_debug,
+                                    (int(mx), int(my)),
+                                    (int(mx + mw), int(my + mh)),
+                                    (100, 100, 100),
+                                    1,
+                                )
+                        self.root.after(
+                            0,
+                            lambda img=detect_debug.copy(), msg=roi_msg:
+                            self._show_debug_preview(img, iteration=iteration, status_text=msg, status_color="orange"),
+                        )
+                        self._update_aiming_status(
+                            track_id,
+                            iteration,
+                            f"Phase 2: center ROI {PHASE23_CENTER_ROI_SIZE_PX}x{PHASE23_CENTER_ROI_SIZE_PX} 밖 객체는 제외",
+                        )
+                        next_pan = self._curr_pan
+                        next_tilt = self._curr_tilt - ROUGH_PHASE2_TILT_STEP_DEG
+                        self._curr_pan = next_pan
+                        self._curr_tilt = next_tilt
+                        self.ctrl.send(
+                            {
+                                "cmd": "move",
+                                "pan": next_pan,
+                                "tilt": next_tilt,
+                                "speed": 100,
+                                "acc": 1.0,
+                            }
+                        )
+                        time.sleep(settle)
+                        continue
                     print("[Pointing-Adaptive]   ")
                     continue
                 led_roi = getattr(self, "_last_object_led_info", {}).get("roi")
@@ -1171,6 +1249,19 @@ class PointingHandlerMixin:
                 print(
                     f"[Pointing-Adaptive] Brightness(BBox ROI {x1}:{x2}, {y1}:{y2}) "
                     f"mean={mean_bright:.2f}"
+                )
+
+                self._draw_phase2_debug_image(
+                    img_led_on=img_led_on,
+                    img_laser_on=img_laser_on,
+                    img_laser_off=img_laser_off,
+                    bbox=bbox,
+                    all_bboxes=all_bboxes,
+                    center_roi_box=phase_center_roi_box,
+                    iteration=iteration,
+                    mean_bright=mean_bright,
+                    roi_ok=True,
+                    log_dir=log_dir,
                 )
 
                 self._update_aiming_status(
@@ -1500,7 +1591,7 @@ class PointingHandlerMixin:
             print(f"[Pointing] Debug   : {e}")
     
     def _show_debug_preview(self, img_bgr, err_x=0, err_y=0, err_mag=0, iteration=0,
-                            tol_x=None, tol_y=None):
+                            tol_x=None, tol_y=None, status_text=None, status_color=None):
         """Pointing   (main thread)"""
         try:
             from PIL import Image, ImageTk
@@ -1514,20 +1605,28 @@ class PointingHandlerMixin:
             
             #  
             if hasattr(self, 'pointing_tab') and hasattr(self.pointing_tab, 'debug_error_label'):
-                if tol_x is None:
-                    tol_x = CONVERGENCE_TOL_PX_X
-                if tol_y is None:
-                    tol_y = CONVERGENCE_TOL_PX_Y
-                color = "green" if abs(err_x) <= tol_x and abs(err_y) <= tol_y else "red"
+                if status_text is not None:
+                    text = str(status_text)
+                    color = status_color or "#888"
+                else:
+                    if tol_x is None:
+                        tol_x = CONVERGENCE_TOL_PX_X
+                    if tol_y is None:
+                        tol_y = CONVERGENCE_TOL_PX_Y
+                    color = "green" if abs(err_x) <= tol_x and abs(err_y) <= tol_y else "red"
+                    text = (
+                        f"[Iter {iteration}]  err_x={err_x:.1f}px  err_y={err_y:.1f}px  "
+                        f"|err|={err_mag:.1f}px  (tol=({tol_x}, {tol_y})px)"
+                    )
                 self.pointing_tab.debug_error_label.config(
-                    text=f"[Iter {iteration}]  err_x={err_x:.1f}px  err_y={err_y:.1f}px  |err|={err_mag:.1f}px  (tol=({tol_x}, {tol_y})px)",
+                    text=text,
                     fg=color
                 )
         except Exception as e:
             print(f"[Pointing] Debug preview : {e}")
     
     def _show_laser_diff(self, img_bgr):
-        """Pointing 탭 하단 보조 패널 이미지 표시 (현재 Phase 3 debug 용도)."""
+        """Pointing 탭 하단 보조 패널 이미지 표시 (Phase 2/3 debug 공용)."""
         try:
             from PIL import Image, ImageTk
             rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
@@ -1539,6 +1638,108 @@ class PointingHandlerMixin:
                 self.pointing_tab.laser_diff_label.image = photo
         except Exception as e:
             print(f"[Pointing] Laser diff preview : {e}")
+
+    def _draw_phase2_debug_image(
+        self,
+        img_led_on,
+        img_laser_on,
+        img_laser_off,
+        bbox,
+        all_bboxes,
+        center_roi_box,
+        iteration,
+        mean_bright,
+        roi_ok,
+        log_dir=None,
+    ):
+        """Render Phase 2 detection/laser diff overlays into the Pointing GUI."""
+        try:
+            detect_debug = img_led_on.copy()
+            diff = cv2.absdiff(img_laser_on, img_laser_off)
+            diff_gray = cv2.cvtColor(diff, cv2.COLOR_BGR2GRAY)
+            laser_debug = cv2.cvtColor(diff_gray, cv2.COLOR_GRAY2BGR)
+
+            cx_img = detect_debug.shape[1] // 2
+            cy_img = detect_debug.shape[0] // 2
+            rx1, ry1, rx2, ry2 = [int(v) for v in center_roi_box]
+
+            for canvas in (detect_debug, laser_debug):
+                cv2.rectangle(canvas, (rx1, ry1), (rx2, ry2), (255, 255, 0), 2)
+                cv2.putText(
+                    canvas,
+                    "CENTER ROI 500x500",
+                    (rx1, max(20, ry1 - 10)),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.6,
+                    (255, 255, 0),
+                    2,
+                )
+                cv2.drawMarker(canvas, (cx_img, cy_img), (255, 255, 255), cv2.MARKER_CROSS, 28, 2)
+
+            if all_bboxes:
+                for mx, my, mw, mh in all_bboxes:
+                    p1 = (int(mx), int(my))
+                    p2 = (int(mx + mw), int(my + mh))
+                    cv2.rectangle(detect_debug, p1, p2, (100, 100, 100), 1)
+                    cv2.rectangle(laser_debug, p1, p2, (100, 100, 100), 1)
+
+            if bbox:
+                bx, by, bw, bh = [int(v) for v in bbox]
+                obj_center = (int(round(bx + (bw / 2.0))), int(round(by + (bh / 2.0))))
+                roi_color = (0, 255, 0) if roi_ok else (0, 140, 255)
+                cv2.rectangle(detect_debug, (bx, by), (bx + bw, by + bh), (0, 255, 255), 2)
+                cv2.rectangle(laser_debug, (bx, by), (bx + bw, by + bh), (0, 255, 255), 2)
+                cv2.drawMarker(detect_debug, obj_center, roi_color, cv2.MARKER_TILTED_CROSS, 24, 2)
+                cv2.drawMarker(laser_debug, obj_center, roi_color, cv2.MARKER_TILTED_CROSS, 24, 2)
+                cv2.putText(detect_debug, "OBJECT ROI", (bx, max(20, by - 8)),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 2)
+                cv2.putText(laser_debug, "BBOX ROI", (bx, max(20, by - 8)),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 2)
+
+            cv2.putText(detect_debug, f"Phase 2 Detection | Iter {iteration}", (20, 34),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 200, 100), 2)
+            cv2.putText(
+                detect_debug,
+                f"ROI check: {'OK' if roi_ok else 'OUT'}",
+                (20, 68),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.7,
+                (0, 255, 0) if roi_ok else (0, 140, 255),
+                2,
+            )
+            cv2.putText(detect_debug, f"Pan={float(getattr(self, '_curr_pan', 0.0)):.2f} Tilt={float(getattr(self, '_curr_tilt', 0.0)):.2f}",
+                        (20, 102), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 200, 100), 2)
+
+            cv2.putText(laser_debug, f"Phase 2 Laser Diff | Iter {iteration}", (20, 34),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 200, 100), 2)
+            cv2.putText(laser_debug, f"Brightness mean={float(mean_bright):.1f}", (20, 68),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+            cv2.putText(
+                laser_debug,
+                f"ROI check: {'OK' if roi_ok else 'OUT'}",
+                (20, 102),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.7,
+                (0, 255, 0) if roi_ok else (0, 140, 255),
+                2,
+            )
+
+            status_text = (
+                f"[Iter {iteration}] Phase 2 mean={float(mean_bright):.1f} | "
+                f"center ROI {'OK' if roi_ok else 'OUT'}"
+            )
+            self.root.after(
+                0,
+                lambda img=detect_debug.copy(), msg=status_text, ok=roi_ok:
+                self._show_debug_preview(img, iteration=iteration, status_text=msg, status_color=("green" if ok else "orange")),
+            )
+            self.root.after(0, lambda img=laser_debug.copy(): self._show_laser_diff(img))
+
+            if log_dir:
+                cv2.imwrite(f"{log_dir}/iter_{iteration}_phase2_detect_debug.jpg", detect_debug)
+                cv2.imwrite(f"{log_dir}/iter_{iteration}_phase2_laser_debug.jpg", laser_debug)
+        except Exception as e:
+            print(f"[Pointing] Phase2 debug render failed: {e}")
 
     @staticmethod
     def _phase3_clip_box(area_box, shape):
@@ -1632,6 +1833,7 @@ class PointingHandlerMixin:
         response_u8,
         bbox,
         all_bboxes,
+        center_roi_box,
         target_x,
         target_y,
         phase3_iter,
@@ -1671,6 +1873,11 @@ class PointingHandlerMixin:
             cv2.rectangle(overlay, (bx, by), (bx + bw, by + bh), (0, 255, 255), 2)
             cv2.putText(overlay, "OBJECT", (bx, max(20, by - 8)),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 2)
+        if center_roi_box:
+            rx1, ry1, rx2, ry2 = [int(v) for v in center_roi_box]
+            cv2.rectangle(overlay, (rx1, ry1), (rx2, ry2), (255, 255, 0), 2)
+            cv2.putText(overlay, "CENTER ROI 500x500", (rx1, max(20, ry1 - 10)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 0), 2)
 
         tx = int(round(float(target_x)))
         ty = int(round(float(target_y)))
@@ -1715,6 +1922,7 @@ class PointingHandlerMixin:
         target_y,
         bbox,
         all_bboxes,
+        center_roi_box,
         area_box,
         response_u8,
         response_metrics,
@@ -1741,6 +1949,7 @@ class PointingHandlerMixin:
                 response_u8=response_u8,
                 bbox=bbox,
                 all_bboxes=all_bboxes,
+                center_roi_box=center_roi_box,
                 target_x=target_x,
                 target_y=target_y,
                 phase3_iter=phase3_iter,
@@ -1762,6 +1971,11 @@ class PointingHandlerMixin:
                 for mx, my, mw, mh in all_bboxes:
                     cv2.rectangle(debug, (int(mx), int(my)),
                                   (int(mx + mw), int(my + mh)), (100, 100, 100), 1)
+            if center_roi_box:
+                rx1, ry1, rx2, ry2 = [int(v) for v in center_roi_box]
+                cv2.rectangle(debug, (rx1, ry1), (rx2, ry2), (255, 255, 0), 2)
+                cv2.putText(debug, "CENTER ROI 500x500", (rx1, max(20, ry1 - 10)),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 0), 2)
             cv2.drawMarker(debug, (tx, ty), (255, 255, 255), cv2.MARKER_TILTED_CROSS, 32, 2)
             cv2.rectangle(debug, (x1, y1), (x2, y2), (255, 255, 255), 2)
             peak = response_metrics.get("peak_pos")
@@ -1808,7 +2022,7 @@ class PointingHandlerMixin:
 
     # ========== Helper Functions (Missing Re-added) ==========
 
-    def _find_object_center(self, img_led_on, img_led_off):
+    def _find_object_center(self, img_led_on, img_led_off, selection_roi_box=None):
         """   - Scan diff """
         if img_led_on is None or img_led_off is None:
             return None, None, None, None
@@ -1871,6 +2085,7 @@ class PointingHandlerMixin:
                 "bbox": bbox,
                 "center": (cx, cy),
                 "dist": dist,
+                "in_selection_roi": self._point_in_box(cx, cy, selection_roi_box),
                 "led_pred": led_pred,
                 "led_score": led_score,
                 "led_roi": led_roi,
@@ -1879,16 +2094,20 @@ class PointingHandlerMixin:
 
         # 4-1)  :    
         if candidates:
-            candidates.sort(key=lambda c: c["dist"])
-            best = candidates[0]
+            selectable = candidates
+            if selection_roi_box is not None:
+                selectable = [c for c in candidates if c.get("in_selection_roi", False)]
+            if selectable:
+                selectable.sort(key=lambda c: c["dist"])
+                best = selectable[0]
 
-            target_bbox = best["bbox"]
-            target_center = best["center"]
-            self._last_object_led_info = {
-                "pred": best["led_pred"],
-                "score": dict(best["led_score"]),
-                "roi": best["led_roi"],
-            }
+                target_bbox = best["bbox"]
+                target_center = best["center"]
+                self._last_object_led_info = {
+                    "pred": best["led_pred"],
+                    "score": dict(best["led_score"]),
+                    "roi": best["led_roi"],
+                }
 
         # 5) YOLO   diff blob  fallback ( 
         if target_center is None:
@@ -1909,6 +2128,8 @@ class PointingHandlerMixin:
                         cy = y + h / 2.0
                         all_bboxes = [(int(x), int(y), int(w), int(h))]
                         self._last_object_led_info = {"pred": "NONE", "score": {"R": 0, "G": 0, "B": 0}, "roi": None}
+                        if selection_roi_box is not None and not self._point_in_box(cx, cy, selection_roi_box):
+                            return None, None, None, all_bboxes
                         return cx, cy, (int(x), int(y), int(w), int(h)), all_bboxes
             except Exception:
                 pass
@@ -2053,8 +2274,20 @@ class PointingHandlerMixin:
                 last_target_x, last_target_y = meas["target_x"], meas["target_y"]
             return meas
 
-        # 1) base
-        meas_base = _measure_at_pan(base_pan, 1, "base")
+        # 1) pan +1
+        pan_plus = float(max(-180.0, min(180.0, base_pan + PHASE3_STEP_DEG)))
+        if abs(pan_plus - base_pan) > 1e-6:
+            meas_plus = _measure_at_pan(pan_plus, 1, "plus")
+            if meas_plus is not None:
+                candidates.append(meas_plus)
+                print(
+                    f"[Pointing-Adaptive] Phase 3-3pt plus: pan={meas_plus['pan']:.2f}, "
+                    f"mean={meas_plus['response_mean']:.1f}, core={meas_plus['response_core']:.1f}, "
+                    f"max={meas_plus['response_max']:.1f}"
+                )
+
+        # 2) base
+        meas_base = _measure_at_pan(base_pan, 2, "base")
         if meas_base is not None:
             candidates.append(meas_base)
             print(
@@ -2063,28 +2296,16 @@ class PointingHandlerMixin:
                 f"max={meas_base['response_max']:.1f}"
             )
 
-        # 2) pan -1
+        # 3) pan -1
         pan_minus = float(max(-180.0, min(180.0, base_pan - PHASE3_STEP_DEG)))
         if abs(pan_minus - base_pan) > 1e-6:
-            meas_minus = _measure_at_pan(pan_minus, 2, "minus")
+            meas_minus = _measure_at_pan(pan_minus, 3, "minus")
             if meas_minus is not None:
                 candidates.append(meas_minus)
                 print(
                     f"[Pointing-Adaptive] Phase 3-3pt minus: pan={meas_minus['pan']:.2f}, "
                     f"mean={meas_minus['response_mean']:.1f}, core={meas_minus['response_core']:.1f}, "
                     f"max={meas_minus['response_max']:.1f}"
-                )
-
-        # 3) pan +1
-        pan_plus = float(max(-180.0, min(180.0, base_pan + PHASE3_STEP_DEG)))
-        if abs(pan_plus - base_pan) > 1e-6:
-            meas_plus = _measure_at_pan(pan_plus, 3, "plus")
-            if meas_plus is not None:
-                candidates.append(meas_plus)
-                print(
-                    f"[Pointing-Adaptive] Phase 3-3pt plus: pan={meas_plus['pan']:.2f}, "
-                    f"mean={meas_plus['response_mean']:.1f}, core={meas_plus['response_core']:.1f}, "
-                    f"max={meas_plus['response_max']:.1f}"
                 )
 
         if not candidates:
@@ -2176,12 +2397,23 @@ class PointingHandlerMixin:
             if img_led_off is None:
                 return None, px_per_cm_hint, fallback_bboxes
 
-            obj_cx, obj_cy, bbox, all_bboxes = self._find_object_center(img_led_on, img_led_off)
+            center_roi_box = self._get_center_roi_box(img_led_on.shape)
+            obj_cx, obj_cy, bbox, all_bboxes = self._find_object_center(
+                img_led_on,
+                img_led_off,
+                selection_roi_box=center_roi_box,
+            )
             if all_bboxes is None:
                 all_bboxes = fallback_bboxes
 
             if obj_cx is None and not px_per_cm_hint:
                 px_per_cm_hint = 10.0
+            if bbox is None:
+                print(
+                    "[Pointing-Adaptive] Phase 3: no object inside center ROI "
+                    f"{PHASE23_CENTER_ROI_SIZE_PX}x{PHASE23_CENTER_ROI_SIZE_PX}"
+                )
+                return None, px_per_cm_hint, all_bboxes
 
             geometry = self._phase3_build_area_geometry(
                 bbox=bbox,
@@ -2228,6 +2460,7 @@ class PointingHandlerMixin:
                 target_y=target_y,
                 bbox=bbox,
                 all_bboxes=all_bboxes,
+                center_roi_box=center_roi_box,
                 area_box=area_box,
                 response_u8=response_u8,
                 response_metrics=response_metrics,
