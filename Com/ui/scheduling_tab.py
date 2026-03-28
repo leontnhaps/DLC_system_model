@@ -6,6 +6,8 @@ from tkinter import ttk
 
 class SchedulingTab:
     """Scheduling 탭 UI"""
+    DEFAULT_PROGRESS_TEXT = "전체 경과: -\nShoot 진행: -\n현재 작업: -"
+
     def __init__(self, parent, callbacks):
         self.callbacks = callbacks
         self.frame = parent
@@ -59,6 +61,17 @@ class SchedulingTab:
 
         self.status_label = Label(self.frame, text="대기 중", fg="#333", font=("", 10))
         self.status_label.grid(row=r, column=0, columnspan=2, sticky="w", padx=8, pady=(10, 6))
+        r += 1
+
+        self.progress_label = Label(
+            self.frame,
+            text=self.DEFAULT_PROGRESS_TEXT,
+            fg="#555",
+            font=("", 9),
+            justify="left",
+            anchor="w",
+        )
+        self.progress_label.grid(row=r, column=0, columnspan=2, sticky="we", padx=8, pady=(0, 6))
 
         for c in range(2):
             self.frame.grid_columnconfigure(c, weight=1)
@@ -81,6 +94,12 @@ class SchedulingTab:
 
     def update_status(self, text, fg="#333"):
         self.status_label.config(text=text, fg=fg)
+
+    def update_progress_text(self, text, fg="#555"):
+        self.progress_label.config(text=text, fg=fg)
+
+    def reset_progress_text(self):
+        self.update_progress_text(self.DEFAULT_PROGRESS_TEXT)
 
     def get_frame_seconds(self):
         try:

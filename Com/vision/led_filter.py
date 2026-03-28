@@ -17,7 +17,7 @@ DEFAULT_LED_FILTER_PARAMS = {
     "gb_min": 10,
     "br_min": 40,
     "bg_min": 40,
-    "min_pixels": 0,
+    "min_pixels": 50,
 }
 
 
@@ -28,7 +28,9 @@ def get_default_led_filter_params():
 
 def expand_led_roi_from_bbox(bbox, img_shape, top_ratio=1.0 / 3.0):
     """
-    Build LED ROI above YOLO bbox only (exclude bbox body).
+    Build LED ROI around the top band of the YOLO bbox.
+    The ROI spans one top-ratio band above the bbox and includes the
+    same-height band inside the upper part of the bbox.
     bbox: (x, y, w, h)
     output: (x, y, w, h) clamped to image boundary.
     """
@@ -43,8 +45,8 @@ def expand_led_roi_from_bbox(bbox, img_shape, top_ratio=1.0 / 3.0):
     x1 = max(0, x)
     x2 = min(w_img, x + w)
     led_h = max(1, int(round(h * float(top_ratio))))
-    y2 = max(0, y)  # top edge of target bbox (target itself excluded)
-    y1 = max(0, y2 - led_h)
+    y2 = min(h_img, y + led_h)
+    y1 = max(0, y - led_h)
 
     if x2 <= x1 or y2 <= y1:
         return None
