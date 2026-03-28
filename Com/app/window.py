@@ -28,6 +28,8 @@ ROUNDROBIN_T_FRAME_SEC_DEFAULT = 0.0
 ROUNDROBIN_T_TOTAL_SEC_DEFAULT = 0.0
 ROUNDROBIN_T_SLICE_RR_FALLBACK_S = 20.0  # hidden fallback to preserve legacy RR timing if T_frame_sec is unset
 ROUNDROBIN_AIM_TIMEOUT_S = 120.0
+ROUNDROBIN_APPROACH_WAIT_S = 0.3         # default pre-target hold at (+1, +1)
+ROUNDROBIN_FIRST_APPROACH_WAIT_S = 2.0   # first target per frame holds longer at (+1, +1)
 
 
 class ComApp(EventHandlersMixin, PointingHandlerMixin, AppHelpersMixin):
@@ -165,6 +167,7 @@ class ComApp(EventHandlersMixin, PointingHandlerMixin, AppHelpersMixin):
         self._scheduling_led_latest = {}
         self._scheduling_led_history = []
         self._track_led_roi = {}  # {track_id: (x,y,w,h)}
+        self._track_led_roi_source_size = {}  # {track_id: (W,H)}
         
         # Blocking snap wait state (Scheduling probe 등에서 사용)
         self._blocking_snap_lock = threading.Lock()
@@ -264,6 +267,23 @@ class ComApp(EventHandlersMixin, PointingHandlerMixin, AppHelpersMixin):
             text = f"RR Slice: - | ID: {cid} | LED: {led_txt} | {phase}"
         if hasattr(self, "preview_frame") and hasattr(self.preview_frame, "set_overlay_text"):
             self.root.after(0, lambda t=text: self.preview_frame.set_overlay_text(t))
+        if hasattr(self, "preview_frame") and hasattr(self.preview_frame, "set_overlay_roi"):
+            roi = None
+            source_size = None
+            roi_label = "LED ROI"
+            if current_id is not None:
+                try:
+                    track_key = int(current_id)
+                except Exception:
+                    track_key = current_id
+                roi = (getattr(self, "_track_led_roi", {}) or {}).get(track_key)
+                source_size = (getattr(self, "_track_led_roi_source_size", {}) or {}).get(track_key)
+                if roi is not None:
+                    roi_label = f"LED ROI ID {track_key}"
+            self.root.after(
+                0,
+                lambda r=roi, s=source_size, lbl=roi_label: self.preview_frame.set_overlay_roi(r, s, lbl),
+            )
 
     def _send_scan_run(self, cmd, session):
         """scan_run 실제 전송 (after 지연 전송용 분리)"""
@@ -507,13 +527,20 @@ class ComApp(EventHandlersMixin, PointingHandlerMixin, AppHelpersMixin):
             if img is None:
                 return "NONE"
 
+            scheduling_led_params = dict(getattr(self, "led_filter_params", None) or get_default_led_filter_params())
+            scheduling_led_params["rg_min"] = 170
+            scheduling_led_params["min_pixels"] = 50
+
             pred, score, roi_used = classify_from_single_roi(
                 img,
                 roi,
-                params=self.led_filter_params,
+                params=scheduling_led_params,
             )
+            if max(int(score["R"]), int(score["G"]), int(score["B"])) < int(scheduling_led_params["min_pixels"]):
+                pred = "R"
             if roi_used is not None:
                 self._track_led_roi[track_id] = tuple(int(v) for v in roi_used)
+                self._track_led_roi_source_size[track_id] = (int(img.shape[1]), int(img.shape[0]))
             roi = roi_used
 
             self._scheduling_led_latest[track_id] = pred
@@ -888,7 +915,15 @@ class ComApp(EventHandlersMixin, PointingHandlerMixin, AppHelpersMixin):
                     )
 
                     self._call_on_ui_thread(lambda: self.set_pointing_mode("adaptive"), timeout=2.0)
-                    self._call_on_ui_thread(lambda tid=track_id: self.move_to_target(tid), timeout=3.0)
+                    self._call_on_ui_thread(
+                        lambda tid=track_id: self.move_to_target(
+                            tid,
+                            use_tilt_approach=False,
+                            use_pan_tilt_approach=True,
+                            pan_tilt_approach_wait_s=0.3,
+                        ),
+                        timeout=3.0,
+                    )
                     time.sleep(settle_s)
 
                     started = bool(self._call_on_ui_thread(lambda tid=track_id: self.start_aiming(tid), timeout=3.0))
@@ -982,6 +1017,12 @@ class ComApp(EventHandlersMixin, PointingHandlerMixin, AppHelpersMixin):
                 )
                 time.sleep(0.2)
 
+            # RR phase keeps laser continuously ON so slice/frame timing stays absolute.
+            rr_ir_head_s = 3.0 if t_slice_rr >= 3.0 else max(0.0, t_slice_rr * 0.5)
+            self._call_on_ui_thread(lambda: self.set_ir_cut("day"), timeout=3.0)
+            self.ctrl.send({"cmd": "laser", "value": 1})
+            self.laser_state = True
+
             rr_started_at = time.monotonic()
             completed_frames = 0
             self._update_scheduling_progress(
@@ -1013,8 +1054,6 @@ class ComApp(EventHandlersMixin, PointingHandlerMixin, AppHelpersMixin):
                 if not self._wait_until_scheduling_deadline(frame_started_at):
                     break
 
-                # 루프마다 IR 모드 재보장
-                self._call_on_ui_thread(lambda: self.set_ir_cut("day"), timeout=3.0)
                 for idx, track_id in enumerate(final_ids, start=1):
                     if self._scheduling_stop_event.is_set():
                         break
@@ -1036,8 +1075,6 @@ class ComApp(EventHandlersMixin, PointingHandlerMixin, AppHelpersMixin):
                         if not self._wait_until_scheduling_deadline(min(slice_end, time.monotonic() + 0.1)):
                             break
                     if time.monotonic() >= slice_end:
-                        self.ctrl.send({"cmd": "laser", "value": 0})
-                        self.laser_state = False
                         continue
 
                     self._set_scheduling_status(
@@ -1069,33 +1106,23 @@ class ComApp(EventHandlersMixin, PointingHandlerMixin, AppHelpersMixin):
                         led_state=led_state,
                     )
                     self._call_on_ui_thread(
-                        lambda tid=track_id: self.move_to_target(tid, use_tilt_approach=True),
+                        lambda tid=track_id, wait_s=(
+                            ROUNDROBIN_FIRST_APPROACH_WAIT_S if idx == 1 else ROUNDROBIN_APPROACH_WAIT_S
+                        ): self.move_to_target(
+                            tid,
+                            use_tilt_approach=False,
+                            use_pan_tilt_approach=True,
+                            pan_tilt_approach_wait_s=wait_s,
+                        ),
                         timeout=5.0,
                     )
-                    now_after_move = time.monotonic()
-                    if now_after_move >= slice_end:
-                        self.ctrl.send({"cmd": "laser", "value": 0})
-                        self.laser_state = False
+                    if time.monotonic() >= slice_end:
                         continue
 
-                    settle_deadline = min(slice_end, time.monotonic() + settle_s)
-                    if not self._wait_until_scheduling_deadline(settle_deadline):
-                        break
-
-                    # Per-ID policy: first few seconds in IR, then keep Normal mode.
-                    ir_head_s = 3.0
+                    # Per-slice IR policy: if slice < 3s, use first half only; otherwise 3s.
                     current_mode = "day"  # day=IR mode, night=Normal mode
                     self._call_on_ui_thread(lambda m=current_mode: self.set_ir_cut(m), timeout=3.0)
 
-                    if time.monotonic() >= slice_end:
-                        self.ctrl.send({"cmd": "laser", "value": 0})
-                        self.laser_state = False
-                        continue
-
-                    self.ctrl.send({"cmd": "laser", "value": 1})
-                    self.laser_state = True
-
-                    laser_started_at = time.monotonic()
                     # Battery check는 slice budget 내부에서만 허용
                     next_probe_elapsed = led_probe_s
                     edge_eps = 1e-3  # 경계(시작/끝) 체크 제외용
@@ -1104,8 +1131,7 @@ class ComApp(EventHandlersMixin, PointingHandlerMixin, AppHelpersMixin):
                             break
                         now = time.monotonic()
                         slice_elapsed = min(max(0.0, now - slice_start), t_slice_rr)
-                        active_elapsed = max(0.0, now - laser_started_at)
-                        while active_elapsed >= next_probe_elapsed:
+                        while slice_elapsed >= next_probe_elapsed:
                             probe_elapsed = next_probe_elapsed
                             next_probe_elapsed += led_probe_s
 
@@ -1126,7 +1152,7 @@ class ComApp(EventHandlersMixin, PointingHandlerMixin, AppHelpersMixin):
                             # 한 루프에서 과도한 연속 체크 방지
                             break
 
-                        desired_mode = "day" if active_elapsed < ir_head_s else "night"
+                        desired_mode = "day" if slice_elapsed < rr_ir_head_s else "night"
                         if desired_mode != current_mode:
                             self._call_on_ui_thread(lambda m=desired_mode: self.set_ir_cut(m), timeout=3.0)
                             current_mode = desired_mode
@@ -1156,8 +1182,6 @@ class ComApp(EventHandlersMixin, PointingHandlerMixin, AppHelpersMixin):
                         if not self._wait_until_scheduling_deadline(min(slice_end, time.monotonic() + 0.1)):
                             break
 
-                    self.ctrl.send({"cmd": "laser", "value": 0})
-                    self.laser_state = False
                     if self._scheduling_stop_event.is_set():
                         break
                     if not self._wait_until_scheduling_deadline(slice_end):
