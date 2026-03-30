@@ -168,6 +168,7 @@ class ComApp(EventHandlersMixin, PointingHandlerMixin, AppHelpersMixin):
         self._scheduling_led_history = []
         self._track_led_roi = {}  # {track_id: (x,y,w,h)}
         self._track_led_roi_source_size = {}  # {track_id: (W,H)}
+        self._track_phase3_response = {}  # {track_id: {"mean": float, "core": float, "max": float}}
         
         # Blocking snap wait state (Scheduling probe 등에서 사용)
         self._blocking_snap_lock = threading.Lock()
