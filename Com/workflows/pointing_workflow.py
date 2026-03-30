@@ -113,7 +113,7 @@ class PointingHandlerMixin:
         return path or None
 
     def _persist_final_target_to_csv(self, track_id, pan, tilt):
-        """Persist the final aimed pan/tilt and final LED ROI back into the scan CSV."""
+        """Persist the final aimed pan/tilt, LED ROI, and Phase 3 response back into the scan CSV."""
         path = self._get_pointing_csv_path()
         if not path or not os.path.exists(path):
             return False
@@ -123,6 +123,7 @@ class PointingHandlerMixin:
         pan_q, tilt_q = self._quantize_pan_tilt(pan, tilt)
         final_led_roi = (getattr(self, "_track_led_roi", {}) or {}).get(track_id)
         final_led_roi_source_size = (getattr(self, "_track_led_roi_source_size", {}) or {}).get(track_id)
+        final_phase3_response = dict((getattr(self, "_track_phase3_response", {}) or {}).get(track_id) or {})
 
         try:
             with open(path, newline="", encoding="utf-8") as f:
@@ -144,6 +145,9 @@ class PointingHandlerMixin:
                 "final_led_roi_h",
                 "final_led_roi_src_w",
                 "final_led_roi_src_h",
+                "final_phase3_response_mean",
+                "final_phase3_response_core",
+                "final_phase3_response_max",
             ):
                 if name not in fieldnames:
                     fieldnames.append(name)
@@ -174,6 +178,17 @@ class PointingHandlerMixin:
                 else:
                     row["final_led_roi_src_w"] = ""
                     row["final_led_roi_src_h"] = ""
+                if final_phase3_response:
+                    mean_v = final_phase3_response.get("mean")
+                    core_v = final_phase3_response.get("core")
+                    max_v = final_phase3_response.get("max")
+                    row["final_phase3_response_mean"] = "" if mean_v is None else f"{float(mean_v):.6f}"
+                    row["final_phase3_response_core"] = "" if core_v is None else f"{float(core_v):.6f}"
+                    row["final_phase3_response_max"] = "" if max_v is None else f"{float(max_v):.6f}"
+                else:
+                    row["final_phase3_response_mean"] = ""
+                    row["final_phase3_response_core"] = ""
+                    row["final_phase3_response_max"] = ""
                 updated += 1
 
             if updated <= 0:
@@ -190,7 +205,8 @@ class PointingHandlerMixin:
             print(
                 f"[Pointing] Final target saved to CSV: UI track {track_id} -> CSV IDs {target_ids}, "
                 f"pan={pan_q:.1f}, tilt={tilt_q:.1f}, "
-                f"roi={'set' if final_led_roi is not None else 'none'}"
+                f"roi={'set' if final_led_roi is not None else 'none'}, "
+                f"phase3_score={'set' if final_phase3_response else 'none'}"
             )
             return True
         except Exception as e:
@@ -238,6 +254,7 @@ class PointingHandlerMixin:
             persisted_targets = {}  # {track_id: (final_pan, final_tilt)}
             persisted_led_rois = {}  # {track_id: (x,y,w,h)}
             persisted_led_roi_source_sizes = {}  # {track_id: (W,H)}
+            persisted_phase3_scores = {}  # {track_id: {"mean": float, "core": float, "max": float}}
             
             # CSV 
             with open(path, newline="", encoding="utf-8") as f:
@@ -274,6 +291,22 @@ class PointingHandlerMixin:
                                         persisted_led_roi_source_sizes[track_id] = (src_w, src_h)
                             except Exception:
                                 pass
+                        if track_id not in persisted_phase3_scores:
+                            score_data = {}
+                            for key, field in (
+                                ("mean", "final_phase3_response_mean"),
+                                ("core", "final_phase3_response_core"),
+                                ("max", "final_phase3_response_max"),
+                            ):
+                                raw_val = d.get(field)
+                                if raw_val in ("", None):
+                                    continue
+                                try:
+                                    score_data[key] = float(raw_val)
+                                except Exception:
+                                    pass
+                            if score_data:
+                                persisted_phase3_scores[track_id] = score_data
 
                     if d.get("conf", "") == "":
                         continue
@@ -465,15 +498,21 @@ class PointingHandlerMixin:
             #   track_id , trackROI 
             track_led_roi = {}
             track_led_roi_source_size = {}
+            track_phase3_response = {}
             for tid in self.computed_targets.keys():
                 member_ids = tuple(int(v) for v in self._pointing_csv_track_ids.get(tid, (tid,)))
                 persisted_roi = None
                 persisted_size = None
+                persisted_score = None
                 for member_id in member_ids:
                     roi = persisted_led_rois.get(member_id)
                     if roi is not None:
                         persisted_roi = roi
                         persisted_size = persisted_led_roi_source_sizes.get(member_id)
+                    score = persisted_phase3_scores.get(member_id)
+                    if score is not None and persisted_score is None:
+                        persisted_score = dict(score)
+                    if persisted_roi is not None and persisted_score is not None:
                         break
                 if persisted_roi is not None:
                     track_led_roi[int(tid)] = tuple(int(v) for v in persisted_roi)
@@ -484,12 +523,13 @@ class PointingHandlerMixin:
                         )
                     else:
                         track_led_roi_source_size[int(tid)] = (int(W_frame), int(H_frame))
-                    continue
+                if persisted_score is not None:
+                    track_phase3_response[int(tid)] = persisted_score
 
                 samples = []
                 for member_id in member_ids:
                     samples.extend(track_led_roi_samples.get(member_id, []))
-                if not samples:
+                if persisted_roi is not None or not samples:
                     continue
                 arr = np.array(samples, dtype=float)
                 med = np.median(arr, axis=0)
@@ -499,6 +539,7 @@ class PointingHandlerMixin:
                     track_led_roi_source_size[int(tid)] = (int(W_frame), int(H_frame))
             self._track_led_roi = track_led_roi
             self._track_led_roi_source_size = track_led_roi_source_size
+            self._track_phase3_response = track_phase3_response
             # Renumber final track IDs to 1..N for UI consistency
             self._renumber_computed_targets()
             # UI  ( )
@@ -531,8 +572,10 @@ class PointingHandlerMixin:
         new_gains = {}
         old_rois = dict(getattr(self, "_track_led_roi", {}) or {})
         old_roi_sizes = dict(getattr(self, "_track_led_roi_source_size", {}) or {})
+        old_phase3_scores = dict(getattr(self, "_track_phase3_response", {}) or {})
         new_rois = {}
         new_roi_sizes = {}
+        new_phase3_scores = {}
         old_csv_track_ids = dict(getattr(self, "_pointing_csv_track_ids", {}) or {})
         new_csv_track_ids = {}
 
@@ -545,12 +588,15 @@ class PointingHandlerMixin:
                 new_rois[new_id] = old_rois[old_id]
             if old_id in old_roi_sizes:
                 new_roi_sizes[new_id] = old_roi_sizes[old_id]
+            if old_id in old_phase3_scores:
+                new_phase3_scores[new_id] = dict(old_phase3_scores[old_id])
             new_csv_track_ids[new_id] = tuple(old_csv_track_ids.get(old_id, (old_id,)))
 
         self.computed_targets = new_targets
         self._pointing_gains = new_gains
         self._track_led_roi = new_rois
         self._track_led_roi_source_size = new_roi_sizes
+        self._track_phase3_response = new_phase3_scores
         self._pointing_csv_track_ids = new_csv_track_ids
         print(f"[Pointing] ID renumbered: {id_map}")
     
@@ -1452,6 +1498,12 @@ class PointingHandlerMixin:
                                 pan_q, tilt_q = self._quantize_pan_tilt(self._curr_pan, self._curr_tilt)
                                 self.computed_targets[track_id] = (pan_q, tilt_q)
                                 self._update_target_button_value(track_id, pan_q, tilt_q)
+                                if hasattr(self, "_track_phase3_response"):
+                                    self._track_phase3_response[track_id] = {
+                                        "mean": float(best_resp_mean),
+                                        "core": float(best_resp_core),
+                                        "max": float(best_resp_max),
+                                    }
                                 self._persist_final_target_to_csv(track_id, pan_q, tilt_q)
                                 print(
                                     "[Pointing-Adaptive] Phase 3 best: "
@@ -1460,8 +1512,12 @@ class PointingHandlerMixin:
                                     f"pose=({self._curr_pan:.2f},{self._curr_tilt:.2f}), ok={phase3_ok}"
                                 )
                             else:
+                                if hasattr(self, "_track_phase3_response"):
+                                    self._track_phase3_response.pop(track_id, None)
                                 self._persist_final_target_to_csv(track_id, final_pan, final_tilt)
                         else:
+                            if hasattr(self, "_track_phase3_response"):
+                                self._track_phase3_response.pop(track_id, None)
                             self._persist_final_target_to_csv(track_id, final_pan, final_tilt)
                             print(
                                 "[Pointing-Adaptive] Phase 3 disabled -> "
