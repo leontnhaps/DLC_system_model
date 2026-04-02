@@ -210,6 +210,7 @@ class ScanController:
                                     led["rx"], led["ry"], led["rw"], led["rh"],
                                     "", "",
                                     "", "", "", "", "", "",
+                                    "", "", "", "",
                                     "", "", "",
                                 ])
                                 self.detected_count += 1
@@ -257,6 +258,7 @@ class ScanController:
                     "final_pan_deg", "final_tilt_deg",
                     "final_led_roi_x", "final_led_roi_y", "final_led_roi_w", "final_led_roi_h",
                     "final_led_roi_src_w", "final_led_roi_src_h",
+                    "final_led_pred", "final_led_r_score", "final_led_g_score", "final_led_b_score",
                     "final_phase3_response_mean", "final_phase3_response_core", "final_phase3_response_max",
                 ])
                 print(f"[ScanController] CSV created: {self.csv_path}")
