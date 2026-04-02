@@ -19,6 +19,11 @@ class _FakeScheduler:
         return "picked", {"index": 123}
 
 
+class _FakeOrderedScheduler(_FakeScheduler):
+    def order_target_ids(self, targets):
+        return ["custom", len(targets or {})]
+
+
 class WorkflowsSchedulingModuleTest(unittest.TestCase):
     def test_import(self):
         from workflows.scheduling_workflow import SchedulingWorkflow
@@ -60,6 +65,14 @@ class WorkflowsSchedulingModuleTest(unittest.TestCase):
         ordered = wf.order_target_ids(targets)
 
         self.assertEqual(ordered, [3, 4, 2, 1])
+
+    def test_order_target_ids_delegates_to_scheduler_when_supported(self):
+        from workflows.scheduling_workflow import SchedulingWorkflow
+
+        wf = SchedulingWorkflow(scheduler=_FakeOrderedScheduler())
+        ordered = wf.order_target_ids({1: (0.0, 0.0), 2: (1.0, 0.0)})
+
+        self.assertEqual(ordered, ["custom", 2])
 
 
 if __name__ == "__main__":

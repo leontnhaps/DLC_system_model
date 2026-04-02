@@ -1,5 +1,6 @@
 """Minimal scheduling workflow scaffold."""
 
+from scheduling.proposed import ProposedScheduler
 from scheduling.round_robin import RoundRobinScheduler
 
 
@@ -23,9 +24,11 @@ class SchedulingWorkflow:
 
     def order_target_ids(self, targets):
         """Return target ids ordered by pan from high to low in one direction."""
+        if self.scheduler and hasattr(self.scheduler, "order_target_ids"):
+            return self.scheduler.order_target_ids(targets)
+
         items = list((targets or {}).items())
         items.sort(key=lambda item: (-float(item[1][0]), int(item[0])))
         return [track_id for track_id, _target in items]
 
-
-__all__ = ["SchedulingWorkflow"]
+__all__ = ["SchedulingWorkflow", "RoundRobinScheduler", "ProposedScheduler"]

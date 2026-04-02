@@ -18,6 +18,8 @@ from pointing_handler import PointingHandlerMixin
 from app_helpers import AppHelpersMixin
 from ui_components import PreviewFrame, ScanTab, TestSettingsTab, PointingTab, SchedulingTab
 from scan_controller import ScanController
+from scheduling.proposed import ProposedScheduler, led_state_to_battery_coeff
+from scheduling.round_robin import RoundRobinScheduler
 from workflows.scan_workflow import ScanWorkflow
 from workflows.scheduling_workflow import SchedulingWorkflow
 from yolo_utils import YOLOProcessor
@@ -110,6 +112,7 @@ class ComApp(EventHandlersMixin, PointingHandlerMixin, AppHelpersMixin):
 
         scheduling_callbacks = {
             "start_roundrobin": self.start_roundrobin,
+            "start_proposed": self.start_proposed_scheduling,
             "stop_scheduling": self.stop_scheduling,
         }
         self.scheduling_tab = SchedulingTab(tab_scheduling, scheduling_callbacks)
@@ -168,7 +171,9 @@ class ComApp(EventHandlersMixin, PointingHandlerMixin, AppHelpersMixin):
         self._scheduling_led_history = []
         self._track_led_roi = {}  # {track_id: (x,y,w,h)}
         self._track_led_roi_source_size = {}  # {track_id: (W,H)}
+        self._track_final_led_state = {}  # {track_id: {"pred": str, "score": {"R":int,"G":int,"B":int}}}
         self._track_phase3_response = {}  # {track_id: {"mean": float, "core": float, "max": float}}
+        self._scheduling_frame_debug = {}
         
         # Blocking snap wait state (Scheduling probe 등에서 사용)
         self._blocking_snap_lock = threading.Lock()
@@ -189,6 +194,8 @@ class ComApp(EventHandlersMixin, PointingHandlerMixin, AppHelpersMixin):
         self.scheduling_workflow = SchedulingWorkflow()
         if hasattr(self.scheduling_workflow, "set_context"):
             self.scheduling_workflow.set_context(app=self)
+        self._scheduling_mode_key = "round_robin"
+        self._scheduling_mode_label = "RoundRobin"
 
         # Pointing related initializations (from PointingHandlerMixin)
         self._pointing_gains = {}
@@ -580,8 +587,25 @@ class ComApp(EventHandlersMixin, PointingHandlerMixin, AppHelpersMixin):
         """Return scheduling workflow backend when available."""
         return self.scheduling_workflow if hasattr(self, "scheduling_workflow") else None
 
+    def _configure_scheduling_backend(self, mode_key):
+        backend = self._get_scheduling_backend()
+        mode_key = str(mode_key or "round_robin").strip().lower()
+        if mode_key == "proposed":
+            scheduler = ProposedScheduler()
+            label = "Proposed"
+        else:
+            scheduler = RoundRobinScheduler()
+            label = "RoundRobin"
+            mode_key = "round_robin"
+
+        if backend and hasattr(backend, "set_scheduler"):
+            backend.set_scheduler(scheduler)
+        self._scheduling_mode_key = mode_key
+        self._scheduling_mode_label = label
+        return label
+
     def _order_scheduling_target_ids(self, targets):
-        """RoundRobin target order: pan 내림차순으로 한 방향 순회."""
+        """Scheduling target order from the active backend."""
         backend = self._get_scheduling_backend()
         if backend and hasattr(backend, "order_target_ids"):
             return backend.order_target_ids(targets)
@@ -671,7 +695,16 @@ class ComApp(EventHandlersMixin, PointingHandlerMixin, AppHelpersMixin):
 
         self.root.after(0, _update)
 
+    def _set_scheduling_frame_debug(self, **kwargs):
+        debug = dict(getattr(self, "_scheduling_frame_debug", {}) or {})
+        debug.update(kwargs)
+        self._scheduling_frame_debug = debug
+
+    def _clear_scheduling_frame_debug(self):
+        self._scheduling_frame_debug = {}
+
     def _reset_scheduling_progress(self):
+        self._clear_scheduling_frame_debug()
         def _update():
             if hasattr(self, "scheduling_tab"):
                 self.scheduling_tab.reset_progress_text()
@@ -696,19 +729,43 @@ class ComApp(EventHandlersMixin, PointingHandlerMixin, AppHelpersMixin):
         total_frames=None,
         fg="#555",
     ):
+        debug = dict(getattr(self, "_scheduling_frame_debug", {}) or {})
+        mode_label = str(debug.get("mode_label") or getattr(self, "_scheduling_mode_label", "-"))
+        mode_progress_label = f"{mode_label} 진행"
+        frame_allocations = dict(debug.get("frame_allocations") or {})
+        execution_order = list(debug.get("execution_order") or frame_allocations.keys())
+        fixed_target_coeffs = dict(debug.get("fixed_target_coeffs") or {})
+        battery_state_prev = dict(debug.get("battery_state_prev") or {})
+        battery_coeff_prev = dict(debug.get("battery_coeff_prev") or {})
+        frame_scores = dict(debug.get("frame_scores") or {})
+
         overall_text = f"전체 경과: {self._format_clock_label(scheduling_elapsed_s)}"
+        mode_text = f"모드: {mode_label}"
 
         if shoot_elapsed_s is None and not (shoot_total_s is not None and shoot_total_s > 0.0):
-            shoot_text = "RR 진행: 준비 중"
+            shoot_text = f"{mode_progress_label}: 준비 중"
         elif shoot_total_s is not None and shoot_total_s > 0.0:
             remaining_s = max(0.0, float(shoot_total_s) - float(shoot_elapsed_s or 0.0))
             shoot_text = (
-                f"RR 진행: {self._format_clock_label(shoot_elapsed_s)} / "
+                f"{mode_progress_label}: {self._format_clock_label(shoot_elapsed_s)} / "
                 f"{self._format_clock_label(shoot_total_s)} "
                 f"(남은 {self._format_clock_label(remaining_s)})"
             )
         else:
-            shoot_text = f"RR 진행: {self._format_clock_label(shoot_elapsed_s)} / manual"
+            shoot_text = f"{mode_progress_label}: {self._format_clock_label(shoot_elapsed_s)} / manual"
+
+        if loop_count is not None:
+            frame_line = f"현재 Frame: {int(loop_count)}"
+            if total_frames is not None:
+                frame_line += f" / {int(total_frames)}"
+        elif completed_frames is not None:
+            frame_line = f"현재 Frame: {int(completed_frames)}"
+            if total_frames is not None:
+                frame_line += f" / {int(total_frames)}"
+        else:
+            frame_line = "현재 Frame: -"
+
+        target_line = f"현재 타깃: ID {int(current_id)}" if current_id is not None else "현재 타깃: -"
 
         detail_parts = []
         if phase:
@@ -737,8 +794,43 @@ class ComApp(EventHandlersMixin, PointingHandlerMixin, AppHelpersMixin):
             detail_parts.append(f"Frame {int(completed_frames)}/{frame_total_text}")
 
         detail_text = " | ".join(detail_parts) if detail_parts else "-"
+        allocation_lines = []
+        if frame_allocations:
+            allocation_lines.append("현재 Frame 할당:")
+            for track_id in execution_order:
+                try:
+                    alloc_s = float(frame_allocations.get(track_id, 0.0))
+                except Exception:
+                    alloc_s = 0.0
+                line = f"Track {int(track_id)} -> {alloc_s:.1f} s"
+                extras = []
+                coeff_c = fixed_target_coeffs.get(track_id)
+                coeff_b = battery_coeff_prev.get(track_id)
+                state_b = battery_state_prev.get(track_id)
+                score_v = frame_scores.get(track_id)
+                if coeff_c is not None:
+                    extras.append(f"C={float(coeff_c):.3f}")
+                if coeff_b is not None or state_b is not None:
+                    coeff_txt = "-" if coeff_b is None else f"{float(coeff_b):.2f}"
+                    state_txt = str(state_b or "-")
+                    extras.append(f"Bprev={coeff_txt}({state_txt})")
+                if score_v is not None:
+                    extras.append(f"Score={float(score_v):.3f}")
+                if extras:
+                    line += " | " + " | ".join(extras)
+                allocation_lines.append(line)
+
+        progress_lines = [
+            mode_text,
+            overall_text,
+            shoot_text,
+            frame_line,
+            target_line,
+            f"현재 작업: {detail_text}",
+        ]
+        progress_lines.extend(allocation_lines)
         self._render_scheduling_progress(
-            f"{overall_text}\n{shoot_text}\n현재 작업: {detail_text}",
+            "\n".join(progress_lines),
             fg=fg,
         )
 
@@ -753,17 +845,19 @@ class ComApp(EventHandlersMixin, PointingHandlerMixin, AppHelpersMixin):
         self._scheduling_active = False
         self._scheduling_thread = None
         self._scheduling_stop_event.clear()
+        self._clear_scheduling_frame_debug()
         if hasattr(self, "scheduling_tab"):
             self.scheduling_tab.set_running_state(False)
             self.scheduling_tab.update_status(message, fg=fg)
         self.info_label.config(text=message)
         self._set_preview_overlay(current_id=None, phase="Idle")
 
-    def start_roundrobin(self):
-        """RoundRobin 스케줄 시작"""
+    def _start_scheduling(self, mode_key="round_robin"):
+        """Start scheduling using the requested backend."""
         backend = self._get_scheduling_backend()
         if backend and hasattr(backend, "set_context"):
             backend.set_context(app=self)
+        mode_label = self._configure_scheduling_backend(mode_key)
 
         if self._scheduling_active:
             self._set_scheduling_status("⚠️ Scheduling already running", fg="orange")
@@ -779,11 +873,19 @@ class ComApp(EventHandlersMixin, PointingHandlerMixin, AppHelpersMixin):
         self._scheduling_stop_event.clear()
         self._set_scheduling_ui_state(True)
         self._reset_scheduling_progress()
-        self._set_scheduling_status("🔁 RoundRobin 시작...", fg="blue")
+        self._set_scheduling_status(f"🔁 {mode_label} 시작...", fg="blue")
 
         self._scheduling_thread = threading.Thread(target=self._roundrobin_worker, daemon=True)
         self._scheduling_thread.start()
         return True
+
+    def start_roundrobin(self):
+        """RoundRobin 스케줄 시작"""
+        return self._start_scheduling("round_robin")
+
+    def start_proposed_scheduling(self):
+        """Proposed scheduling 시작"""
+        return self._start_scheduling("proposed")
 
     def stop_scheduling(self):
         """현재 실행 중인 Scheduling 알고리즘 중지"""
@@ -802,7 +904,10 @@ class ComApp(EventHandlersMixin, PointingHandlerMixin, AppHelpersMixin):
             self._set_scheduling_ui_state(False)
 
     def _roundrobin_worker(self):
-        final_message = "✅ RoundRobin 완료"
+        mode_label = getattr(self, "_scheduling_mode_label", "RoundRobin")
+        mode_key = getattr(self, "_scheduling_mode_key", "round_robin")
+        is_proposed_mode = str(mode_key).strip().lower() == "proposed"
+        final_message = f"✅ {mode_label} 완료"
         final_color = "green"
         scheduling_started_at = None
         rr_started_at = None
@@ -815,9 +920,19 @@ class ComApp(EventHandlersMixin, PointingHandlerMixin, AppHelpersMixin):
         completed_frames = 0
         loop_count = 0
         dwell_s = None
+        csv_path = None
+        active_scheduler = None
+        proposed_state = None
+        current_frame_allocations = {}
+        current_frame_scores = {}
         try:
             scheduling_started_at = time.monotonic()
             final_targets = dict(getattr(self, "computed_targets", {}) or {})
+            if hasattr(self, "_get_pointing_csv_path"):
+                try:
+                    csv_path = self._get_pointing_csv_path()
+                except Exception:
+                    csv_path = None
             settle_s = float(self._call_on_ui_thread(lambda: self.scan_tab.settle.get(), timeout=2.0))
             settle_s = max(0.1, settle_s)
             T_frame_sec_cfg = self._call_on_ui_thread(
@@ -833,6 +948,12 @@ class ComApp(EventHandlersMixin, PointingHandlerMixin, AppHelpersMixin):
                 timeout=2.0
             ))
             led_probe_s = max(0.5, led_probe_s)
+            battery_check_enabled = bool(self._call_on_ui_thread(
+                lambda: self.scheduling_tab.get_battery_check_enabled() if hasattr(self, "scheduling_tab") else False,
+                timeout=2.0,
+            ))
+            rr_battery_check_enabled = bool(battery_check_enabled)
+            battery_sampling_enabled = True if is_proposed_mode else rr_battery_check_enabled
             self._scheduling_led_latest = {}
             self._scheduling_led_history = []
             self._update_scheduling_progress(
@@ -844,12 +965,12 @@ class ComApp(EventHandlersMixin, PointingHandlerMixin, AppHelpersMixin):
 
             if final_targets:
                 self._set_scheduling_status(
-                    f"🔁 RoundRobin: 기존 타깃 {len(final_targets)}개 사용, RR 바로 시작",
+                    f"🔁 {mode_label}: 기존 타깃 {len(final_targets)}개 사용, 바로 시작",
                     fg="blue",
                 )
                 self._set_preview_overlay(current_id=None, phase="RR")
             else:
-                self._set_scheduling_status("🔁 RoundRobin: Scan 시작", fg="blue")
+                self._set_scheduling_status(f"🔁 {mode_label}: Scan 시작", fg="blue")
                 self._set_preview_overlay(current_id=None, phase="Scan")
                 params = self._call_on_ui_thread(lambda: self.scan_tab.get_scan_params())
                 self._call_on_ui_thread(lambda: setattr(self, "computed_targets", {}), timeout=2.0)
@@ -873,7 +994,7 @@ class ComApp(EventHandlersMixin, PointingHandlerMixin, AppHelpersMixin):
 
                 # stop_scan에서 auto-compute 실패했을 때만 한 번 더 보정
                 if not targets and csv_path:
-                    self._set_scheduling_status("🔎 RoundRobin: CSV Compute 재시도...", fg="blue")
+                    self._set_scheduling_status(f"🔎 {mode_label}: CSV Compute 재시도...", fg="blue")
                     self._call_on_ui_thread(lambda p=csv_path: self.pointing_compute(p), timeout=60.0)
                     targets = dict(getattr(self, "computed_targets", {}) or {})
 
@@ -882,7 +1003,7 @@ class ComApp(EventHandlersMixin, PointingHandlerMixin, AppHelpersMixin):
 
                 ordered_ids = self._order_scheduling_target_ids(targets)
                 self._set_scheduling_status(
-                    f"🎯 RoundRobin: {len(ordered_ids)}개 ID Adaptive 수렴 시작",
+                    f"🎯 {mode_label}: {len(ordered_ids)}개 ID Adaptive 수렴 시작",
                     fg="blue",
                 )
 
@@ -991,6 +1112,7 @@ class ComApp(EventHandlersMixin, PointingHandlerMixin, AppHelpersMixin):
             N_targets = rr_timing["N_targets"]
             t_slice_rr = rr_timing["t_slice_rr"]
             dwell_s = rr_timing["dwell_s"]
+            active_scheduler = getattr(self._get_scheduling_backend(), "scheduler", None)
 
             k_text = str(K_frames) if K_frames is not None else "manual"
             if T_total_sec > 0.0:
@@ -1000,11 +1122,67 @@ class ComApp(EventHandlersMixin, PointingHandlerMixin, AppHelpersMixin):
             else:
                 total_text = "manual"
 
+            if is_proposed_mode and isinstance(active_scheduler, ProposedScheduler):
+                initial_led_states = {}
+                final_led_state_map = dict(getattr(self, "_track_final_led_state", {}) or {})
+                for track_id in final_ids:
+                    state_info = dict(final_led_state_map.get(track_id) or {})
+                    initial_led_states[track_id] = state_info.get("pred") or self._scheduling_led_latest.get(track_id)
+                proposed_state = active_scheduler.initialize_state(
+                    total_frame_time=T_frame_sec,
+                    ordered_track_ids=final_ids,
+                    csv_path=csv_path,
+                    track_id_members=dict(getattr(self, "_pointing_csv_track_ids", {}) or {}),
+                    initial_led_states=initial_led_states,
+                )
+                frame_plan = active_scheduler.build_frame_plan(proposed_state)
+                current_frame_allocations = dict(frame_plan.get("allocations") or {})
+                current_frame_scores = dict(frame_plan.get("scores") or {})
+                self._set_scheduling_frame_debug(
+                    mode_label=mode_label,
+                    execution_order=list(final_ids),
+                    frame_allocations=dict(current_frame_allocations),
+                    fixed_target_coeffs=dict(frame_plan.get("fixed_target_coeffs") or {}),
+                    battery_state_prev=dict(frame_plan.get("battery_state_prev") or {}),
+                    battery_coeff_prev=dict(frame_plan.get("battery_coeff_prev") or {}),
+                    frame_scores=dict(current_frame_scores),
+                )
+                battery_check_text = "Battery update end-sample"
+            else:
+                current_frame_allocations = {int(track_id): float(t_slice_rr) for track_id in final_ids}
+                current_frame_scores = {int(track_id): 1.0 for track_id in final_ids}
+                initial_state_debug = {}
+                initial_coeff_debug = {}
+                final_led_state_map = dict(getattr(self, "_track_final_led_state", {}) or {})
+                for track_id in final_ids:
+                    state_info = dict(final_led_state_map.get(track_id) or {})
+                    led_state = state_info.get("pred") or self._scheduling_led_latest.get(track_id) or "R"
+                    initial_state_debug[int(track_id)] = str(led_state)
+                    initial_coeff_debug[int(track_id)] = float(led_state_to_battery_coeff(led_state))
+                self._set_scheduling_frame_debug(
+                    mode_label=mode_label,
+                    execution_order=list(final_ids),
+                    frame_allocations=dict(current_frame_allocations),
+                    fixed_target_coeffs={int(track_id): 1.0 for track_id in final_ids},
+                    battery_state_prev=initial_state_debug,
+                    battery_coeff_prev=initial_coeff_debug,
+                    frame_scores=dict(current_frame_scores),
+                )
+                battery_check_text = (
+                    f"Battery check {led_probe_s:.1f}초"
+                    if rr_battery_check_enabled
+                    else "Battery check off"
+                )
+            alloc_text = (
+                "dynamic allocation"
+                if is_proposed_mode
+                else f"slice={t_slice_rr:.1f}초/ID"
+            )
             self._set_scheduling_status(
-                f"🔴 RoundRobin RR: {len(final_ids)}개 ID 순환 조사 시작 "
-                f"(slice={t_slice_rr:.1f}초/ID, T_frame={T_frame_sec:.1f}s, "
+                f"🔴 {mode_label}: {len(final_ids)}개 ID 순환 조사 시작 "
+                f"({alloc_text}, T_frame={T_frame_sec:.1f}s, "
                 f"T_total={total_text}, K={k_text}, N={N_targets}, "
-                f"Battery check {led_probe_s:.1f}초)",
+                f"{battery_check_text})",
                 fg="blue",
             )
             self._set_preview_overlay(current_id=None, phase="RR", dwell_elapsed=0.0, dwell_total=dwell_s)
@@ -1018,8 +1196,7 @@ class ComApp(EventHandlersMixin, PointingHandlerMixin, AppHelpersMixin):
                 )
                 time.sleep(0.2)
 
-            # RR phase keeps laser continuously ON so slice/frame timing stays absolute.
-            rr_ir_head_s = 3.0 if t_slice_rr >= 3.0 else max(0.0, t_slice_rr * 0.5)
+            # RR / Proposed phase keeps laser continuously ON so frame timing stays absolute.
             self._call_on_ui_thread(lambda: self.set_ir_cut("day"), timeout=3.0)
             self.ctrl.send({"cmd": "laser", "value": 1})
             self.laser_state = True
@@ -1045,21 +1222,65 @@ class ComApp(EventHandlersMixin, PointingHandlerMixin, AppHelpersMixin):
             loop_count = 0
             while not self._scheduling_stop_event.is_set():
                 if K_frames is not None and completed_frames >= K_frames:
-                    final_message = "✅ RoundRobin 완료 (K_frames 도달)"
+                    final_message = f"✅ {mode_label} 완료 (K_frames 도달)"
                     final_color = "green"
                     break
                 loop_count = completed_frames + 1
+                if is_proposed_mode and proposed_state is not None and isinstance(active_scheduler, ProposedScheduler):
+                    frame_plan = active_scheduler.build_frame_plan(
+                        proposed_state,
+                        total_frame_time=T_frame_sec,
+                        execution_order=final_ids,
+                    )
+                    current_frame_allocations = dict(frame_plan.get("allocations") or {})
+                    current_frame_scores = dict(frame_plan.get("scores") or {})
+                    self._set_scheduling_frame_debug(
+                        mode_label=mode_label,
+                        execution_order=list(final_ids),
+                        frame_allocations=dict(current_frame_allocations),
+                        fixed_target_coeffs=dict(frame_plan.get("fixed_target_coeffs") or {}),
+                        battery_state_prev=dict(frame_plan.get("battery_state_prev") or {}),
+                        battery_coeff_prev=dict(frame_plan.get("battery_coeff_prev") or {}),
+                        frame_scores=dict(current_frame_scores),
+                    )
+                else:
+                    current_frame_allocations = {int(track_id): float(t_slice_rr) for track_id in final_ids}
+                    current_frame_scores = {int(track_id): 1.0 for track_id in final_ids}
+                    self._set_scheduling_frame_debug(
+                        mode_label=mode_label,
+                        execution_order=list(final_ids),
+                        frame_allocations=dict(current_frame_allocations),
+                        frame_scores=dict(current_frame_scores),
+                    )
                 frame_started_at = rr_started_at + (completed_frames * T_frame_sec)
                 frame_deadline = frame_started_at + T_frame_sec
+
+                self._update_scheduling_progress(
+                    scheduling_elapsed_s=time.monotonic() - scheduling_started_at,
+                    shoot_elapsed_s=min(time.monotonic() - rr_started_at, completed_frames * T_frame_sec),
+                    shoot_total_s=T_total_sec if T_total_sec > 0.0 else None,
+                    phase="Frame 할당 준비",
+                    loop_count=loop_count,
+                    frame_elapsed_s=0.0,
+                    frame_total_s=T_frame_sec,
+                    slice_total=N_targets,
+                    current_elapsed_s=0.0,
+                    current_total_s=None,
+                    completed_frames=completed_frames,
+                    total_frames=K_frames,
+                )
 
                 if not self._wait_until_scheduling_deadline(frame_started_at):
                     break
 
+                slice_offset_s = 0.0
                 for idx, track_id in enumerate(final_ids, start=1):
                     if self._scheduling_stop_event.is_set():
                         break
-                    slice_start = frame_started_at + ((idx - 1) * t_slice_rr)
-                    slice_end = frame_started_at + (idx * t_slice_rr)
+                    alloc_s = max(0.0, float(current_frame_allocations.get(track_id, t_slice_rr)))
+                    slice_start = frame_started_at + slice_offset_s
+                    slice_end = frame_started_at + slice_offset_s + alloc_s
+                    slice_offset_s += alloc_s
 
                     if not self._wait_until_scheduling_deadline(slice_start):
                         break
@@ -1079,7 +1300,7 @@ class ComApp(EventHandlersMixin, PointingHandlerMixin, AppHelpersMixin):
                         continue
 
                     self._set_scheduling_status(
-                        f"🔴 RR frame {loop_count} [{idx}/{len(final_ids)}] ID {track_id}",
+                        f"🔴 {mode_label} frame {loop_count} [{idx}/{len(final_ids)}] ID {track_id}",
                         fg="blue",
                     )
                     led_state = self._scheduling_led_latest.get(track_id, "-")
@@ -1094,25 +1315,23 @@ class ComApp(EventHandlersMixin, PointingHandlerMixin, AppHelpersMixin):
                         frame_total_s=T_frame_sec,
                         slice_index=idx,
                         slice_total=N_targets,
-                        current_elapsed_s=min(max(0.0, time.monotonic() - slice_start), t_slice_rr),
-                        current_total_s=dwell_s,
+                        current_elapsed_s=min(max(0.0, time.monotonic() - slice_start), alloc_s),
+                        current_total_s=alloc_s,
                         completed_frames=completed_frames,
                         total_frames=K_frames,
                     )
                     self._set_preview_overlay(
                         current_id=track_id,
                         phase="RR",
-                        dwell_elapsed=min(max(0.0, time.monotonic() - slice_start), t_slice_rr),
-                        dwell_total=dwell_s,
+                        dwell_elapsed=min(max(0.0, time.monotonic() - slice_start), alloc_s),
+                        dwell_total=alloc_s,
                         led_state=led_state,
                     )
                     self._call_on_ui_thread(
-                        lambda tid=track_id, wait_s=(
-                            ROUNDROBIN_FIRST_APPROACH_WAIT_S if idx == 1 else ROUNDROBIN_APPROACH_WAIT_S
-                        ): self.move_to_target(
+                        lambda tid=track_id, use_special=(idx == 1), wait_s=ROUNDROBIN_FIRST_APPROACH_WAIT_S: self.move_to_target(
                             tid,
                             use_tilt_approach=False,
-                            use_pan_tilt_approach=True,
+                            use_pan_tilt_approach=use_special,
                             pan_tilt_approach_wait_s=wait_s,
                         ),
                         timeout=5.0,
@@ -1121,23 +1340,56 @@ class ComApp(EventHandlersMixin, PointingHandlerMixin, AppHelpersMixin):
                         continue
 
                     # Per-slice IR policy: if slice < 3s, use first half only; otherwise 3s.
+                    slice_ir_head_s = 3.0 if alloc_s >= 3.0 else max(0.0, alloc_s * 0.5)
                     current_mode = "day"  # day=IR mode, night=Normal mode
                     self._call_on_ui_thread(lambda m=current_mode: self.set_ir_cut(m), timeout=3.0)
 
-                    # Battery check는 slice budget 내부에서만 허용
-                    next_probe_elapsed = led_probe_s
+                    # Battery update/check는 slice budget 내부에서만 허용
+                    next_probe_elapsed = led_probe_s if rr_battery_check_enabled else None
+                    sample_taken = False
+                    sample_elapsed = None
+                    if is_proposed_mode and proposed_state is not None and isinstance(active_scheduler, ProposedScheduler):
+                        sample_elapsed = active_scheduler.get_sampling_elapsed(alloc_s)
                     edge_eps = 1e-3  # 경계(시작/끝) 체크 제외용
                     while time.monotonic() < slice_end:
                         if self._scheduling_stop_event.is_set():
                             break
                         now = time.monotonic()
-                        slice_elapsed = min(max(0.0, now - slice_start), t_slice_rr)
-                        while slice_elapsed >= next_probe_elapsed:
+                        slice_elapsed = min(max(0.0, now - slice_start), alloc_s)
+                        if (
+                            is_proposed_mode
+                            and proposed_state is not None
+                            and isinstance(active_scheduler, ProposedScheduler)
+                            and not sample_taken
+                            and sample_elapsed is not None
+                            and slice_elapsed >= sample_elapsed
+                        ):
+                            remaining_for_probe = slice_end - time.monotonic()
+                            sampled_led_state = None
+                            probe_timeout = min(remaining_for_probe - 0.05, 10.0)
+                            if probe_timeout > 0.2:
+                                sampled_led_state = self._probe_led_state_for_track(
+                                    track_id,
+                                    probe_interval_s=led_probe_s,
+                                    timeout_s=probe_timeout,
+                                )
+                            update = active_scheduler.sample_or_update_battery_state_for_target(
+                                proposed_state,
+                                track_id,
+                                sampled_led_state,
+                            )
+                            self._scheduling_led_latest[track_id] = str(update.get("next_state", "NONE"))
+                            sample_taken = True
+                        while (
+                            rr_battery_check_enabled
+                            and next_probe_elapsed is not None
+                            and slice_elapsed >= next_probe_elapsed
+                        ):
                             probe_elapsed = next_probe_elapsed
                             next_probe_elapsed += led_probe_s
 
                             # "시작/끝 제외": 현재 ID 구간 내부 시점에서만 체크
-                            if probe_elapsed <= edge_eps or probe_elapsed >= (dwell_s - edge_eps):
+                            if probe_elapsed <= edge_eps or probe_elapsed >= (alloc_s - edge_eps):
                                 continue
                             remaining_for_probe = slice_end - time.monotonic()
                             probe_timeout = min(remaining_for_probe - 0.1, led_probe_s)
@@ -1153,7 +1405,7 @@ class ComApp(EventHandlersMixin, PointingHandlerMixin, AppHelpersMixin):
                             # 한 루프에서 과도한 연속 체크 방지
                             break
 
-                        desired_mode = "day" if slice_elapsed < rr_ir_head_s else "night"
+                        desired_mode = "day" if slice_elapsed < slice_ir_head_s else "night"
                         if desired_mode != current_mode:
                             self._call_on_ui_thread(lambda m=desired_mode: self.set_ir_cut(m), timeout=3.0)
                             current_mode = desired_mode
@@ -1169,7 +1421,7 @@ class ComApp(EventHandlersMixin, PointingHandlerMixin, AppHelpersMixin):
                             slice_index=idx,
                             slice_total=N_targets,
                             current_elapsed_s=slice_elapsed,
-                            current_total_s=dwell_s,
+                            current_total_s=alloc_s,
                             completed_frames=completed_frames,
                             total_frames=K_frames,
                         )
@@ -1177,11 +1429,24 @@ class ComApp(EventHandlersMixin, PointingHandlerMixin, AppHelpersMixin):
                             current_id=track_id,
                             phase="RR",
                             dwell_elapsed=slice_elapsed,
-                            dwell_total=dwell_s,
+                            dwell_total=alloc_s,
                             led_state=self._scheduling_led_latest.get(track_id, "-"),
                         )
                         if not self._wait_until_scheduling_deadline(min(slice_end, time.monotonic() + 0.1)):
                             break
+
+                    if (
+                        is_proposed_mode
+                        and proposed_state is not None
+                        and isinstance(active_scheduler, ProposedScheduler)
+                        and not sample_taken
+                    ):
+                        update = active_scheduler.sample_or_update_battery_state_for_target(
+                            proposed_state,
+                            track_id,
+                            None,
+                        )
+                        self._scheduling_led_latest[track_id] = str(update.get("next_state", "NONE"))
 
                     if self._scheduling_stop_event.is_set():
                         break
@@ -1192,6 +1457,10 @@ class ComApp(EventHandlersMixin, PointingHandlerMixin, AppHelpersMixin):
                     break
                 if not self._wait_until_scheduling_deadline(frame_deadline):
                     break
+
+                if is_proposed_mode and proposed_state is not None and isinstance(active_scheduler, ProposedScheduler):
+                    active_scheduler.log_frame_summary(proposed_state)
+                    active_scheduler.finalize_frame_and_prepare_next(proposed_state)
 
                 completed_frames += 1
                 self._update_scheduling_progress(
@@ -1211,7 +1480,7 @@ class ComApp(EventHandlersMixin, PointingHandlerMixin, AppHelpersMixin):
                 final_color = "red"
 
         except Exception as e:
-            final_message = f"❌ RoundRobin 오류: {e}"
+            final_message = f"❌ {mode_label} 오류: {e}"
             final_color = "red"
             print(final_message)
         finally:
