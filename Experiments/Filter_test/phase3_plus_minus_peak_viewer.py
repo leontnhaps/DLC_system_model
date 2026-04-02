@@ -25,6 +25,7 @@ DIFF_EXIST_THRESHOLD = 30
 LED_DIFF_EXCLUDE_THRESHOLD = 50
 CLICK_ROI_SIZE = 360
 DEFAULT_CLICK_ROI_CENTER = (1375, 780)
+FIXED_REFERENCE_POINT = (1360, 760)
 
 
 def imread_unicode(path: Path) -> np.ndarray | None:
@@ -205,6 +206,17 @@ def draw_marker(
     cv2.circle(canvas, (x, y), 4, color, -1)
 
 
+def draw_fixed_reference_marker(
+    canvas: np.ndarray,
+    pos: tuple[int, int] = FIXED_REFERENCE_POINT,
+) -> None:
+    x, y = int(pos[0]), int(pos[1])
+    cv2.drawMarker(canvas, (x, y), (255, 255, 255), cv2.MARKER_CROSS, 72, 12)
+    cv2.drawMarker(canvas, (x, y), (0, 0, 0), cv2.MARKER_CROSS, 58, 8)
+    cv2.circle(canvas, (x, y), 18, (255, 255, 255), 6)
+    cv2.circle(canvas, (x, y), 14, (0, 0, 0), 4)
+
+
 def draw_roi_box(
     canvas: np.ndarray,
     roi_box: tuple[int, int, int, int] | None,
@@ -251,15 +263,18 @@ def draw_plus_overlay(
     plus_pixels: int,
     source_name: str,
     roi_box: tuple[int, int, int, int] | None = None,
+    metric_label: str = "gray diff >= 30 weighted centroid",
 ) -> np.ndarray:
     canvas = plus_img.copy()
     draw_roi_box(canvas, roi_box)
+    draw_fixed_reference_marker(canvas)
     draw_marker(canvas, plus_centroid, (0, 255, 255), 30)
     lines = [
-        "Phase3 plus | diff >= 30 weighted centroid",
+        f"Phase3 plus | {metric_label}",
         f"source={source_name}",
         f"plus diff_pixels={plus_pixels}",
         "yellow = plus weighted centroid",
+        "black cross = fixed ref (1355, 770)",
         "green box = clicked/default 300x300 ROI",
     ]
     y = 36
@@ -277,20 +292,23 @@ def draw_base_overlay(
     base_pixels: int,
     source_name: str,
     roi_box: tuple[int, int, int, int] | None = None,
+    metric_label: str = "gray diff >= 30 weighted centroid",
 ) -> np.ndarray:
     canvas = base_img.copy()
     draw_roi_box(canvas, roi_box)
+    draw_fixed_reference_marker(canvas)
     draw_marker(canvas, plus_centroid, (0, 255, 255), 28)
     draw_marker(canvas, base_centroid, (255, 255, 0), 32)
     draw_marker(canvas, avg_centroid, (255, 0, 255), 36)
 
     lines = [
-        "Phase3 base | diff >= 30 weighted centroid",
+        f"Phase3 base | {metric_label}",
         f"source={source_name}",
         f"base diff_pixels={base_pixels}",
         "yellow = plus weighted centroid",
         "cyan = base weighted centroid",
         "magenta = avg(plus, base)",
+        "black cross = fixed ref (1355, 770)",
         "green box = clicked/default 300x300 ROI",
     ]
     y = 36
@@ -309,6 +327,7 @@ def draw_heatmap_overlay(
 ) -> np.ndarray:
     canvas = heatmap.copy()
     draw_roi_box(canvas, roi_box)
+    draw_fixed_reference_marker(canvas)
     draw_marker(canvas, plus_centroid, (0, 255, 255), 28)
     draw_marker(canvas, base_centroid, (255, 255, 0), 32)
     draw_marker(canvas, avg_centroid, (255, 0, 255), 36)
@@ -322,15 +341,17 @@ def draw_threshold_plot(
     base_centroid: tuple[int, int] | None = None,
     avg_centroid: tuple[int, int] | None = None,
     roi_box: tuple[int, int, int, int] | None = None,
+    metric_label: str = "laser diff",
 ) -> np.ndarray:
     canvas = masked_img.copy()
     draw_roi_box(canvas, roi_box)
+    draw_fixed_reference_marker(canvas)
     draw_marker(canvas, plus_centroid, (0, 255, 255), 28)
     draw_marker(canvas, base_centroid, (255, 255, 0), 32)
     draw_marker(canvas, avg_centroid, (255, 0, 255), 36)
     cv2.putText(
         canvas,
-        f"{tag} | only laser diff >= {DIFF_EXIST_THRESHOLD}",
+        f"{tag} | only {metric_label} >= {DIFF_EXIST_THRESHOLD}",
         (20, 36),
         cv2.FONT_HERSHEY_SIMPLEX,
         0.8,
@@ -357,9 +378,11 @@ def draw_threshold_plot_with_exclusion(
     avg_centroid: tuple[int, int] | None = None,
     exclude_mask: np.ndarray | None = None,
     roi_box: tuple[int, int, int, int] | None = None,
+    metric_label: str = "laser diff",
 ) -> np.ndarray:
     canvas = masked_img.copy()
     draw_roi_box(canvas, roi_box)
+    draw_fixed_reference_marker(canvas)
     if exclude_mask is not None and np.count_nonzero(exclude_mask) > 0:
         contours, _ = cv2.findContours(exclude_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         if contours:
@@ -369,7 +392,7 @@ def draw_threshold_plot_with_exclusion(
     draw_marker(canvas, avg_centroid, (255, 0, 255), 36)
     cv2.putText(
         canvas,
-        f"{tag} | laser diff >= {DIFF_EXIST_THRESHOLD}, excluding LED diff > {LED_DIFF_EXCLUDE_THRESHOLD}",
+        f"{tag} | {metric_label} >= {DIFF_EXIST_THRESHOLD}, excluding LED diff > {LED_DIFF_EXCLUDE_THRESHOLD}",
         (20, 36),
         cv2.FONT_HERSHEY_SIMPLEX,
         0.75,
@@ -530,7 +553,6 @@ def main():
         avg_centroid = compute_midpoint(plus_centroid, base_centroid)
         plus_threshold_plot = apply_diff_presence_mask(plus_laser_on, plus_diff_u8, roi_box=plus_roi_box)
         base_threshold_plot = apply_diff_presence_mask(base_laser_on, base_diff_u8, roi_box=base_roi_box)
-
         plus_excluded_centroid, plus_excluded_pixels = compute_weighted_centroid(
             plus_diff_u8,
             exclude_mask=plus_led_exclude_mask,
@@ -554,7 +576,6 @@ def main():
             exclude_mask=base_led_exclude_mask,
             roi_box=base_roi_box,
         )
-
         print(f"PLUS centroid  : {plus_centroid} diff_pixels={plus_pixels} (threshold={DIFF_EXIST_THRESHOLD})")
         print(
             f"PLUS excl LED>50: centroid={plus_excluded_centroid} diff_pixels={plus_excluded_pixels} "
@@ -575,6 +596,7 @@ def main():
             plus_pixels,
             plus_laser_on_path.name,
             roi_box=plus_roi_box,
+            metric_label="gray diff >= 30 weighted centroid",
         )
         base_overlay = draw_base_overlay(
             base_laser_on,
@@ -584,6 +606,7 @@ def main():
             base_pixels,
             base_laser_on_path.name,
             roi_box=base_roi_box,
+            metric_label="gray diff >= 30 weighted centroid",
         )
         plus_heatmap = draw_heatmap_overlay(
             plus_heatmap_base,
@@ -602,6 +625,7 @@ def main():
             "Phase3 plus",
             plus_centroid=plus_centroid,
             roi_box=plus_roi_box,
+            metric_label="gray diff",
         )
         base_threshold_view = draw_threshold_plot(
             base_threshold_plot,
@@ -610,6 +634,7 @@ def main():
             base_centroid=base_centroid,
             avg_centroid=avg_centroid,
             roi_box=base_roi_box,
+            metric_label="gray diff",
         )
         plus_threshold_excluded_view = draw_threshold_plot_with_exclusion(
             plus_threshold_excluded_plot,
@@ -617,6 +642,7 @@ def main():
             plus_centroid=plus_excluded_centroid,
             exclude_mask=plus_led_exclude_mask,
             roi_box=plus_roi_box,
+            metric_label="gray diff",
         )
         base_threshold_excluded_view = draw_threshold_plot_with_exclusion(
             base_threshold_excluded_plot,
@@ -626,8 +652,8 @@ def main():
             avg_centroid=avg_excluded_centroid,
             exclude_mask=base_led_exclude_mask,
             roi_box=base_roi_box,
+            metric_label="gray diff",
         )
-
         overlay_pair, overlay_meta = make_side_by_side(
             plus_overlay,
             base_overlay,
