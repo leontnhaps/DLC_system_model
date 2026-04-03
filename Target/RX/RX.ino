@@ -1,267 +1,378 @@
-  #include <Arduino.h>
-  #include <EEPROM.h>
+#include <Arduino.h>
+#include <EEPROM.h>
 
-  // ===================== 핀 설정 =====================
-  const uint8_t PIN_BAT_A0 = A1;
+// =====================================================
+// 핀 설정
+// =====================================================
+const uint8_t PIN_BAT   = A1;
+const uint8_t PIN_LED_R = 2;
+const uint8_t PIN_LED_B = 3;
+const uint8_t PIN_LED_G = 4;
 
-  // LED (각각 100Ω 직렬 후 LED->GND, 핀 HIGH면 켜짐)
-  const uint8_t PIN_LED_R = 2;
-  const uint8_t PIN_LED_B = 3;
-  const uint8_t PIN_LED_G = 4;
+// =====================================================
+// 분압 설정
+// BAT+ --- 39k --- A1 --- 12k --- GND
+// =====================================================
+const double R_TOP = 39000.0;
+const double R_BOTTOM = 12000.0;
+const double DIV_GAIN = (R_TOP + R_BOTTOM) / R_BOTTOM;   // 4.25
+const double REF_VOLTAGE_mV = 1100.0;                    // INTERNAL 1.1V
 
-  // ===================== 분압 설정 =====================
-  // 100k / 20k 저항 분배 => (100 + 20) / 20 = 6배
-  const float DIV_GAIN = 6.0f;
-  const float REF_VOLTAGE_mV = 1100.0f; // 아두이노 내부 1.1V (1100mV) 기준
+// =====================================================
+// 배터리 범위
+// =====================================================
+const long V_FULL_mV  = 4200;   // 4.2V
+const long V_EMPTY_mV = 3000;   // 3.0V
 
-  // ===================== 배터리 % 매핑 (대략) =====================
-  const long V_FULL_mV  = 4200;  // 4.20V
-  const long V_EMPTY_mV = 3000;  // 3.0V 
+// LED 구간
+const long V_LOW_mV = 3400;     // 3.0 ~ 3.4V -> RED
+const long V_MID_mV = 3800;     // 3.4 ~ 3.8V -> BLUE / 3.8 ~ 4.2V -> GREEN
+const long LED_HYS_mV = 30;     // 히스테리시스
 
-  // LED 구간(%)
-  const int PCT_LOW = 35;
-  const int PCT_MID = 70;
-  const int PCT_HYS = 2;   // 깜빡임 방지 히스테리시스
+// =====================================================
+// 측정 / 저장 주기
+// =====================================================
+const unsigned long SAMPLE_INTERVAL_MS = 1000UL;   // 1초마다 측정
+const uint8_t AVG_COUNT = 10;                      // 10개 평균 -> 10초 평균 저장
 
-  // ===================== 로깅 간격(초) =====================
-  const uint16_t LOG_INTERVAL_S = 10;
+// =====================================================
+// EEPROM 저장 포맷
+// =====================================================
+const uint16_t VMIN_LOG_mV = 3000;
+const uint8_t  STEP_mV     = 5;
 
-  // ===================== EEPROM 저장 포맷(1바이트 압축) =====================
-  const uint16_t VMIN_LOG_mV = 3000;
-  const uint8_t  STEP_mV     = 5;
+// 헤더를 너무 자주 저장하면 특정 주소가 빨리 닳으므로
+// 60개 로그마다 한 번만 저장 (10초 * 60 = 10분)
+const uint8_t HEADER_SAVE_EVERY = 60;
 
-  // ===================== 상태(숫자 상수로) =====================
-  const uint8_t ST_RED   = 0;
-  const uint8_t ST_BLUE  = 1;
-  const uint8_t ST_GREEN = 2;
+// =====================================================
+// 상태 정의
+// =====================================================
+enum LedState {
+  ST_RED = 0,
+  ST_BLUE,
+  ST_GREEN
+};
 
-  uint8_t g_state = ST_RED;
+LedState g_state = ST_RED;
 
-  // ===================== EEPROM 헤더 =====================
-  const uint16_t MAGIC = 0xBEEF;
-  const uint8_t  VER   = 1;
+// =====================================================
+// EEPROM 헤더
+// =====================================================
+const uint16_t MAGIC = 0xBEEF;
+const uint8_t  VER   = 1;
 
-  struct Header {
-    uint16_t magic;
-    uint8_t  ver;
-    uint8_t  step_mV;
-    uint16_t vmin_mV;
-    uint16_t interval_s;
-    uint16_t write_idx;       
-    uint32_t total_written;   
-  };
+struct Header {
+  uint16_t magic;
+  uint8_t  ver;
+  uint8_t  step_mV;
+  uint16_t vmin_mV;
+  uint16_t interval_s;
+  uint16_t write_idx;
+  uint32_t total_written;
+};
 
-  Header H;
+Header H;
+uint8_t pendingHeaderLogs = 0;
 
-  static uint16_t dataOffset() {
-    return (uint16_t)sizeof(Header);
-  }
+// =====================================================
+// 시간 / 누적 변수
+// =====================================================
+unsigned long lastSampleMs = 0;
 
-  static uint16_t dataCapacity() {
-    uint16_t len = (uint16_t)EEPROM.length();
-    uint16_t off = dataOffset();
-    if (len <= off) return 0;
-    return (uint16_t)(len - off);
-  }
+long sampleSum_mV = 0;      // 최근 10초 누적합
+uint8_t sampleCount = 0;    // 최근 10초 샘플 개수
 
-  // ===================== LED 제어 =====================
-  static void setOneLed(uint8_t st) {
-    digitalWrite(PIN_LED_R, (st == ST_RED)   ? HIGH : LOW);
-    digitalWrite(PIN_LED_B, (st == ST_BLUE)  ? HIGH : LOW);
-    digitalWrite(PIN_LED_G, (st == ST_GREEN) ? HIGH : LOW);
-  }
+// =====================================================
+// 유틸
+// =====================================================
+uint16_t dataOffset() {
+  return (uint16_t)sizeof(Header);
+}
 
-  // ===================== 배터리 전압 읽기(mV) =====================
-  static long readBattery_mV(bool printDebug = false) {
-    long sum = 0;
-    for (int i = 0; i < 8; i++) {
-      sum += analogRead(PIN_BAT_A0);
-      delay(2);
-    }
-    float adc = sum / 8.0f;
+uint16_t dataCapacity() {
+  uint16_t len = (uint16_t)EEPROM.length();
+  uint16_t off = dataOffset();
 
-    // ★ 1.1V(1100mV) 내부 기준과 6배율 적용 계산식
-    // Vbat(mV) = ADC * (1100mV / 1023) * 6
-    float vBat_mV = adc * (REF_VOLTAGE_mV / 1023.0f) * DIV_GAIN;
+  if (len <= off) return 0;
+  return (uint16_t)(len - off);
+}
 
-    if (printDebug) {
-      Serial.print("[DEBUG] 내부 1.1V 기준 작동 중 | 아날로그 리드(평균): ");
-      Serial.print(adc);
-      Serial.print(" -> 계산된 배터리 전압: ");
-      Serial.print(vBat_mV);
-      Serial.println(" mV");
-    }
+void saveHeader() {
+  EEPROM.put(0, H);
+}
 
-    return (long)(vBat_mV + 0.5f); // 반올림하여 정수(mV)로 반환
-  }
-
-  static int voltageToPercent(long vbat_mV) {
-    float p = ((float)(vbat_mV - V_EMPTY_mV) * 100.0f) / (float)(V_FULL_mV - V_EMPTY_mV);
-    if (p < 0) p = 0;
-    if (p > 100) p = 100;
-    return (int)(p + 0.5f);
-  }
-
-  // ===================== EEPROM 로드/초기화 =====================
-  static void loadOrInitHeader() {
-    EEPROM.get(0, H);
-
-    bool ok = (H.magic == MAGIC &&
-              H.ver == VER &&
-              H.step_mV == STEP_mV &&
-              H.vmin_mV == VMIN_LOG_mV &&
-              H.interval_s == LOG_INTERVAL_S);
-
-    if (!ok) {
-      H.magic = MAGIC;
-      H.ver = VER;
-      H.step_mV = STEP_mV;
-      H.vmin_mV = VMIN_LOG_mV;
-      H.interval_s = LOG_INTERVAL_S;
-      H.write_idx = 0;
-      H.total_written = 0;
-      EEPROM.put(0, H);
-    }
-  }
-
-  static void saveHeader() {
-    EEPROM.put(0, H); 
-  }
-
-  // ===================== 인코딩/디코딩 =====================
-  static uint8_t encodeVbat(long vbat_mV) {
-    long x = vbat_mV - (long)VMIN_LOG_mV;
-    if (x < 0) x = 0;
-    long code = x / (long)STEP_mV;
-    if (code > 255) code = 255;
-    return (uint8_t)code;
-  }
-
-  static long decodeVbat(uint8_t code) {
-    return (long)VMIN_LOG_mV + (long)code * (long)STEP_mV;
-  }
-
-  // ===================== 샘플 추가(링버퍼) =====================
-  static void appendSample(long vbat_mV) {
-    uint16_t cap = dataCapacity();
-    if (cap == 0) return;
-
-    uint8_t code = encodeVbat(vbat_mV);
-    uint16_t addr = dataOffset() + H.write_idx;
-
-    EEPROM.update(addr, code);
-
-    H.write_idx = (uint16_t)((H.write_idx + 1) % cap);
-    H.total_written++;
+void syncHeaderIfNeeded() {
+  if (pendingHeaderLogs > 0) {
     saveHeader();
+    pendingHeaderLogs = 0;
   }
+}
 
-  // ===================== 덤프/클리어 =====================
-  static void dumpCsv() {
-    uint16_t cap = dataCapacity();
-    if (cap == 0) {
-      Serial.println("ERR,EEPROM capacity=0");
-      return;
-    }
+void loadOrInitHeader() {
+  EEPROM.get(0, H);
 
-    uint32_t total = H.total_written;
-    uint32_t n = (total < cap) ? total : cap;
+  bool ok = (H.magic == MAGIC &&
+             H.ver == VER &&
+             H.step_mV == STEP_mV &&
+             H.vmin_mV == VMIN_LOG_mV &&
+             H.interval_s == (AVG_COUNT * (SAMPLE_INTERVAL_MS / 1000UL)));
 
-    uint16_t start = (total < cap) ? 0 : H.write_idx;
-
-    Serial.println("idx,time_s,vbat_mV,percent");
-
-    for (uint32_t i = 0; i < n; i++) {
-      uint16_t idx = (uint16_t)((start + i) % cap);
-      uint8_t code = EEPROM.read(dataOffset() + idx);
-      long v = decodeVbat(code);
-      int pct = voltageToPercent(v);
-      uint32_t t = i * (uint32_t)H.interval_s;
-
-      Serial.print(i); Serial.print(",");
-      Serial.print(t); Serial.print(",");
-      Serial.print(v); Serial.print(",");
-      Serial.println(pct);
-    }
-    Serial.println("END");
-  }
-
-  static void clearLog() {
+  if (!ok) {
+    H.magic = MAGIC;
+    H.ver = VER;
+    H.step_mV = STEP_mV;
+    H.vmin_mV = VMIN_LOG_mV;
+    H.interval_s = (uint16_t)(AVG_COUNT * (SAMPLE_INTERVAL_MS / 1000UL)); // 10초
     H.write_idx = 0;
     H.total_written = 0;
     saveHeader();
-    Serial.println("OK,CLEARED");
+  }
+}
+
+// =====================================================
+// LED 제어
+// =====================================================
+void setOneLed(LedState st) {
+  digitalWrite(PIN_LED_R, (st == ST_RED)   ? HIGH : LOW);
+  digitalWrite(PIN_LED_B, (st == ST_BLUE)  ? HIGH : LOW);
+  digitalWrite(PIN_LED_G, (st == ST_GREEN) ? HIGH : LOW);
+}
+
+// =====================================================
+// 배터리 전압 읽기
+// - 한 번 측정할 때 내부적으로 8번 평균
+// =====================================================
+long readBattery_mV() {
+  long sum = 0;
+
+  for (uint8_t i = 0; i < 8; i++) {
+    sum += analogRead(PIN_BAT);
+    delay(2);
   }
 
-  // ===================== 메인 =====================
-  unsigned long lastLogMs = 0;
-  unsigned long lastLedMs = 0;
+  double adc = sum / 8.0;
+  double vBat_mV = adc * (REF_VOLTAGE_mV / 1023.0) * DIV_GAIN;
 
-  void setup() {
-    pinMode(PIN_LED_R, OUTPUT);
-    pinMode(PIN_LED_B, OUTPUT);
-    pinMode(PIN_LED_G, OUTPUT);
+  return (long)(vBat_mV + 0.5);
+}
 
-    setOneLed(ST_RED);
+// =====================================================
+// 전압 -> 퍼센트
+// =====================================================
+int voltageToPercent(long vbat_mV) {
+  if (vbat_mV < V_EMPTY_mV) vbat_mV = V_EMPTY_mV;
+  if (vbat_mV > V_FULL_mV)  vbat_mV = V_FULL_mV;
 
-    Serial.begin(9600); // 19200 보드레이트 유지
-    delay(200);
+  long num = (vbat_mV - V_EMPTY_mV) * 100L;
+  long den = (V_FULL_mV - V_EMPTY_mV);
 
-    // ★ 1.1V 내부 기준 전압 사용 설정
-    analogReference(INTERNAL);
+  return (int)((num + den / 2) / den);
+}
 
-    loadOrInitHeader();
-
-    Serial.println("Battery EEPROM Logger Ready (1.1V Ref / 5.7x Divider)");
-    Serial.println("Commands: D=dump CSV, C=clear");
+// =====================================================
+// LED 상태 갱신
+// runningAvg_mV 기준으로 LED 표시
+// =====================================================
+void updateBatteryLed(long vbat_mV) {
+  if (g_state == ST_RED) {
+    if (vbat_mV >= (V_LOW_mV + LED_HYS_mV)) {
+      g_state = ST_BLUE;
+    }
+  }
+  else if (g_state == ST_BLUE) {
+    if (vbat_mV < (V_LOW_mV - LED_HYS_mV)) {
+      g_state = ST_RED;
+    }
+    else if (vbat_mV >= (V_MID_mV + LED_HYS_mV)) {
+      g_state = ST_GREEN;
+    }
+  }
+  else { // ST_GREEN
+    if (vbat_mV < (V_MID_mV - LED_HYS_mV)) {
+      g_state = ST_BLUE;
+    }
   }
 
-  void loop() {
-    // ---- 시리얼 명령 ----
-    if (Serial.available()) {
-      char c = (char)Serial.read();
-      digitalWrite(PIN_LED_B, HIGH);
-      delay(50);
-      digitalWrite(PIN_LED_B, LOW);
-      if (c == 'D' || c == 'd') dumpCsv();
-      if (c == 'C' || c == 'c') clearLog();
-    }
+  setOneLed(g_state);
+}
 
-    unsigned long now = millis();
+// =====================================================
+// 인코딩 / 디코딩
+// =====================================================
+uint8_t encodeVbat(long vbat_mV) {
+  long x = vbat_mV - (long)VMIN_LOG_mV;
+  if (x < 0) x = 0;
 
-    // ---- LED 상태 업데이트(0.5초마다) ----
-    if (now - lastLedMs >= 500) {
-      lastLedMs = now;
+  long code = (x + (STEP_mV / 2)) / (long)STEP_mV;
+  if (code > 255) code = 255;
 
-      long vbat = readBattery_mV();
-      int pct = voltageToPercent(vbat);
+  return (uint8_t)code;
+}
 
-      if (g_state == ST_RED) {
-        if (pct > (PCT_LOW + PCT_HYS)) g_state = ST_BLUE;
-      } else if (g_state == ST_BLUE) {
-        if (pct < (PCT_LOW - PCT_HYS)) g_state = ST_RED;
-        else if (pct > (PCT_MID + PCT_HYS)) g_state = ST_GREEN;
-      } else { 
-        if (pct < (PCT_MID - PCT_HYS)) g_state = ST_BLUE;
-      }
+long decodeVbat(uint8_t code) {
+  return (long)VMIN_LOG_mV + (long)code * (long)STEP_mV;
+}
 
-      setOneLed(g_state);
-    }
+// =====================================================
+// EEPROM 샘플 저장
+// =====================================================
+void appendSample(long vbat_mV) {
+  uint16_t cap = dataCapacity();
+  if (cap == 0) return;
 
-    // ---- EEPROM 로깅(LOG_INTERVAL_S마다) ----
-    if (now - lastLogMs >= (unsigned long)LOG_INTERVAL_S * 1000UL) {
-      lastLogMs = now;
-      long vbat = readBattery_mV(true); // true로 설정하여 디버그 메시지 출력
-      int pct = voltageToPercent(vbat); 
-      
-      appendSample(vbat);
-      
-      Serial.print("[LOG] Vbat: ");
-      Serial.print(vbat);
-      Serial.print(" mV, ");
-      Serial.print(pct);
-      Serial.println(" %");
-    }
+  uint8_t code = encodeVbat(vbat_mV);
+  uint16_t addr = dataOffset() + H.write_idx;
 
-    delay(10);
+  EEPROM.update(addr, code);
+
+  H.write_idx = (uint16_t)((H.write_idx + 1) % cap);
+
+  if (H.total_written < 0xFFFFFFFFUL) {
+    H.total_written++;
   }
+
+  pendingHeaderLogs++;
+
+  if (pendingHeaderLogs >= HEADER_SAVE_EVERY) {
+    saveHeader();
+    pendingHeaderLogs = 0;
+  }
+}
+
+// =====================================================
+// CSV 출력
+// =====================================================
+void dumpCsv() {
+  syncHeaderIfNeeded();
+
+  uint16_t cap = dataCapacity();
+  if (cap == 0) {
+    Serial.println("ERR,EEPROM capacity=0");
+    return;
+  }
+
+  uint32_t total = H.total_written;
+  uint32_t n = (total < cap) ? total : cap;
+  uint16_t start = (total < cap) ? 0 : H.write_idx;
+
+  Serial.println("idx,time_s,vbat_mV,percent");
+
+  for (uint32_t i = 0; i < n; i++) {
+    uint16_t idx = (uint16_t)((start + i) % cap);
+    uint8_t code = EEPROM.read(dataOffset() + idx);
+
+    long v = decodeVbat(code);
+    int pct = voltageToPercent(v);
+    uint32_t t = i * (uint32_t)H.interval_s;
+
+    Serial.print(i);
+    Serial.print(",");
+    Serial.print(t);
+    Serial.print(",");
+    Serial.print(v);
+    Serial.print(",");
+    Serial.println(pct);
+  }
+
+  Serial.println("END");
+}
+
+// =====================================================
+// 로그 초기화
+// =====================================================
+void clearLog() {
+  H.write_idx = 0;
+  H.total_written = 0;
+  pendingHeaderLogs = 0;
+  saveHeader();
+
+  sampleSum_mV = 0;
+  sampleCount = 0;
+
+  Serial.println("OK,CLEARED");
+}
+
+// =====================================================
+// setup
+// =====================================================
+void setup() {
+  pinMode(PIN_LED_R, OUTPUT);
+  pinMode(PIN_LED_B, OUTPUT);
+  pinMode(PIN_LED_G, OUTPUT);
+
+  setOneLed(ST_RED);
+
+  Serial.begin(9600);
+
+  analogReference(INTERNAL);
+  delay(5);
+
+  // 기준전압 전환 직후 더미 리드
+  analogRead(PIN_BAT);
+  delay(5);
+
+  loadOrInitHeader();
+
+  Serial.println("Battery EEPROM Logger Ready");
+  Serial.println("Commands: D=dump CSV, C=clear");
+}
+
+// =====================================================
+// loop
+// =====================================================
+void loop() {
+  // -------------------------
+  // 시리얼 명령 처리
+  // -------------------------
+  if (Serial.available()) {
+    char c = (char)Serial.read();
+
+    if (c == 'D' || c == 'd') {
+      dumpCsv();
+    }
+    else if (c == 'C' || c == 'c') {
+      clearLog();
+    }
+  }
+
+  unsigned long now = millis();
+
+  // -------------------------
+  // 1초마다 측정
+  // -------------------------
+  if (now - lastSampleMs >= SAMPLE_INTERVAL_MS) {
+    lastSampleMs = now;
+
+    long vbat = readBattery_mV();
+
+    sampleSum_mV += vbat;
+    sampleCount++;
+
+    // LED는 현재까지의 누적 평균값 기준으로 표시
+    long runningAvg_mV = sampleSum_mV / sampleCount;
+    updateBatteryLed(runningAvg_mV);
+
+    Serial.print("SAMPLE,");
+    Serial.println(vbat);
+
+    // -------------------------
+    // 10개 모이면 평균 저장
+    // -------------------------
+    if (sampleCount >= AVG_COUNT) {
+      long avgVbat = sampleSum_mV / sampleCount;
+
+      appendSample(avgVbat);
+
+      Serial.print("LOG,");
+      Serial.print(avgVbat);
+      Serial.print(",");
+      Serial.println(voltageToPercent(avgVbat));
+
+      sampleSum_mV = 0;
+      sampleCount = 0;
+    }
+  }
+
+  delay(10);
+}
