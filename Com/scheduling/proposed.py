@@ -13,7 +13,17 @@ BATTERY_COEFF_MAP = {
     "B": 0.50,
     "G": 0.25,
 }
-DEFAULT_BATTERY_STATE = "R"
+BATTERY_BITS_COEFF_MAP = {
+    "000": 1.000,
+    "001": 0.875,
+    "010": 0.750,
+    "011": 0.625,
+    "100": 0.500,
+    "101": 0.375,
+    "110": 0.250,
+    "111": 0.125,
+}
+DEFAULT_BATTERY_STATE = "000"
 DEFAULT_MEAN_FIELD_CANDIDATES = (
     "mean",
     "mean_delta",
@@ -23,8 +33,10 @@ DEFAULT_MEAN_FIELD_CANDIDATES = (
 
 
 def _canonical_led_state(value, default=None):
-    """Normalize LED labels to one of ``R/G/B``."""
+    """Normalize LED labels to one of ``000~111`` or legacy ``R/G/B``."""
     text = str(value or "").strip().upper()
+    if 1 <= len(text) <= 3 and all(ch in "01" for ch in text):
+        return text.zfill(3)
     if text in ("R", "RED"):
         return "R"
     if text in ("G", "GREEN"):
@@ -120,13 +132,15 @@ def initialize_fixed_target_coeffs_from_csv(
 
 
 def led_state_to_battery_coeff(led_state, default_state=DEFAULT_BATTERY_STATE):
-    """Convert LED state to the required battery urgency coefficient."""
+    """Convert 3bit battery state (preferred) or legacy RGB state to urgency coefficient."""
     canonical = _canonical_led_state(led_state, default=default_state)
-    return float(BATTERY_COEFF_MAP.get(canonical, BATTERY_COEFF_MAP[DEFAULT_BATTERY_STATE]))
+    if canonical in BATTERY_BITS_COEFF_MAP:
+        return float(BATTERY_BITS_COEFF_MAP[canonical])
+    return float(BATTERY_COEFF_MAP.get(canonical, BATTERY_BITS_COEFF_MAP[DEFAULT_BATTERY_STATE]))
 
 
 def compute_frame_allocations(total_frame_time, ordered_track_ids, fixed_target_coeffs, battery_coeff_prev):
-    """Compute ``Score_n^k`` and ``t_n^k`` for one frame."""
+    """Compute per-frame allocations using battery coefficient only."""
     ordered_ids = [int(track_id) for track_id in ordered_track_ids or []]
     try:
         total_frame_time = max(0.0, float(total_frame_time))
@@ -135,9 +149,8 @@ def compute_frame_allocations(total_frame_time, ordered_track_ids, fixed_target_
 
     scores = {}
     for track_id in ordered_ids:
-        coeff_c = max(0.0, float((fixed_target_coeffs or {}).get(track_id, 1.0)))
-        coeff_b = max(0.0, float((battery_coeff_prev or {}).get(track_id, BATTERY_COEFF_MAP[DEFAULT_BATTERY_STATE])))
-        scores[track_id] = coeff_b * coeff_c
+        coeff_b = max(0.0, float((battery_coeff_prev or {}).get(track_id, led_state_to_battery_coeff(DEFAULT_BATTERY_STATE))))
+        scores[track_id] = coeff_b
 
     score_sum = sum(scores.values())
     allocations = {}
@@ -172,6 +185,19 @@ def sample_or_update_battery_state_for_target(track_id, previous_state, sampled_
         next_state = prev_canonical
         valid = False
         reason = "missing_or_invalid"
+    elif prev_canonical in BATTERY_BITS_COEFF_MAP and sampled_canonical in BATTERY_BITS_COEFF_MAP:
+        prev_stage = int(prev_canonical, 2)
+        sampled_stage = int(sampled_canonical, 2)
+        if sampled_stage > prev_stage:
+            next_state = prev_canonical
+            valid = False
+            reason = "blocked_increasing_bit_transition"
+        elif (prev_stage - sampled_stage) > 1:
+            next_state = prev_canonical
+            valid = False
+            reason = "blocked_non_adjacent_bit_transition"
+        else:
+            next_state = sampled_canonical
     elif prev_canonical == "G" and sampled_canonical == "R":
         next_state = prev_canonical
         valid = False
@@ -249,11 +275,6 @@ class ProposedScheduler(SchedulingAlgorithm):
         initial_led_states=None,
     ):
         ordered_ids = [int(track_id) for track_id in ordered_track_ids or []]
-        coeff_bundle = initialize_fixed_target_coeffs_from_csv(
-            csv_path=csv_path,
-            track_id_members=track_id_members,
-            ordered_track_ids=ordered_ids,
-        )
         battery_state_prev = {}
         battery_coeff_prev = {}
         initial_led_states = dict(initial_led_states or {})
@@ -266,9 +287,9 @@ class ProposedScheduler(SchedulingAlgorithm):
             "frame_index": 1,
             "total_frame_time": float(max(0.0, float(total_frame_time))),
             "execution_order": ordered_ids,
-            "fixed_target_coeffs": dict(coeff_bundle["normalized"]),
-            "fixed_target_raw_coeffs": dict(coeff_bundle["raw"]),
-            "mean_field_name": coeff_bundle.get("mean_field"),
+            "fixed_target_coeffs": {},
+            "fixed_target_raw_coeffs": {},
+            "mean_field_name": None,
             "battery_state_prev": battery_state_prev,
             "battery_coeff_prev": battery_coeff_prev,
             "battery_state_next": {},
@@ -304,16 +325,20 @@ class ProposedScheduler(SchedulingAlgorithm):
         }
 
     @staticmethod
-    def get_sampling_elapsed(allocation_s):
-        """Return when to sample within the slice, measured from slice start."""
+    def get_sampling_elapsed_points(allocation_s, interval_s=10.0):
+        """Return repeated sampling points within the slice, measured from slice start."""
         try:
             allocation_s = max(0.0, float(allocation_s))
         except Exception:
             allocation_s = 0.0
-        if allocation_s <= 0.0:
-            return None
-        lead_time = 10.0 if allocation_s >= 10.0 else (allocation_s * 0.1)
-        return max(0.0, allocation_s - lead_time)
+        try:
+            interval_s = max(0.0, float(interval_s))
+        except Exception:
+            interval_s = 0.0
+        if allocation_s <= 0.0 or interval_s <= 0.0:
+            return []
+        sample_count = int(allocation_s // interval_s)
+        return [interval_s * float(i) for i in range(1, sample_count + 1)]
 
     def sample_or_update_battery_state_for_target(self, state, track_id, sampled_state):
         previous_state = dict(state.get("battery_state_prev", {}) or {}).get(track_id, DEFAULT_BATTERY_STATE)
@@ -330,10 +355,9 @@ class ProposedScheduler(SchedulingAlgorithm):
         execution_order = list(state.get("execution_order", ()))
         print(
             f"[Scheduling-Proposed] Frame {frame_index} "
-            f"order={execution_order} mean_field={state.get('mean_field_name') or 'fallback'}"
+            f"order={execution_order} battery_only=1"
         )
         for track_id in execution_order:
-            coeff_c = float((state.get("fixed_target_coeffs", {}) or {}).get(track_id, 1.0))
             prev_state = str((state.get("battery_state_prev", {}) or {}).get(track_id, DEFAULT_BATTERY_STATE))
             prev_coeff = float((state.get("battery_coeff_prev", {}) or {}).get(track_id, led_state_to_battery_coeff(prev_state)))
             score = float((state.get("frame_scores", {}) or {}).get(track_id, 0.0))
@@ -342,11 +366,10 @@ class ProposedScheduler(SchedulingAlgorithm):
             next_coeff = float((state.get("battery_coeff_next", {}) or {}).get(track_id, led_state_to_battery_coeff(next_state)))
             print(
                 "[Scheduling-Proposed] frame={frame} track_id={track} "
-                "C_n={coeff_c:.6f} prev_state={prev_state} prev_B={prev_coeff:.2f} "
+                "prev_state={prev_state} prev_B={prev_coeff:.3f} "
                 "score={score:.6f} alloc={alloc:.3f}s next_state={next_state} next_B={next_coeff:.2f}".format(
                     frame=frame_index,
                     track=int(track_id),
-                    coeff_c=coeff_c,
                     prev_state=prev_state,
                     prev_coeff=prev_coeff,
                     score=score,
@@ -359,6 +382,7 @@ class ProposedScheduler(SchedulingAlgorithm):
 
 __all__ = [
     "BATTERY_COEFF_MAP",
+    "BATTERY_BITS_COEFF_MAP",
     "DEFAULT_BATTERY_STATE",
     "DEFAULT_MEAN_FIELD_CANDIDATES",
     "ProposedScheduler",
