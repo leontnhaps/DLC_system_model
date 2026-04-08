@@ -16,7 +16,9 @@ from led_filter import (
     classify_from_single_roi,
     expand_led_roi_from_bbox,
     get_default_led_filter_params,
+    led_score_to_bits,
 )
+from yolo_utils import non_max_suppression
 
 
 # ========== Constants ==========
@@ -60,6 +62,7 @@ FINAL_TILT_APPROACH_UP_DEG = 1.0      #   tilt+1
 FINAL_PAN_APPROACH_RIGHT_DEG = 1.0    # scheduling test: pan+1 -> final
 FINAL_PAN_ONLY_APPROACH_WAIT_S = 0.3  # scheduling test: tilt return hold before pan return
 PHASE23_CENTER_ROI_SIZE_PX = 800      # 화면 중심 기준 Phase 2/3 유효 객체 ROI (x축 폭)
+POINTING_SCAN_PAN_MARGIN_DEG = 40.0
 
 
 class PointingHandlerMixin:
@@ -74,7 +77,7 @@ class PointingHandlerMixin:
         return self._quantize_deg(pan), self._quantize_deg(tilt)
 
     @staticmethod
-    def _expand_loaded_led_roi_x(roi, source_size, width_scale=1.3):
+    def _expand_loaded_led_roi_x(roi, source_size, width_scale=1.5):
         """Expand a persisted LED ROI only when loading it from CSV."""
         if roi is None:
             return None
@@ -149,6 +152,7 @@ class PointingHandlerMixin:
 
         zero_state = {
             "pred": "NONE",
+            "bits": "000",
             "score": {"R": 0, "G": 0, "B": 0},
         }
         roi = (getattr(self, "_track_led_roi", {}) or {}).get(track_id)
@@ -173,7 +177,6 @@ class PointingHandlerMixin:
             return dict(zero_state)
 
         led_params = dict(getattr(self, "led_filter_params", None) or get_default_led_filter_params())
-        led_params["rg_min"] = 170
         led_params["min_pixels"] = 50
 
         pred, score, roi_used = classify_from_single_roi(
@@ -181,6 +184,7 @@ class PointingHandlerMixin:
             roi,
             params=led_params,
         )
+        bit_result = led_score_to_bits(score, threshold=led_params.get("min_pixels", 0))
         if max(int(score["R"]), int(score["G"]), int(score["B"])) < int(led_params["min_pixels"]):
             pred = "R"
         if roi_used is not None:
@@ -189,6 +193,7 @@ class PointingHandlerMixin:
 
         final_state = {
             "pred": str(pred),
+            "bits": str(bit_result["bits"]),
             "score": {
                 "R": int(score["R"]),
                 "G": int(score["G"]),
@@ -198,6 +203,7 @@ class PointingHandlerMixin:
         self._track_final_led_state[track_id] = final_state
         self._last_object_led_info = {
             "pred": final_state["pred"],
+            "bits": final_state["bits"],
             "score": dict(final_state["score"]),
             "roi": tuple(int(v) for v in (roi_used or roi)),
         }
@@ -238,6 +244,7 @@ class PointingHandlerMixin:
                 "final_led_roi_src_w",
                 "final_led_roi_src_h",
                 "final_led_pred",
+                "final_led_bits",
                 "final_led_r_score",
                 "final_led_g_score",
                 "final_led_b_score",
@@ -277,11 +284,13 @@ class PointingHandlerMixin:
                 if final_led_state:
                     score = dict(final_led_state.get("score") or {})
                     row["final_led_pred"] = str(final_led_state.get("pred", "NONE"))
+                    row["final_led_bits"] = str(final_led_state.get("bits", "000"))
                     row["final_led_r_score"] = str(int(score.get("R", 0)))
                     row["final_led_g_score"] = str(int(score.get("G", 0)))
                     row["final_led_b_score"] = str(int(score.get("B", 0)))
                 else:
                     row["final_led_pred"] = ""
+                    row["final_led_bits"] = ""
                     row["final_led_r_score"] = ""
                     row["final_led_g_score"] = ""
                     row["final_led_b_score"] = ""
@@ -313,7 +322,8 @@ class PointingHandlerMixin:
                 f"[Pointing] Final target saved to CSV: UI track {track_id} -> CSV IDs {target_ids}, "
                 f"pan={pan_q:.1f}, tilt={tilt_q:.1f}, "
                 f"roi={'set' if final_led_roi is not None else 'none'}, "
-                f"led={final_led_state.get('pred', 'none') if final_led_state else 'none'}, "
+                f"led={final_led_state.get('pred', 'none') if final_led_state else 'none'}/"
+                f"{final_led_state.get('bits', '000') if final_led_state else '000'}, "
                 f"phase3_score={'set' if final_phase3_response else 'none'}"
             )
             return True
@@ -423,6 +433,9 @@ class PointingHandlerMixin:
                                 persisted_phase3_scores[track_id] = score_data
                         if track_id not in persisted_final_led_states:
                             led_pred = str(d.get("final_led_pred", "") or "").strip()
+                            led_bits = str(d.get("final_led_bits", "") or "").strip()
+                            if 1 <= len(led_bits) <= 3 and all(ch in "01" for ch in led_bits):
+                                led_bits = led_bits.zfill(3)
                             score_data = {}
                             for key, field in (
                                 ("R", "final_led_r_score"),
@@ -436,9 +449,10 @@ class PointingHandlerMixin:
                                     score_data[key] = int(float(raw_val))
                                 except Exception:
                                     pass
-                            if led_pred or score_data:
+                            if led_pred or led_bits or score_data:
                                 persisted_final_led_states[track_id] = {
                                     "pred": led_pred or "NONE",
+                                    "bits": led_bits or "000",
                                     "score": {
                                         "R": int(score_data.get("R", 0)),
                                         "G": int(score_data.get("G", 0)),
@@ -501,6 +515,33 @@ class PointingHandlerMixin:
             if W_frame is None or H_frame is None:
                 print("[Pointing] CSVW/H  ")
                 return
+
+            pan_range_candidates = []
+            try:
+                if hasattr(self, "scan_tab"):
+                    pan_range_candidates.extend([
+                        float(self.scan_tab.pan_min.get()),
+                        float(self.scan_tab.pan_max.get()),
+                    ])
+            except Exception:
+                pass
+            try:
+                observed_pans = [float(row["pan"]) for row in rows]
+                if observed_pans:
+                    pan_range_candidates.extend([min(observed_pans), max(observed_pans)])
+            except Exception:
+                pass
+
+            allowed_pan_min = None
+            allowed_pan_max = None
+            if pan_range_candidates:
+                allowed_pan_min = min(pan_range_candidates) - float(POINTING_SCAN_PAN_MARGIN_DEG)
+                allowed_pan_max = max(pan_range_candidates) + float(POINTING_SCAN_PAN_MARGIN_DEG)
+                print(
+                    f"[Pointing] Scan pan filter enabled: "
+                    f"{allowed_pan_min:.1f} <= pan <= {allowed_pan_max:.1f} "
+                    f"(margin={POINTING_SCAN_PAN_MARGIN_DEG:.1f})"
+                )
             
             # Track ID 
             grouped_by_track = defaultdict(list)
@@ -620,6 +661,21 @@ class PointingHandlerMixin:
                     self._pointing_csv_track_ids[track_id] = (track_id,)
                 else:
                     print(f"[Pointing] track_id={track_id}   (insufficient data)")
+
+            if allowed_pan_min is not None and allowed_pan_max is not None:
+                excluded_targets = []
+                for track_id, (pan_q, tilt_q) in list(self.computed_targets.items()):
+                    if allowed_pan_min <= float(pan_q) <= allowed_pan_max:
+                        continue
+                    excluded_targets.append((int(track_id), float(pan_q), float(tilt_q)))
+                    self.computed_targets.pop(track_id, None)
+                    self._pointing_gains.pop(track_id, None)
+                    self._pointing_csv_track_ids.pop(track_id, None)
+                for track_id, pan_q, tilt_q in excluded_targets:
+                    print(
+                        f"[Pointing] Excluded track_id={track_id} outside scan pan window: "
+                        f"pan={pan_q:.1f}, tilt={tilt_q:.1f}"
+                    )
             
             #  : 5   ID
             MERGE_TOL = 5.0  # deg
@@ -636,6 +692,21 @@ class PointingHandlerMixin:
                 self.computed_targets = merged['targets']
                 self._pointing_gains = merged['gains']
                 self._pointing_csv_track_ids = merged.get('members', {})
+
+            if allowed_pan_min is not None and allowed_pan_max is not None:
+                excluded_targets = []
+                for track_id, (pan_q, tilt_q) in list(self.computed_targets.items()):
+                    if allowed_pan_min <= float(pan_q) <= allowed_pan_max:
+                        continue
+                    excluded_targets.append((int(track_id), float(pan_q), float(tilt_q)))
+                    self.computed_targets.pop(track_id, None)
+                    self._pointing_gains.pop(track_id, None)
+                    self._pointing_csv_track_ids.pop(track_id, None)
+                for track_id, pan_q, tilt_q in excluded_targets:
+                    print(
+                        f"[Pointing] Excluded merged track_id={track_id} outside scan pan window: "
+                        f"pan={pan_q:.1f}, tilt={tilt_q:.1f}"
+                    )
 
             # TrackLED ROI (CSVled_roi_*  
             #   track_id , trackROI 
@@ -678,6 +749,7 @@ class PointingHandlerMixin:
                 if persisted_led_state is not None:
                     track_final_led_state[int(tid)] = {
                         "pred": str(persisted_led_state.get("pred", "NONE")),
+                        "bits": str(persisted_led_state.get("bits", "000")),
                         "score": {
                             "R": int((persisted_led_state.get("score") or {}).get("R", 0)),
                             "G": int((persisted_led_state.get("score") or {}).get("G", 0)),
@@ -1005,6 +1077,9 @@ class PointingHandlerMixin:
 
         if hasattr(self, '_aiming_active') and self._aiming_active:
             print("[Pointing]   .  .")
+            return False
+        if getattr(self, "_led_test_active", False):
+            print("[Pointing] LED Test 실행 중에는 Start Aiming을 시작할 수 없습니다.")
             return False
 
         pan_t, tilt_t = self.computed_targets[track_id]
@@ -2447,13 +2522,31 @@ class PointingHandlerMixin:
         all_bboxes = []
         target_bbox = None
         target_center = None
-        self._last_object_led_info = {"pred": "NONE", "score": {"R": 0, "G": 0, "B": 0}, "roi": None}
+        self._last_object_led_info = {"pred": "NONE", "bits": "000", "score": {"R": 0, "G": 0, "B": 0}, "roi": None}
 
         H, W = diff.shape[:2]
         center_x, center_y = W // 2, H // 2
 
         # 3) conf>=0.5    ( )
         use_results = [r for r in results if len(r) >= 6 and float(r[4]) >= 0.5] or results
+        if use_results:
+            try:
+                nms_boxes = []
+                nms_scores = []
+                for r in use_results:
+                    x1, y1, x2, y2, conf, _cls_id = r
+                    nms_boxes.append([
+                        float(x1),
+                        float(y1),
+                        max(0.0, float(x2) - float(x1)),
+                        max(0.0, float(y2) - float(y1)),
+                    ])
+                    nms_scores.append(float(conf))
+                keep_indices = list(non_max_suppression(nms_boxes, nms_scores, iou_threshold=0.6))
+                if keep_indices:
+                    use_results = [use_results[int(i)] for i in keep_indices]
+            except Exception:
+                pass
         led_params = getattr(self, "led_filter_params", None) or get_default_led_filter_params()
         candidates = []
 
@@ -2479,6 +2572,7 @@ class PointingHandlerMixin:
                 led_roi_seed,
                 params=led_params,
             )
+            led_bits = led_score_to_bits(led_score, threshold=led_params.get("min_pixels", 0))["bits"]
             led_strength = max(int(led_score["R"]), int(led_score["G"]), int(led_score["B"]))
             candidates.append({
                 "bbox": bbox,
@@ -2486,6 +2580,7 @@ class PointingHandlerMixin:
                 "dist": dist,
                 "in_selection_roi": self._point_in_box(cx, cy, selection_roi_box),
                 "led_pred": led_pred,
+                "led_bits": led_bits,
                 "led_score": led_score,
                 "led_roi": led_roi,
                 "led_strength": led_strength,
@@ -2504,6 +2599,7 @@ class PointingHandlerMixin:
                 target_center = best["center"]
                 self._last_object_led_info = {
                     "pred": best["led_pred"],
+                    "bits": best["led_bits"],
                     "score": dict(best["led_score"]),
                     "roi": best["led_roi"],
                 }
@@ -2526,7 +2622,7 @@ class PointingHandlerMixin:
                         cx = x + w / 2.0
                         cy = y + h / 2.0
                         all_bboxes = [(int(x), int(y), int(w), int(h))]
-                        self._last_object_led_info = {"pred": "NONE", "score": {"R": 0, "G": 0, "B": 0}, "roi": None}
+                        self._last_object_led_info = {"pred": "NONE", "bits": "000", "score": {"R": 0, "G": 0, "B": 0}, "roi": None}
                         if selection_roi_box is not None and not self._point_in_box(cx, cy, selection_roi_box):
                             return None, None, None, all_bboxes
                         return cx, cy, (int(x), int(y), int(w), int(h)), all_bboxes

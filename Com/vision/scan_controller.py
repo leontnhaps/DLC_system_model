@@ -16,6 +16,7 @@ from led_filter import (
     classify_from_single_roi,
     expand_led_roi_from_bbox,
     get_default_led_filter_params,
+    led_score_to_bits,
 )
 
 
@@ -169,12 +170,14 @@ class ScanController:
                                 led_roi_seed,
                                 params=self.led_filter_params,
                             )
+                            bit_result = led_score_to_bits(score, threshold=self.led_filter_params.get("min_pixels", 0))
                             if roi is None:
                                 rx = ry = rw = rh = 0
                             else:
                                 rx, ry, rw, rh = roi
                             led_infos.append({
                                 "pred": pred,
+                                "bits": bit_result["bits"],
                                 "r": int(score["R"]),
                                 "g": int(score["G"]),
                                 "b": int(score["B"]),
@@ -199,18 +202,18 @@ class ScanController:
                         if self.csv_writer:
                             for i, (x, y, w, h) in enumerate(boxes):
                                 led = led_infos[i] if i < len(led_infos) else {
-                                    "pred": "NONE", "r": 0, "g": 0, "b": 0,
+                                    "pred": "NONE", "bits": "000", "r": 0, "g": 0, "b": 0,
                                     "rx": 0, "ry": 0, "rw": 0, "rh": 0,
                                 }
                                 self.csv_writer.writerow([
                                     pan, tilt, x+w/2, y+h/2, w, h,
                                     float(scores[i]), int(classes[i]), W, H,
                                     track_ids[i],  # ⭐ track_id 추가
-                                    led["pred"], led["r"], led["g"], led["b"],
+                                    led["pred"], led["bits"], led["r"], led["g"], led["b"],
                                     led["rx"], led["ry"], led["rw"], led["rh"],
                                     "", "",
                                     "", "", "", "", "", "",
-                                    "", "", "", "",
+                                    "", "", "", "", "",
                                     "", "", "",
                                 ])
                                 self.detected_count += 1
@@ -253,12 +256,12 @@ class ScanController:
                 self.csv_writer.writerow([
                     "pan_deg", "tilt_deg", "cx", "cy", "w", "h",
                     "conf", "cls", "W", "H", "track_id",
-                    "led_pred", "led_r_score", "led_g_score", "led_b_score",
+                    "led_pred", "led_bits", "led_r_score", "led_g_score", "led_b_score",
                     "led_roi_x", "led_roi_y", "led_roi_w", "led_roi_h",
                     "final_pan_deg", "final_tilt_deg",
                     "final_led_roi_x", "final_led_roi_y", "final_led_roi_w", "final_led_roi_h",
                     "final_led_roi_src_w", "final_led_roi_src_h",
-                    "final_led_pred", "final_led_r_score", "final_led_g_score", "final_led_b_score",
+                    "final_led_pred", "final_led_bits", "final_led_r_score", "final_led_g_score", "final_led_b_score",
                     "final_phase3_response_mean", "final_phase3_response_core", "final_phase3_response_max",
                 ])
                 print(f"[ScanController] CSV created: {self.csv_path}")
