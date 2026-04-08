@@ -24,11 +24,6 @@ const double REF_VOLTAGE_mV = 1100.0;                    // INTERNAL 1.1V
 const long V_FULL_mV  = 4200;   // 4.2V
 const long V_EMPTY_mV = 3000;   // 3.0V
 
-// LED 구간
-const long V_LOW_mV = 3400;     // 3.0 ~ 3.4V -> RED
-const long V_MID_mV = 3800;     // 3.4 ~ 3.8V -> BLUE / 3.8 ~ 4.2V -> GREEN
-const long LED_HYS_mV = 30;     // 히스테리시스
-
 // =====================================================
 // 측정 / 저장 주기
 // =====================================================
@@ -44,17 +39,6 @@ const uint8_t  STEP_mV     = 5;
 // 헤더를 너무 자주 저장하면 특정 주소가 빨리 닳으므로
 // 60개 로그마다 한 번만 저장 (10초 * 60 = 10분)
 const uint8_t HEADER_SAVE_EVERY = 60;
-
-// =====================================================
-// 상태 정의
-// =====================================================
-enum LedState {
-  ST_RED = 0,
-  ST_BLUE,
-  ST_GREEN
-};
-
-LedState g_state = ST_RED;
 
 // =====================================================
 // EEPROM 헤더
@@ -132,11 +116,31 @@ void loadOrInitHeader() {
 
 // =====================================================
 // LED 제어
+// stage 0 = 111 (full), stage 7 = 000 (empty)
+// 실제 출력 bit는 [R,B,G] = [bit2, bit1, bit0]
 // =====================================================
-void setOneLed(LedState st) {
-  digitalWrite(PIN_LED_R, (st == ST_RED)   ? HIGH : LOW);
-  digitalWrite(PIN_LED_B, (st == ST_BLUE)  ? HIGH : LOW);
-  digitalWrite(PIN_LED_G, (st == ST_GREEN) ? HIGH : LOW);
+int batteryPercentTo3BitStage(int percent) {
+  if (percent < 0) percent = 0;
+  if (percent > 100) percent = 100;
+
+  if (percent <= 12) return 7;
+  if (percent <= 24) return 6;
+  if (percent <= 37) return 5;
+  if (percent <= 49) return 4;
+  if (percent <= 62) return 3;
+  if (percent <= 74) return 2;
+  if (percent <= 87) return 1;
+  return 0;
+}
+
+void setBatteryLedBits(int stage) {
+  if (stage < 0) stage = 0;
+  if (stage > 7) stage = 7;
+  int ledValue = 7 - stage;
+
+  digitalWrite(PIN_LED_R, (ledValue & 0b100) ? HIGH : LOW);
+  digitalWrite(PIN_LED_B, (ledValue & 0b010) ? HIGH : LOW);
+  digitalWrite(PIN_LED_G, (ledValue & 0b001) ? HIGH : LOW);
 }
 
 // =====================================================
@@ -175,26 +179,9 @@ int voltageToPercent(long vbat_mV) {
 // runningAvg_mV 기준으로 LED 표시
 // =====================================================
 void updateBatteryLed(long vbat_mV) {
-  if (g_state == ST_RED) {
-    if (vbat_mV >= (V_LOW_mV + LED_HYS_mV)) {
-      g_state = ST_BLUE;
-    }
-  }
-  else if (g_state == ST_BLUE) {
-    if (vbat_mV < (V_LOW_mV - LED_HYS_mV)) {
-      g_state = ST_RED;
-    }
-    else if (vbat_mV >= (V_MID_mV + LED_HYS_mV)) {
-      g_state = ST_GREEN;
-    }
-  }
-  else { // ST_GREEN
-    if (vbat_mV < (V_MID_mV - LED_HYS_mV)) {
-      g_state = ST_BLUE;
-    }
-  }
-
-  setOneLed(g_state);
+  int percent = voltageToPercent(vbat_mV);
+  int stage = batteryPercentTo3BitStage(percent);
+  setBatteryLedBits(stage);
 }
 
 // =====================================================
@@ -301,7 +288,7 @@ void setup() {
   pinMode(PIN_LED_B, OUTPUT);
   pinMode(PIN_LED_G, OUTPUT);
 
-  setOneLed(ST_RED);
+  setBatteryLedBits(7);
 
   Serial.begin(9600);
 

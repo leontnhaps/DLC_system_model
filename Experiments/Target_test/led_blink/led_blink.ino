@@ -14,22 +14,23 @@ int g_stage = 0;
 void setBatteryLedBits(int stage) {
   if (stage < 0) stage = 0;
   if (stage > 7) stage = 7;
+  int ledValue = 7 - stage;
 
-  digitalWrite(PIN_LED_R, (stage & 0b100) ? HIGH : LOW);
-  digitalWrite(PIN_LED_B, (stage & 0b010) ? HIGH : LOW);
-  digitalWrite(PIN_LED_G, (stage & 0b001) ? HIGH : LOW);
+  digitalWrite(PIN_LED_R, (ledValue & 0b100) ? HIGH : LOW);
+  digitalWrite(PIN_LED_B, (ledValue & 0b010) ? HIGH : LOW);
+  digitalWrite(PIN_LED_G, (ledValue & 0b001) ? HIGH : LOW);
 }
 
 const char* stageToBits(int stage) {
   switch (stage) {
-    case 0: return "000";
-    case 1: return "001";
-    case 2: return "010";
-    case 3: return "011";
-    case 4: return "100";
-    case 5: return "101";
-    case 6: return "110";
-    default: return "111";
+    case 0: return "111";
+    case 1: return "110";
+    case 2: return "101";
+    case 3: return "100";
+    case 4: return "011";
+    case 5: return "010";
+    case 6: return "001";
+    default: return "000";
   }
 }
 
