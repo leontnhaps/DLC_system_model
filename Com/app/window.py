@@ -16,14 +16,14 @@ from network import GuiCtrlClient, GuiImgClient, ui_q
 from event_handlers import EventHandlersMixin
 from pointing_handler import PointingHandlerMixin
 from app_helpers import AppHelpersMixin
-from ui_components import PreviewFrame, ScanTab, TestSettingsTab, PointingTab, SchedulingTab
+from ui_components import PreviewFrame, ScanTab, TestSettingsTab, PointingTab, SchedulingTab, LEDTestTab
 from scan_controller import ScanController
 from scheduling.proposed import ProposedScheduler, led_state_to_battery_coeff
 from scheduling.round_robin import RoundRobinScheduler
 from workflows.scan_workflow import ScanWorkflow
 from workflows.scheduling_workflow import SchedulingWorkflow
 from yolo_utils import YOLOProcessor
-from led_filter import classify_from_single_roi, get_default_led_filter_params
+from led_filter import classify_from_single_roi, expand_led_roi_from_bbox, get_default_led_filter_params, led_score_to_bits
 import threading
 
 ROUNDROBIN_T_FRAME_SEC_DEFAULT = 0.0
@@ -76,11 +76,13 @@ class ComApp(EventHandlersMixin, PointingHandlerMixin, AppHelpersMixin):
         tab_test = Frame(self.notebook)
         tab_pointing = Frame(self.notebook)
         tab_scheduling = Frame(self.notebook)
+        tab_led_test = Frame(self.notebook)
         
         self.notebook.add(tab_scan, text="Scan")
         self.notebook.add(tab_test, text="Test & Settings")
         self.notebook.add(tab_pointing, text="Pointing")
         self.notebook.add(tab_scheduling, text="Scheduling")
+        self.notebook.add(tab_led_test, text="LED Test")
         self._tab_index_pointing = 2
         
         # Initialize Tab Content
@@ -116,6 +118,16 @@ class ComApp(EventHandlersMixin, PointingHandlerMixin, AppHelpersMixin):
             "stop_scheduling": self.stop_scheduling,
         }
         self.scheduling_tab = SchedulingTab(tab_scheduling, scheduling_callbacks)
+
+        led_test_callbacks = {
+            "start_led_test": self.start_led_test,
+            "stop_led_test": self.stop_led_test,
+        }
+        self.led_test_tab = LEDTestTab(
+            tab_led_test,
+            led_test_callbacks,
+            initial_params=get_default_led_filter_params(),
+        )
         
         # pointing_handler에서 참조할 수 있도록 변수 연결
         self.point_csv_path = self.pointing_tab.point_csv_path
@@ -174,6 +186,12 @@ class ComApp(EventHandlersMixin, PointingHandlerMixin, AppHelpersMixin):
         self._track_final_led_state = {}  # {track_id: {"pred": str, "score": {"R":int,"G":int,"B":int}}}
         self._track_phase3_response = {}  # {track_id: {"mean": float, "core": float, "max": float}}
         self._scheduling_frame_debug = {}
+        self._led_test_active = False
+        self._led_test_thread = None
+        self._led_test_stop_event = threading.Event()
+        self._led_test_cached_roi = None
+        self._led_test_cached_bbox = None
+        self._led_test_cached_all_bboxes = []
         
         # Blocking snap wait state (Scheduling probe 등에서 사용)
         self._blocking_snap_lock = threading.Lock()
@@ -333,6 +351,9 @@ class ComApp(EventHandlersMixin, PointingHandlerMixin, AppHelpersMixin):
 
     def start_scan(self, params):
         """스캔 시작"""
+        if self._led_test_active:
+            self.info_label.config(text="⚠️ LED Test 실행 중에는 Scan을 시작할 수 없습니다.")
+            return
         # ⭐ 버튼 상태 변경 (Start -> Disabled, Stop -> Normal)
         self.scan_tab.set_scan_state(True)
         self._scan_done_pending = False
@@ -491,7 +512,7 @@ class ComApp(EventHandlersMixin, PointingHandlerMixin, AppHelpersMixin):
                 if remain <= 0:
                     print(f"[Scheduling] Snap timeout: {save_name}")
                     return None
-                if self._scheduling_stop_event.is_set():
+                if self._scheduling_stop_event.is_set() or self._led_test_stop_event.is_set():
                     return None
                 if self._blocking_snap_event.wait(timeout=min(0.1, remain)):
                     with self._blocking_snap_lock:
@@ -507,10 +528,361 @@ class ComApp(EventHandlersMixin, PointingHandlerMixin, AppHelpersMixin):
                 self._blocking_snap_data = None
                 self._blocking_snap_event.clear()
 
-    def _probe_led_state_for_track(self, track_id, probe_interval_s=2.0, timeout_s=10.0):
+    def _set_led_test_ui_state(self, is_running):
+        def _update():
+            if hasattr(self, "led_test_tab"):
+                self.led_test_tab.set_running_state(is_running)
+        self.root.after(0, _update)
+
+    def _set_led_test_status(self, text, fg="#333"):
+        def _update():
+            if hasattr(self, "led_test_tab"):
+                self.led_test_tab.update_status(text, fg=fg)
+        self.root.after(0, _update)
+
+    def _update_led_test_result(
+        self,
+        raw_score=None,
+        bits="000",
+        threshold=None,
+        roi=None,
+        legacy_pred="NONE",
+        preview_img=None,
+        status_text=None,
+        status_fg="#333",
+    ):
+        def _update():
+            if not hasattr(self, "led_test_tab"):
+                return
+            if status_text is not None:
+                self.led_test_tab.update_status(status_text, fg=status_fg)
+            self.led_test_tab.update_result(
+                raw_score=raw_score,
+                bits=bits,
+                threshold=threshold,
+                roi=roi,
+                legacy_pred=legacy_pred,
+            )
+            if preview_img is not None:
+                self.led_test_tab.show_preview(preview_img)
+        self.root.after(0, _update)
+
+    def _build_led_test_preview_image(self, img_bgr, bbox=None, roi=None, all_bboxes=None, bits="000", score=None):
+        if img_bgr is None or img_bgr.size == 0:
+            return np.zeros((300, 420, 3), dtype=np.uint8)
+
+        vis = img_bgr.copy()
+        h_img, w_img = vis.shape[:2]
+        center_x = w_img // 2
+        center_y = h_img // 2
+        cv2.drawMarker(vis, (center_x, center_y), (255, 255, 255), cv2.MARKER_CROSS, 36, 2)
+
+        for candidate in list(all_bboxes or []):
+            try:
+                x, y, w, h = [int(round(float(v))) for v in candidate]
+                cv2.rectangle(vis, (x, y), (x + w, y + h), (0, 200, 255), 2)
+            except Exception:
+                continue
+
+        if bbox is not None:
+            try:
+                x, y, w, h = [int(round(float(v))) for v in bbox]
+                cv2.rectangle(vis, (x, y), (x + w, y + h), (0, 255, 0), 3)
+            except Exception:
+                pass
+
+        if roi is not None:
+            try:
+                rx, ry, rw, rh = [int(round(float(v))) for v in roi]
+                cv2.rectangle(vis, (rx, ry), (rx + rw, ry + rh), (255, 255, 0), 3)
+            except Exception:
+                pass
+
+        # ROI가 잡힌 뒤에는 ROI 주변을 crop해서 확대된 preview로 표시한다.
+        preview = vis
+        if roi is not None:
+            try:
+                rx, ry, rw, rh = [int(round(float(v))) for v in roi]
+                cx = rx + (rw // 2)
+                cy = ry + (rh // 2)
+                half_w = max(140, int(round(rw * 2.2)))
+                half_h = max(110, int(round(rh * 2.2)))
+                x1 = max(0, cx - half_w)
+                x2 = min(w_img, cx + half_w)
+                y1 = max(0, cy - half_h)
+                y2 = min(h_img, cy + half_h)
+                if x2 > x1 and y2 > y1:
+                    preview = vis[y1:y2, x1:x2].copy()
+            except Exception:
+                preview = vis
+
+        return preview
+
+    def _capture_led_test_pair(self, led_value=255, led_settle_s=0.2):
+        ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        snap_on = f"led_test_on_{ts}.jpg"
+        snap_off = f"led_test_off_{ts}.jpg"
+
+        try:
+            self._call_on_ui_thread(lambda: self.set_ir_cut("night"), timeout=3.0)
+        except Exception:
+            pass
+
+        try:
+            self.ctrl.send({"cmd": "laser", "value": 0})
+            self.laser_state = False
+        except Exception:
+            pass
+
+        self._call_on_ui_thread(lambda v=int(led_value): self.set_led(v), timeout=3.0)
+        time.sleep(max(0.05, float(led_settle_s)))
+        img_on = self._blocking_snap_and_wait(
+            snap_on,
+            timeout=10.0,
+            shutter_speed=10000,
+            analogue_gain=1.0,
+        )
+
+        self._call_on_ui_thread(lambda: self.set_led(0), timeout=3.0)
+        time.sleep(max(0.05, float(led_settle_s)))
+        img_off = self._blocking_snap_and_wait(
+            snap_off,
+            timeout=10.0,
+            shutter_speed=10000,
+            analogue_gain=1.0,
+        )
+        return img_on, img_off
+
+    def _capture_scheduling_led_probe_pair(self, track_id, led_value=255, led_settle_s=0.2, timeout_s=10.0):
+        ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        snap_on = f"sched_led_on_id{track_id}_{ts}.jpg"
+        snap_off = f"sched_led_off_id{track_id}_{ts}.jpg"
+
+        self._call_on_ui_thread(lambda v=int(led_value): self.set_led(v), timeout=3.0)
+        time.sleep(max(0.05, float(led_settle_s)))
+        img_on = self._blocking_snap_and_wait(
+            snap_on,
+            timeout=max(0.2, float(timeout_s)),
+            shutter_speed=10000,
+            analogue_gain=1.0,
+        )
+
+        self._call_on_ui_thread(lambda: self.set_led(0), timeout=3.0)
+        time.sleep(max(0.05, float(led_settle_s)))
+        img_off = self._blocking_snap_and_wait(
+            snap_off,
+            timeout=max(0.2, float(timeout_s)),
+            shutter_speed=10000,
+            analogue_gain=1.0,
+        )
+        return img_on, img_off
+
+    def _capture_led_test_single(self):
+        ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        snap_name = f"led_test_single_{ts}.jpg"
+
+        try:
+            self._call_on_ui_thread(lambda: self.set_ir_cut("night"), timeout=3.0)
+        except Exception:
+            pass
+
+        try:
+            self.ctrl.send({"cmd": "laser", "value": 0})
+            self.laser_state = False
+        except Exception:
+            pass
+
+        try:
+            self._call_on_ui_thread(lambda: self.set_led(0), timeout=3.0)
+        except Exception:
+            pass
+
+        return self._blocking_snap_and_wait(
+            snap_name,
+            timeout=10.0,
+            shutter_speed=10000,
+            analogue_gain=1.0,
+        )
+
+    def start_led_test(self):
+        if self._led_test_active:
+            self._set_led_test_status("⚠️ LED Test already running", fg="orange")
+            return False
+        if self.scan_ctrl.is_active():
+            self._set_led_test_status("⚠️ Scan 실행 중에는 LED Test를 시작할 수 없습니다.", fg="orange")
+            return False
+        if self._scheduling_active:
+            self._set_led_test_status("⚠️ Scheduling 실행 중에는 LED Test를 시작할 수 없습니다.", fg="orange")
+            return False
+        if getattr(self, "_aiming_active", False):
+            self._set_led_test_status("⚠️ Pointing 실행 중에는 LED Test를 시작할 수 없습니다.", fg="orange")
+            return False
+
+        self._led_test_active = True
+        self._led_test_stop_event.clear()
+        self._led_test_cached_roi = None
+        self._led_test_cached_bbox = None
+        self._led_test_cached_all_bboxes = []
+        self._set_led_test_ui_state(True)
+        self._set_led_test_status("🔍 LED Test 시작...", fg="blue")
+        self._led_test_thread = threading.Thread(target=self._led_test_worker, daemon=True)
+        self._led_test_thread.start()
+        return True
+
+    def stop_led_test(self):
+        self._led_test_stop_event.set()
+        self._set_led_test_status("⛔ LED Test 중지 요청...", fg="red")
+        self._led_test_cached_roi = None
+        self._led_test_cached_bbox = None
+        self._led_test_cached_all_bboxes = []
+        try:
+            self._call_on_ui_thread(lambda: self.set_led(0), timeout=3.0)
+        except Exception:
+            pass
+        if not self._led_test_active:
+            self._set_led_test_ui_state(False)
+
+    def _led_test_worker(self):
+        final_message = "✅ LED Test 종료"
+        final_color = "green"
+        try:
+            while not self._led_test_stop_event.is_set():
+                params = dict(self._call_on_ui_thread(lambda: self.led_test_tab.get_filter_params(), timeout=2.0))
+                led_settle_s = float(self._call_on_ui_thread(lambda: self.scan_tab.led_settle.get(), timeout=2.0))
+
+                bbox = self._led_test_cached_bbox
+                all_bboxes = list(self._led_test_cached_all_bboxes or [])
+                roi = self._led_test_cached_roi
+                detected_this_cycle = False
+                img_off = None
+
+                if roi is None:
+                    img_on, img_off = self._capture_led_test_pair(led_value=255, led_settle_s=led_settle_s)
+                    if self._led_test_stop_event.is_set():
+                        break
+                    if img_on is None or img_off is None:
+                        self._update_led_test_result(
+                            raw_score={"R": 0, "G": 0, "B": 0},
+                            bits="000",
+                            threshold=params.get("min_pixels", 0),
+                            roi=None,
+                            legacy_pred="NONE",
+                            preview_img=np.zeros((300, 420, 3), dtype=np.uint8),
+                            status_text="⚠️ LED Test snap 실패, 재시도 중...",
+                            status_fg="orange",
+                        )
+                        time.sleep(0.5)
+                        continue
+                    obj_cx, obj_cy, bbox, all_bboxes = self._find_object_center(img_on, img_off, selection_roi_box=None)
+                    _ = (obj_cx, obj_cy)
+                    led_info = dict(getattr(self, "_last_object_led_info", {}) or {})
+                    roi = led_info.get("roi")
+                    if roi is None and bbox is not None:
+                        roi = expand_led_roi_from_bbox(bbox, img_off.shape, top_ratio=1.0 / 3.0)
+                    if bbox is not None and roi is not None:
+                        self._led_test_cached_bbox = tuple(int(v) for v in bbox)
+                        self._led_test_cached_all_bboxes = [tuple(int(v) for v in bb) for bb in (all_bboxes or [])]
+                        self._led_test_cached_roi = tuple(int(v) for v in roi)
+                        detected_this_cycle = True
+                else:
+                    img_off = self._capture_led_test_single()
+                    if self._led_test_stop_event.is_set():
+                        break
+                    if img_off is None:
+                        self._update_led_test_result(
+                            raw_score={"R": 0, "G": 0, "B": 0},
+                            bits="000",
+                            threshold=params.get("min_pixels", 0),
+                            roi=roi,
+                            legacy_pred="NONE",
+                            preview_img=np.zeros((300, 420, 3), dtype=np.uint8),
+                            status_text="⚠️ LED Test single snap 실패, 재시도 중...",
+                            status_fg="orange",
+                        )
+                        time.sleep(0.5)
+                        continue
+                    roi = tuple(int(v) for v in roi)
+                    if bbox is not None:
+                        bbox = tuple(int(v) for v in bbox)
+                    all_bboxes = [tuple(int(v) for v in bb) for bb in (all_bboxes or [])]
+
+                legacy_pred = "NONE"
+                score = {"R": 0, "G": 0, "B": 0}
+                bits = "000"
+                preview_img = self._build_led_test_preview_image(
+                    img_off,
+                    bbox=bbox,
+                    roi=roi,
+                    all_bboxes=all_bboxes,
+                    bits=bits,
+                    score=score,
+                )
+
+                if bbox is not None and roi is not None:
+                    legacy_pred, score, roi_used = classify_from_single_roi(img_off, roi, params=params)
+                    if roi_used is not None:
+                        roi = roi_used
+                        self._led_test_cached_roi = tuple(int(v) for v in roi_used)
+                    bit_result = led_score_to_bits(score, threshold=params.get("min_pixels", 0))
+                    bits = bit_result["bits"]
+                    preview_img = self._build_led_test_preview_image(
+                        img_off,
+                        bbox=bbox,
+                        roi=roi,
+                        all_bboxes=all_bboxes,
+                        bits=bits,
+                        score=score,
+                    )
+                    if detected_this_cycle:
+                        status_text = f"✅ Target detected, ROI locked | legacy={legacy_pred} | bits={bits}"
+                    else:
+                        status_text = f"✅ ROI reused | legacy={legacy_pred} | bits={bits}"
+                    status_fg = "green"
+                else:
+                    status_text = "⚠️ 타깃 검출 실패"
+                    status_fg = "orange"
+
+                self._update_led_test_result(
+                    raw_score=score,
+                    bits=bits,
+                    threshold=params.get("min_pixels", 0),
+                    roi=roi,
+                    legacy_pred=legacy_pred,
+                    preview_img=preview_img,
+                    status_text=status_text,
+                    status_fg=status_fg,
+                )
+
+                for _ in range(10):
+                    if self._led_test_stop_event.is_set():
+                        break
+                    time.sleep(0.1)
+        except Exception as e:
+            final_message = f"❌ LED Test failed: {e}"
+            final_color = "red"
+            print(f"[LED Test] Worker failed: {e}")
+        finally:
+            self._led_test_active = False
+            self._led_test_thread = None
+            self._led_test_stop_event.clear()
+            self._led_test_cached_roi = None
+            self._led_test_cached_bbox = None
+            self._led_test_cached_all_bboxes = []
+            try:
+                self._call_on_ui_thread(lambda: self.set_led(0), timeout=3.0)
+            except Exception:
+                pass
+            def _finalize_led_test_ui(msg=final_message, fg=final_color):
+                if hasattr(self, "led_test_tab"):
+                    self.led_test_tab.set_running_state(False)
+                    self.led_test_tab.update_status(msg, fg=fg)
+            self.root.after(0, _finalize_led_test_ui)
+
+    def _probe_led_state_for_track(self, track_id, probe_interval_s=2.0, timeout_s=10.0, return_bits=False, refresh_roi=False):
         """
         Scheduling shoot loop 중 K초 주기 LED 상태 프로브.
-        LED ON/OFF 없이, 저장된 ROI에서 단일 프레임으로 LED 상태를 판정한다.
+        기본은 저장된 ROI에서 단일 프레임으로 LED 상태를 판정한다.
+        Proposed sampling에서는 LED ON/OFF pair로 객체를 다시 찾고 ROI를 재생성할 수 있다.
         카메라 모드는 shoot loop의 현재 상태를 그대로 유지한다.
         """
         ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
@@ -518,52 +890,101 @@ class ComApp(EventHandlersMixin, PointingHandlerMixin, AppHelpersMixin):
 
         preview_was_on = bool(self._call_on_ui_thread(lambda: self.preview_active, timeout=2.0))
         pred = "NONE"
+        bits = "000"
         score = {"R": 0, "G": 0, "B": 0}
         roi = None
         try:
-            roi = self._track_led_roi.get(track_id)
-            if roi is None:
-                print(f"[Scheduling] LED probe skipped (ID {track_id}): no stored ROI")
-                return "NONE"
-
             img = self._blocking_snap_and_wait(
                 snap_name,
                 timeout=max(0.2, float(timeout_s)),
                 shutter_speed=10000,
                 analogue_gain=None,
-            )
-            if img is None:
-                return "NONE"
+            ) if not refresh_roi else None
 
             scheduling_led_params = dict(getattr(self, "led_filter_params", None) or get_default_led_filter_params())
-            scheduling_led_params["rg_min"] = 170
             scheduling_led_params["min_pixels"] = 50
 
-            pred, score, roi_used = classify_from_single_roi(
-                img,
-                roi,
-                params=scheduling_led_params,
-            )
-            if max(int(score["R"]), int(score["G"]), int(score["B"])) < int(scheduling_led_params["min_pixels"]):
-                pred = "R"
-            if roi_used is not None:
-                self._track_led_roi[track_id] = tuple(int(v) for v in roi_used)
-                self._track_led_roi_source_size[track_id] = (int(img.shape[1]), int(img.shape[0]))
-            roi = roi_used
+            if refresh_roi:
+                try:
+                    led_settle_s = float(getattr(self.scan_tab, "led_settle", None).get())
+                except Exception:
+                    led_settle_s = 0.2
+                pair_timeout = max(0.2, min(float(timeout_s), 10.0))
+                img_on, img_off = self._capture_scheduling_led_probe_pair(
+                    track_id,
+                    led_value=255,
+                    led_settle_s=led_settle_s,
+                    timeout_s=pair_timeout,
+                )
+                if img_on is None or img_off is None:
+                    return "NONE"
+                _obj_cx, _obj_cy, bbox, _all_bboxes = self._find_object_center(
+                    img_on,
+                    img_off,
+                    selection_roi_box=None,
+                )
+                if bbox is None:
+                    print(f"[Scheduling] LED probe skipped (ID {track_id}): no detected object for ROI refresh")
+                    return "NONE"
+                led_roi_seed = expand_led_roi_from_bbox(
+                    bbox,
+                    img_off.shape,
+                    top_ratio=1.0 / 3.0,
+                )
+                if led_roi_seed is not None and hasattr(self, "_expand_loaded_led_roi_x"):
+                    led_roi_seed = self._expand_loaded_led_roi_x(
+                        led_roi_seed,
+                        (int(img_off.shape[1]), int(img_off.shape[0])),
+                    )
+                pred, score, roi_used = classify_from_single_roi(
+                    img_off,
+                    led_roi_seed,
+                    params=scheduling_led_params,
+                )
+                bit_result = led_score_to_bits(score, threshold=scheduling_led_params.get("min_pixels", 0))
+                bits = str(bit_result["bits"])
+                if max(int(score["R"]), int(score["G"]), int(score["B"])) < int(scheduling_led_params["min_pixels"]):
+                    pred = "R"
+                if roi_used is not None:
+                    self._track_led_roi[track_id] = tuple(int(v) for v in roi_used)
+                    self._track_led_roi_source_size[track_id] = (int(img_off.shape[1]), int(img_off.shape[0]))
+                roi = roi_used
+            else:
+                roi = self._track_led_roi.get(track_id)
+                if roi is None:
+                    print(f"[Scheduling] LED probe skipped (ID {track_id}): no stored ROI")
+                    return "NONE"
+                if img is None:
+                    return "NONE"
+
+                pred, score, roi_used = classify_from_single_roi(
+                    img,
+                    roi,
+                    params=scheduling_led_params,
+                )
+                bit_result = led_score_to_bits(score, threshold=scheduling_led_params.get("min_pixels", 0))
+                bits = str(bit_result["bits"])
+                if max(int(score["R"]), int(score["G"]), int(score["B"])) < int(scheduling_led_params["min_pixels"]):
+                    pred = "R"
+                if roi_used is not None:
+                    self._track_led_roi[track_id] = tuple(int(v) for v in roi_used)
+                    self._track_led_roi_source_size[track_id] = (int(img.shape[1]), int(img.shape[0]))
+                roi = roi_used
 
             self._scheduling_led_latest[track_id] = pred
             self._scheduling_led_history.append({
                 "ts": ts,
                 "track_id": int(track_id),
                 "pred": pred,
+                "bits": bits,
                 "r": int(score["R"]),
                 "g": int(score["G"]),
                 "b": int(score["B"]),
                 "roi": tuple(int(v) for v in roi) if roi is not None else None,
-                "mode": "single_roi",
+                "mode": "pair_refresh_roi" if refresh_roi else "single_roi",
                 "probe_interval_s": float(probe_interval_s),
             })
-            return pred
+            return bits if return_bits else pred
         except Exception as e:
             print(f"[Scheduling] LED probe failed (ID {track_id}): {e}")
             return "NONE"
@@ -868,6 +1289,9 @@ class ComApp(EventHandlersMixin, PointingHandlerMixin, AppHelpersMixin):
         if getattr(self, "_aiming_active", False):
             self._set_scheduling_status("⚠️ Pointing is running. Stop aiming first.", fg="orange")
             return False
+        if self._led_test_active:
+            self._set_scheduling_status("⚠️ LED Test is running. Stop LED Test first.", fg="orange")
+            return False
 
         self._scheduling_active = True
         self._scheduling_stop_event.clear()
@@ -1127,7 +1551,12 @@ class ComApp(EventHandlersMixin, PointingHandlerMixin, AppHelpersMixin):
                 final_led_state_map = dict(getattr(self, "_track_final_led_state", {}) or {})
                 for track_id in final_ids:
                     state_info = dict(final_led_state_map.get(track_id) or {})
-                    initial_led_states[track_id] = state_info.get("pred") or self._scheduling_led_latest.get(track_id)
+                    initial_led_states[track_id] = (
+                        state_info.get("bits")
+                        or state_info.get("pred")
+                        or self._scheduling_led_latest.get(track_id)
+                        or "000"
+                    )
                 proposed_state = active_scheduler.initialize_state(
                     total_frame_time=T_frame_sec,
                     ordered_track_ids=final_ids,
@@ -1142,7 +1571,7 @@ class ComApp(EventHandlersMixin, PointingHandlerMixin, AppHelpersMixin):
                     mode_label=mode_label,
                     execution_order=list(final_ids),
                     frame_allocations=dict(current_frame_allocations),
-                    fixed_target_coeffs=dict(frame_plan.get("fixed_target_coeffs") or {}),
+                    fixed_target_coeffs={},
                     battery_state_prev=dict(frame_plan.get("battery_state_prev") or {}),
                     battery_coeff_prev=dict(frame_plan.get("battery_coeff_prev") or {}),
                     frame_scores=dict(current_frame_scores),
@@ -1238,7 +1667,7 @@ class ComApp(EventHandlersMixin, PointingHandlerMixin, AppHelpersMixin):
                         mode_label=mode_label,
                         execution_order=list(final_ids),
                         frame_allocations=dict(current_frame_allocations),
-                        fixed_target_coeffs=dict(frame_plan.get("fixed_target_coeffs") or {}),
+                        fixed_target_coeffs={},
                         battery_state_prev=dict(frame_plan.get("battery_state_prev") or {}),
                         battery_coeff_prev=dict(frame_plan.get("battery_coeff_prev") or {}),
                         frame_scores=dict(current_frame_scores),
@@ -1346,23 +1775,22 @@ class ComApp(EventHandlersMixin, PointingHandlerMixin, AppHelpersMixin):
 
                     # Battery update/check는 slice budget 내부에서만 허용
                     next_probe_elapsed = led_probe_s if rr_battery_check_enabled else None
-                    sample_taken = False
-                    sample_elapsed = None
+                    proposed_sample_index = 0
+                    proposed_sample_elapsed_points = []
                     if is_proposed_mode and proposed_state is not None and isinstance(active_scheduler, ProposedScheduler):
-                        sample_elapsed = active_scheduler.get_sampling_elapsed(alloc_s)
+                        proposed_sample_elapsed_points = list(active_scheduler.get_sampling_elapsed_points(alloc_s, interval_s=10.0))
                     edge_eps = 1e-3  # 경계(시작/끝) 체크 제외용
                     while time.monotonic() < slice_end:
                         if self._scheduling_stop_event.is_set():
                             break
                         now = time.monotonic()
                         slice_elapsed = min(max(0.0, now - slice_start), alloc_s)
-                        if (
+                        while (
                             is_proposed_mode
                             and proposed_state is not None
                             and isinstance(active_scheduler, ProposedScheduler)
-                            and not sample_taken
-                            and sample_elapsed is not None
-                            and slice_elapsed >= sample_elapsed
+                            and proposed_sample_index < len(proposed_sample_elapsed_points)
+                            and slice_elapsed >= proposed_sample_elapsed_points[proposed_sample_index]
                         ):
                             remaining_for_probe = slice_end - time.monotonic()
                             sampled_led_state = None
@@ -1370,8 +1798,10 @@ class ComApp(EventHandlersMixin, PointingHandlerMixin, AppHelpersMixin):
                             if probe_timeout > 0.2:
                                 sampled_led_state = self._probe_led_state_for_track(
                                     track_id,
-                                    probe_interval_s=led_probe_s,
+                                    probe_interval_s=10.0,
                                     timeout_s=probe_timeout,
+                                    return_bits=True,
+                                    refresh_roi=True,
                                 )
                             update = active_scheduler.sample_or_update_battery_state_for_target(
                                 proposed_state,
@@ -1379,7 +1809,9 @@ class ComApp(EventHandlersMixin, PointingHandlerMixin, AppHelpersMixin):
                                 sampled_led_state,
                             )
                             self._scheduling_led_latest[track_id] = str(update.get("next_state", "NONE"))
-                            sample_taken = True
+                            proposed_sample_index += 1
+                            if probe_timeout <= 0.2:
+                                break
                         while (
                             rr_battery_check_enabled
                             and next_probe_elapsed is not None
@@ -1439,7 +1871,7 @@ class ComApp(EventHandlersMixin, PointingHandlerMixin, AppHelpersMixin):
                         is_proposed_mode
                         and proposed_state is not None
                         and isinstance(active_scheduler, ProposedScheduler)
-                        and not sample_taken
+                        and track_id not in dict(proposed_state.get("battery_state_next", {}) or {})
                     ):
                         update = active_scheduler.sample_or_update_battery_state_for_target(
                             proposed_state,

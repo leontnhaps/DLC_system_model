@@ -18,6 +18,10 @@ def route_saved_image(app, name: str, data: bytes) -> None:
     if hasattr(app, "_notify_blocking_snap_saved"):
         app._notify_blocking_snap_saved(name, data)
 
+    if name.startswith("led_test_"):
+        app._set_preview(data)
+        return
+
     if app.scan_ctrl.is_active():
         saved_path = app.scan_ctrl.save_image(name, data)
         if saved_path:
