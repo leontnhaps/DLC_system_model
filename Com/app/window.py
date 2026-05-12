@@ -97,6 +97,7 @@ class ComApp(EventHandlersMixin, PointingHandlerMixin, AppHelpersMixin):
             'set_led': self.set_led,
             'toggle_laser': self.toggle_laser,
             'toggle_preview': self.toggle_preview,
+            'set_preview_crosshair': self.set_preview_crosshair,
             'set_ir_cut': self.set_ir_cut,
             'snap_capture': self.snap_capture
         }
@@ -2014,6 +2015,11 @@ class ComApp(EventHandlersMixin, PointingHandlerMixin, AppHelpersMixin):
             self.info_label.config(text=f"✅ 프리뷰: {w}x{h}")
         else:
             self.info_label.config(text="⏸️ 프리뷰 중지")
+
+    def set_preview_crosshair(self, visible):
+        """Live Preview 중앙 십자가 표시 토글"""
+        if hasattr(self, "preview_frame") and hasattr(self.preview_frame, "set_crosshair_visible"):
+            self.preview_frame.set_crosshair_visible(bool(visible))
     
     def set_ir_cut(self, mode):
         """IR-CUT 모드 설정"""
