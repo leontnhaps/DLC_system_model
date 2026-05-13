@@ -143,5 +143,8 @@ Captures/
 captures_server_*
 Com_refactor/tests/_scratch/
 Captures/**
+!Captures/
+!Captures/Beam modeling/
+!Captures/Beam modeling/*.py
 *.csv
 *.jpg
