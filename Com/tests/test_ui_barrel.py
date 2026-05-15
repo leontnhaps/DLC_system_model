@@ -11,9 +11,10 @@ EXPECTED_IMPORTS = {
     "ui.test_settings_tab": ["TestSettingsTab"],
     "ui.pointing_tab": ["PointingTab"],
     "ui.scheduling_tab": ["SchedulingTab"],
+    "ui.led_test_tab": ["LEDTestTab"],
 }
 
-EXPECTED_EXPORTS = ["PreviewFrame", "ScanTab", "TestSettingsTab", "PointingTab", "SchedulingTab"]
+EXPECTED_EXPORTS = ["PreviewFrame", "ScanTab", "TestSettingsTab", "PointingTab", "SchedulingTab", "LEDTestTab"]
 
 
 class UIBarrelAstTest(unittest.TestCase):

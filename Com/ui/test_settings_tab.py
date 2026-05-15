@@ -41,6 +41,7 @@ class TestSettingsTab:
         self.preview_h = IntVar(value=480)
         self.preview_fps = IntVar(value=5)
         self.preview_q = IntVar(value=70)
+        self.preview_crosshair = BooleanVar(value=True)
         
         row = 0
         
@@ -87,6 +88,15 @@ class TestSettingsTab:
                    command=self._on_toggle)
         preview_check.grid(row=row, column=0, columnspan=2, sticky="w", pady=2)
         preview_check.deselect()  # 체크 해제
+        row += 1
+
+        crosshair_check = Checkbutton(
+            self.frame,
+            text="Center Crosshair",
+            variable=self.preview_crosshair,
+            command=self._on_crosshair_toggle,
+        )
+        crosshair_check.grid(row=row, column=0, columnspan=2, sticky="w", pady=2)
         row += 1
         
         # Preview Resolution Combobox
@@ -207,6 +217,10 @@ class TestSettingsTab:
     def _on_apply_preview_exposure(self):
         if self.preview_enable.get():
             self._on_toggle()
+
+    def _on_crosshair_toggle(self):
+        if self.callbacks.get('set_preview_crosshair'):
+            self.callbacks['set_preview_crosshair'](self.preview_crosshair.get())
     
     def _on_ir_cut(self, mode):
         if self.callbacks.get('set_ir_cut'):

@@ -13,6 +13,7 @@ class PreviewFrame:
         self.overlay_roi = None
         self.overlay_roi_source_size = None
         self.overlay_roi_label = "LED ROI"
+        self.show_crosshair = True
 
         self.frame = Frame(parent, width=width, height=height,
                           bg="#111", highlightthickness=1, highlightbackground="#333")
@@ -46,11 +47,12 @@ class PreviewFrame:
             cy = img.height // 2
             arm = max(8, min(img.width, img.height) // 30)
 
-            # High-contrast crosshair: black outline + white inner lines.
-            draw.line((cx - arm, cy, cx + arm, cy), fill="black", width=4)
-            draw.line((cx, cy - arm, cx, cy + arm), fill="black", width=4)
-            draw.line((cx - arm, cy, cx + arm, cy), fill="white", width=2)
-            draw.line((cx, cy - arm, cx, cy + arm), fill="white", width=2)
+            if self.show_crosshair:
+                # High-contrast crosshair: black outline + white inner lines.
+                draw.line((cx - arm, cy, cx + arm, cy), fill="black", width=4)
+                draw.line((cx, cy - arm, cx, cy + arm), fill="black", width=4)
+                draw.line((cx - arm, cy, cx + arm, cy), fill="white", width=2)
+                draw.line((cx, cy - arm, cx, cy + arm), fill="white", width=2)
 
             roi = self.overlay_roi
             if roi is not None:
@@ -109,3 +111,7 @@ class PreviewFrame:
         except Exception:
             self.overlay_roi_source_size = None
         self.overlay_roi_label = str(label or "LED ROI")
+
+    def set_crosshair_visible(self, visible=True):
+        """Toggle the center crosshair drawn on preview frames."""
+        self.show_crosshair = bool(visible)

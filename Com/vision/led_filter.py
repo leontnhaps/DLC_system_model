@@ -12,11 +12,11 @@ DEFAULT_LED_FILTER_PARAMS = {
     "g_min": 60,
     "b_min": 60,
     "rg_min": 10,
-    "rb_min": 100,
+    "rb_min": 10,
     "gr_min": 10,
     "gb_min": 10,
-    "br_min": 40,
-    "bg_min": 40,
+    "br_min": 10,
+    "bg_min": 10,
     "min_pixels": 50,
 }
 
@@ -24,6 +24,38 @@ DEFAULT_LED_FILTER_PARAMS = {
 def get_default_led_filter_params():
     """Return a copy of default LED filter params."""
     return dict(DEFAULT_LED_FILTER_PARAMS)
+
+
+def led_score_to_bits(score, threshold=0):
+    """
+    Convert per-channel raw scores into independent 3-bit LED states.
+
+    Bit order is fixed as ``R,B,G`` to match the target firmware mapping.
+    A channel is considered ON only when it is both positive and above the
+    configured threshold so that threshold=0 still keeps zero-count channels OFF.
+    """
+    raw = {
+        "R": max(0, int((score or {}).get("R", 0))),
+        "G": max(0, int((score or {}).get("G", 0))),
+        "B": max(0, int((score or {}).get("B", 0))),
+    }
+    try:
+        threshold = max(0, int(round(float(threshold))))
+    except Exception:
+        threshold = 0
+
+    states = {
+        "R": raw["R"] > 0 and raw["R"] >= threshold,
+        "B": raw["B"] > 0 and raw["B"] >= threshold,
+        "G": raw["G"] > 0 and raw["G"] >= threshold,
+    }
+    bits = f"{int(states['R'])}{int(states['B'])}{int(states['G'])}"
+    return {
+        "bits": bits,
+        "states": dict(states),
+        "threshold": int(threshold),
+        "raw": dict(raw),
+    }
 
 
 def expand_led_roi_from_bbox(bbox, img_shape, top_ratio=1.0 / 3.0):
@@ -128,6 +160,31 @@ def classify_from_on_off(img_on, img_off, bbox, params=None, top_ratio=1.0 / 3.0
     return pred, score, roi, on_counts, off_counts
 
 
+def classify_bits_from_on_off(img_on, img_off, bbox, params=None, top_ratio=1.0 / 3.0, threshold=None):
+    """
+    Classify LED bits using an ON/OFF pair on the expanded ROI.
+
+    Returns:
+      bits: "000" ~ "111"
+      score: {"R": int, "G": int, "B": int}
+      roi: (x, y, w, h) or None
+      states: {"R": bool, "B": bool, "G": bool}
+      on_counts/off_counts: original dominant-pixel counts
+    """
+    if params is None:
+        params = DEFAULT_LED_FILTER_PARAMS
+    pred, score, roi, on_counts, off_counts = classify_from_on_off(
+        img_on,
+        img_off,
+        bbox,
+        params=params,
+        top_ratio=top_ratio,
+    )
+    _ = pred  # legacy compatibility helper already computed this.
+    bit_result = led_score_to_bits(score, threshold=params.get("min_pixels", 0) if threshold is None else threshold)
+    return bit_result["bits"], score, roi, bit_result["states"], on_counts, off_counts
+
+
 def classify_from_single_roi(img_bgr, roi, params=None):
     """
     Classify LED color from a single frame using a precomputed ROI.
@@ -164,3 +221,20 @@ def classify_from_single_roi(img_bgr, roi, params=None):
     min_pixels = int(params.get("min_pixels", 0))
     pred = best_color if score[best_color] >= min_pixels else "NONE"
     return pred, score, roi_clamped
+
+
+def classify_bits_from_single_roi(img_bgr, roi, params=None, threshold=None):
+    """
+    Classify LED bits from a single frame using a precomputed ROI.
+
+    Returns:
+      bits: "000" ~ "111"
+      score: {"R": int, "G": int, "B": int}
+      roi_clamped: (x, y, w, h) or None
+      states: {"R": bool, "B": bool, "G": bool}
+    """
+    if params is None:
+        params = DEFAULT_LED_FILTER_PARAMS
+    _pred, score, roi_clamped = classify_from_single_roi(img_bgr, roi, params=params)
+    bit_result = led_score_to_bits(score, threshold=params.get("min_pixels", 0) if threshold is None else threshold)
+    return bit_result["bits"], score, roi_clamped, bit_result["states"]

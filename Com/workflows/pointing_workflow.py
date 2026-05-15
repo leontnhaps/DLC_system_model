@@ -16,7 +16,9 @@ from led_filter import (
     classify_from_single_roi,
     expand_led_roi_from_bbox,
     get_default_led_filter_params,
+    led_score_to_bits,
 )
+from yolo_utils import non_max_suppression
 
 
 # ========== Constants ==========
@@ -58,7 +60,9 @@ ROUGH_PHASE2_DROP_RATIO = 0.65        # /
 ROUGH_PHASE2_DROP_DELTA = 8.0         # -    
 FINAL_TILT_APPROACH_UP_DEG = 1.0      #   tilt+1  
 FINAL_PAN_APPROACH_RIGHT_DEG = 1.0    # scheduling test: pan+1 -> final
+FINAL_PAN_ONLY_APPROACH_WAIT_S = 0.3  # scheduling test: tilt return hold before pan return
 PHASE23_CENTER_ROI_SIZE_PX = 800      # 화면 중심 기준 Phase 2/3 유효 객체 ROI (x축 폭)
+POINTING_SCAN_PAN_MARGIN_DEG = 40.0
 
 
 class PointingHandlerMixin:
@@ -71,6 +75,34 @@ class PointingHandlerMixin:
 
     def _quantize_pan_tilt(self, pan, tilt):
         return self._quantize_deg(pan), self._quantize_deg(tilt)
+
+    @staticmethod
+    def _expand_loaded_led_roi_x(roi, source_size, width_scale=1.5):
+        """Expand a persisted LED ROI only when loading it from CSV."""
+        if roi is None:
+            return None
+        try:
+            x, y, w, h = [int(round(float(v))) for v in roi]
+        except Exception:
+            return None
+        if w <= 0 or h <= 0:
+            return None
+        try:
+            src_w, src_h = [int(round(float(v))) for v in source_size]
+        except Exception:
+            return (x, y, w, h)
+        if src_w <= 0 or src_h <= 0:
+            return (x, y, w, h)
+
+        expanded_w = max(1, int(round(w * float(width_scale))))
+        cx = x + (w / 2.0)
+        x1 = max(0, int(round(cx - (expanded_w / 2.0))))
+        x2 = min(src_w, int(round(cx + (expanded_w / 2.0))))
+        y1 = max(0, y)
+        y2 = min(src_h, y + h)
+        if x2 <= x1 or y2 <= y1:
+            return None
+        return (x1, y1, x2 - x1, y2 - y1)
 
     @staticmethod
     def _get_center_roi_box(shape, size_px=PHASE23_CENTER_ROI_SIZE_PX):
@@ -112,8 +144,73 @@ class PointingHandlerMixin:
             path = str(self.point_csv_path).strip()
         return path or None
 
+    def _capture_final_led_state_at_current_pose(self, track_id, label=None, led_settle=0.1):
+        """Measure LED state once more at the final current pose and cache it."""
+        final_led_states = dict(getattr(self, "_track_final_led_state", {}) or {})
+        final_led_states.pop(track_id, None)
+        self._track_final_led_state = final_led_states
+
+        zero_state = {
+            "pred": "NONE",
+            "bits": "000",
+            "score": {"R": 0, "G": 0, "B": 0},
+        }
+        roi = (getattr(self, "_track_led_roi", {}) or {}).get(track_id)
+        if roi is None:
+            self._track_final_led_state[track_id] = dict(zero_state)
+            return dict(zero_state)
+
+        try:
+            time.sleep(max(0.05, float(led_settle)))
+        except Exception:
+            pass
+
+        ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        snap_label = label or f"pointing_final_led_track{track_id}_{ts}"
+        img = self._snap_and_wait(
+            snap_label,
+            shutter_speed=10000,
+            analogue_gain=None,
+        )
+        if img is None:
+            self._track_final_led_state[track_id] = dict(zero_state)
+            return dict(zero_state)
+
+        led_params = dict(getattr(self, "led_filter_params", None) or get_default_led_filter_params())
+        led_params["min_pixels"] = 50
+
+        pred, score, roi_used = classify_from_single_roi(
+            img,
+            roi,
+            params=led_params,
+        )
+        bit_result = led_score_to_bits(score, threshold=led_params.get("min_pixels", 0))
+        if max(int(score["R"]), int(score["G"]), int(score["B"])) < int(led_params["min_pixels"]):
+            pred = "R"
+        if roi_used is not None:
+            self._track_led_roi[track_id] = tuple(int(v) for v in roi_used)
+            self._track_led_roi_source_size[track_id] = (int(img.shape[1]), int(img.shape[0]))
+
+        final_state = {
+            "pred": str(pred),
+            "bits": str(bit_result["bits"]),
+            "score": {
+                "R": int(score["R"]),
+                "G": int(score["G"]),
+                "B": int(score["B"]),
+            },
+        }
+        self._track_final_led_state[track_id] = final_state
+        self._last_object_led_info = {
+            "pred": final_state["pred"],
+            "bits": final_state["bits"],
+            "score": dict(final_state["score"]),
+            "roi": tuple(int(v) for v in (roi_used or roi)),
+        }
+        return dict(final_state)
+
     def _persist_final_target_to_csv(self, track_id, pan, tilt):
-        """Persist the final aimed pan/tilt and final LED ROI back into the scan CSV."""
+        """Persist the final aimed pan/tilt, LED ROI, LED state, and Phase 3 response back into the scan CSV."""
         path = self._get_pointing_csv_path()
         if not path or not os.path.exists(path):
             return False
@@ -123,6 +220,8 @@ class PointingHandlerMixin:
         pan_q, tilt_q = self._quantize_pan_tilt(pan, tilt)
         final_led_roi = (getattr(self, "_track_led_roi", {}) or {}).get(track_id)
         final_led_roi_source_size = (getattr(self, "_track_led_roi_source_size", {}) or {}).get(track_id)
+        final_led_state = dict((getattr(self, "_track_final_led_state", {}) or {}).get(track_id) or {})
+        final_phase3_response = dict((getattr(self, "_track_phase3_response", {}) or {}).get(track_id) or {})
 
         try:
             with open(path, newline="", encoding="utf-8") as f:
@@ -144,6 +243,14 @@ class PointingHandlerMixin:
                 "final_led_roi_h",
                 "final_led_roi_src_w",
                 "final_led_roi_src_h",
+                "final_led_pred",
+                "final_led_bits",
+                "final_led_r_score",
+                "final_led_g_score",
+                "final_led_b_score",
+                "final_phase3_response_mean",
+                "final_phase3_response_core",
+                "final_phase3_response_max",
             ):
                 if name not in fieldnames:
                     fieldnames.append(name)
@@ -174,6 +281,30 @@ class PointingHandlerMixin:
                 else:
                     row["final_led_roi_src_w"] = ""
                     row["final_led_roi_src_h"] = ""
+                if final_led_state:
+                    score = dict(final_led_state.get("score") or {})
+                    row["final_led_pred"] = str(final_led_state.get("pred", "NONE"))
+                    row["final_led_bits"] = str(final_led_state.get("bits", "000"))
+                    row["final_led_r_score"] = str(int(score.get("R", 0)))
+                    row["final_led_g_score"] = str(int(score.get("G", 0)))
+                    row["final_led_b_score"] = str(int(score.get("B", 0)))
+                else:
+                    row["final_led_pred"] = ""
+                    row["final_led_bits"] = ""
+                    row["final_led_r_score"] = ""
+                    row["final_led_g_score"] = ""
+                    row["final_led_b_score"] = ""
+                if final_phase3_response:
+                    mean_v = final_phase3_response.get("mean")
+                    core_v = final_phase3_response.get("core")
+                    max_v = final_phase3_response.get("max")
+                    row["final_phase3_response_mean"] = "" if mean_v is None else f"{float(mean_v):.6f}"
+                    row["final_phase3_response_core"] = "" if core_v is None else f"{float(core_v):.6f}"
+                    row["final_phase3_response_max"] = "" if max_v is None else f"{float(max_v):.6f}"
+                else:
+                    row["final_phase3_response_mean"] = ""
+                    row["final_phase3_response_core"] = ""
+                    row["final_phase3_response_max"] = ""
                 updated += 1
 
             if updated <= 0:
@@ -190,7 +321,10 @@ class PointingHandlerMixin:
             print(
                 f"[Pointing] Final target saved to CSV: UI track {track_id} -> CSV IDs {target_ids}, "
                 f"pan={pan_q:.1f}, tilt={tilt_q:.1f}, "
-                f"roi={'set' if final_led_roi is not None else 'none'}"
+                f"roi={'set' if final_led_roi is not None else 'none'}, "
+                f"led={final_led_state.get('pred', 'none') if final_led_state else 'none'}/"
+                f"{final_led_state.get('bits', '000') if final_led_state else '000'}, "
+                f"phase3_score={'set' if final_phase3_response else 'none'}"
             )
             return True
         except Exception as e:
@@ -238,6 +372,8 @@ class PointingHandlerMixin:
             persisted_targets = {}  # {track_id: (final_pan, final_tilt)}
             persisted_led_rois = {}  # {track_id: (x,y,w,h)}
             persisted_led_roi_source_sizes = {}  # {track_id: (W,H)}
+            persisted_final_led_states = {}  # {track_id: {"pred": str, "score": {...}}}
+            persisted_phase3_scores = {}  # {track_id: {"mean": float, "core": float, "max": float}}
             
             # CSV 
             with open(path, newline="", encoding="utf-8") as f:
@@ -267,13 +403,62 @@ class PointingHandlerMixin:
                                 frw = int(float(d.get("final_led_roi_w", "") or 0))
                                 frh = int(float(d.get("final_led_roi_h", "") or 0))
                                 if frw > 0 and frh > 0:
-                                    persisted_led_rois[track_id] = (frx, fry, frw, frh)
                                     src_w = int(float(d.get("final_led_roi_src_w", "") or (W or 0)))
                                     src_h = int(float(d.get("final_led_roi_src_h", "") or (H or 0)))
+                                    roi_loaded = self._expand_loaded_led_roi_x(
+                                        (frx, fry, frw, frh),
+                                        (src_w, src_h),
+                                    )
+                                    if roi_loaded is not None:
+                                        persisted_led_rois[track_id] = roi_loaded
                                     if src_w > 0 and src_h > 0:
                                         persisted_led_roi_source_sizes[track_id] = (src_w, src_h)
                             except Exception:
                                 pass
+                        if track_id not in persisted_phase3_scores:
+                            score_data = {}
+                            for key, field in (
+                                ("mean", "final_phase3_response_mean"),
+                                ("core", "final_phase3_response_core"),
+                                ("max", "final_phase3_response_max"),
+                            ):
+                                raw_val = d.get(field)
+                                if raw_val in ("", None):
+                                    continue
+                                try:
+                                    score_data[key] = float(raw_val)
+                                except Exception:
+                                    pass
+                            if score_data:
+                                persisted_phase3_scores[track_id] = score_data
+                        if track_id not in persisted_final_led_states:
+                            led_pred = str(d.get("final_led_pred", "") or "").strip()
+                            led_bits = str(d.get("final_led_bits", "") or "").strip()
+                            if 1 <= len(led_bits) <= 3 and all(ch in "01" for ch in led_bits):
+                                led_bits = led_bits.zfill(3)
+                            score_data = {}
+                            for key, field in (
+                                ("R", "final_led_r_score"),
+                                ("G", "final_led_g_score"),
+                                ("B", "final_led_b_score"),
+                            ):
+                                raw_val = d.get(field)
+                                if raw_val in ("", None):
+                                    continue
+                                try:
+                                    score_data[key] = int(float(raw_val))
+                                except Exception:
+                                    pass
+                            if led_pred or led_bits or score_data:
+                                persisted_final_led_states[track_id] = {
+                                    "pred": led_pred or "NONE",
+                                    "bits": led_bits or "000",
+                                    "score": {
+                                        "R": int(score_data.get("R", 0)),
+                                        "G": int(score_data.get("G", 0)),
+                                        "B": int(score_data.get("B", 0)),
+                                    },
+                                }
 
                     if d.get("conf", "") == "":
                         continue
@@ -315,7 +500,12 @@ class PointingHandlerMixin:
                         rw = int(float(d.get("led_roi_w", 0) or 0))
                         rh = int(float(d.get("led_roi_h", 0) or 0))
                         if rw > 0 and rh > 0:
-                            track_led_roi_samples[track_id].append((rx, ry, rw, rh))
+                            roi_loaded = self._expand_loaded_led_roi_x(
+                                (rx, ry, rw, rh),
+                                (W or 0, H or 0),
+                            )
+                            if roi_loaded is not None:
+                                track_led_roi_samples[track_id].append(roi_loaded)
                     except Exception:
                         pass
             
@@ -325,6 +515,33 @@ class PointingHandlerMixin:
             if W_frame is None or H_frame is None:
                 print("[Pointing] CSVW/H  ")
                 return
+
+            pan_range_candidates = []
+            try:
+                if hasattr(self, "scan_tab"):
+                    pan_range_candidates.extend([
+                        float(self.scan_tab.pan_min.get()),
+                        float(self.scan_tab.pan_max.get()),
+                    ])
+            except Exception:
+                pass
+            try:
+                observed_pans = [float(row["pan"]) for row in rows]
+                if observed_pans:
+                    pan_range_candidates.extend([min(observed_pans), max(observed_pans)])
+            except Exception:
+                pass
+
+            allowed_pan_min = None
+            allowed_pan_max = None
+            if pan_range_candidates:
+                allowed_pan_min = min(pan_range_candidates) - float(POINTING_SCAN_PAN_MARGIN_DEG)
+                allowed_pan_max = max(pan_range_candidates) + float(POINTING_SCAN_PAN_MARGIN_DEG)
+                print(
+                    f"[Pointing] Scan pan filter enabled: "
+                    f"{allowed_pan_min:.1f} <= pan <= {allowed_pan_max:.1f} "
+                    f"(margin={POINTING_SCAN_PAN_MARGIN_DEG:.1f})"
+                )
             
             # Track ID 
             grouped_by_track = defaultdict(list)
@@ -444,6 +661,21 @@ class PointingHandlerMixin:
                     self._pointing_csv_track_ids[track_id] = (track_id,)
                 else:
                     print(f"[Pointing] track_id={track_id}   (insufficient data)")
+
+            if allowed_pan_min is not None and allowed_pan_max is not None:
+                excluded_targets = []
+                for track_id, (pan_q, tilt_q) in list(self.computed_targets.items()):
+                    if allowed_pan_min <= float(pan_q) <= allowed_pan_max:
+                        continue
+                    excluded_targets.append((int(track_id), float(pan_q), float(tilt_q)))
+                    self.computed_targets.pop(track_id, None)
+                    self._pointing_gains.pop(track_id, None)
+                    self._pointing_csv_track_ids.pop(track_id, None)
+                for track_id, pan_q, tilt_q in excluded_targets:
+                    print(
+                        f"[Pointing] Excluded track_id={track_id} outside scan pan window: "
+                        f"pan={pan_q:.1f}, tilt={tilt_q:.1f}"
+                    )
             
             #  : 5   ID
             MERGE_TOL = 5.0  # deg
@@ -461,19 +693,49 @@ class PointingHandlerMixin:
                 self._pointing_gains = merged['gains']
                 self._pointing_csv_track_ids = merged.get('members', {})
 
+            if allowed_pan_min is not None and allowed_pan_max is not None:
+                excluded_targets = []
+                for track_id, (pan_q, tilt_q) in list(self.computed_targets.items()):
+                    if allowed_pan_min <= float(pan_q) <= allowed_pan_max:
+                        continue
+                    excluded_targets.append((int(track_id), float(pan_q), float(tilt_q)))
+                    self.computed_targets.pop(track_id, None)
+                    self._pointing_gains.pop(track_id, None)
+                    self._pointing_csv_track_ids.pop(track_id, None)
+                for track_id, pan_q, tilt_q in excluded_targets:
+                    print(
+                        f"[Pointing] Excluded merged track_id={track_id} outside scan pan window: "
+                        f"pan={pan_q:.1f}, tilt={tilt_q:.1f}"
+                    )
+
             # TrackLED ROI (CSVled_roi_*  
             #   track_id , trackROI 
             track_led_roi = {}
             track_led_roi_source_size = {}
+            track_final_led_state = {}
+            track_phase3_response = {}
             for tid in self.computed_targets.keys():
                 member_ids = tuple(int(v) for v in self._pointing_csv_track_ids.get(tid, (tid,)))
                 persisted_roi = None
                 persisted_size = None
+                persisted_led_state = None
+                persisted_score = None
                 for member_id in member_ids:
                     roi = persisted_led_rois.get(member_id)
                     if roi is not None:
                         persisted_roi = roi
                         persisted_size = persisted_led_roi_source_sizes.get(member_id)
+                    led_state = persisted_final_led_states.get(member_id)
+                    if led_state is not None and persisted_led_state is None:
+                        persisted_led_state = dict(led_state)
+                    score = persisted_phase3_scores.get(member_id)
+                    if score is not None and persisted_score is None:
+                        persisted_score = dict(score)
+                    if (
+                        persisted_roi is not None
+                        and persisted_score is not None
+                        and persisted_led_state is not None
+                    ):
                         break
                 if persisted_roi is not None:
                     track_led_roi[int(tid)] = tuple(int(v) for v in persisted_roi)
@@ -484,12 +746,23 @@ class PointingHandlerMixin:
                         )
                     else:
                         track_led_roi_source_size[int(tid)] = (int(W_frame), int(H_frame))
-                    continue
+                if persisted_led_state is not None:
+                    track_final_led_state[int(tid)] = {
+                        "pred": str(persisted_led_state.get("pred", "NONE")),
+                        "bits": str(persisted_led_state.get("bits", "000")),
+                        "score": {
+                            "R": int((persisted_led_state.get("score") or {}).get("R", 0)),
+                            "G": int((persisted_led_state.get("score") or {}).get("G", 0)),
+                            "B": int((persisted_led_state.get("score") or {}).get("B", 0)),
+                        },
+                    }
+                if persisted_score is not None:
+                    track_phase3_response[int(tid)] = persisted_score
 
                 samples = []
                 for member_id in member_ids:
                     samples.extend(track_led_roi_samples.get(member_id, []))
-                if not samples:
+                if persisted_roi is not None or not samples:
                     continue
                 arr = np.array(samples, dtype=float)
                 med = np.median(arr, axis=0)
@@ -499,6 +772,8 @@ class PointingHandlerMixin:
                     track_led_roi_source_size[int(tid)] = (int(W_frame), int(H_frame))
             self._track_led_roi = track_led_roi
             self._track_led_roi_source_size = track_led_roi_source_size
+            self._track_final_led_state = track_final_led_state
+            self._track_phase3_response = track_phase3_response
             # Renumber final track IDs to 1..N for UI consistency
             self._renumber_computed_targets()
             # UI  ( )
@@ -531,8 +806,12 @@ class PointingHandlerMixin:
         new_gains = {}
         old_rois = dict(getattr(self, "_track_led_roi", {}) or {})
         old_roi_sizes = dict(getattr(self, "_track_led_roi_source_size", {}) or {})
+        old_final_led_states = dict(getattr(self, "_track_final_led_state", {}) or {})
+        old_phase3_scores = dict(getattr(self, "_track_phase3_response", {}) or {})
         new_rois = {}
         new_roi_sizes = {}
+        new_final_led_states = {}
+        new_phase3_scores = {}
         old_csv_track_ids = dict(getattr(self, "_pointing_csv_track_ids", {}) or {})
         new_csv_track_ids = {}
 
@@ -545,12 +824,18 @@ class PointingHandlerMixin:
                 new_rois[new_id] = old_rois[old_id]
             if old_id in old_roi_sizes:
                 new_roi_sizes[new_id] = old_roi_sizes[old_id]
+            if old_id in old_final_led_states:
+                new_final_led_states[new_id] = dict(old_final_led_states[old_id])
+            if old_id in old_phase3_scores:
+                new_phase3_scores[new_id] = dict(old_phase3_scores[old_id])
             new_csv_track_ids[new_id] = tuple(old_csv_track_ids.get(old_id, (old_id,)))
 
         self.computed_targets = new_targets
         self._pointing_gains = new_gains
         self._track_led_roi = new_rois
         self._track_led_roi_source_size = new_roi_sizes
+        self._track_final_led_state = new_final_led_states
+        self._track_phase3_response = new_phase3_scores
         self._pointing_csv_track_ids = new_csv_track_ids
         print(f"[Pointing] ID renumbered: {id_map}")
     
@@ -793,6 +1078,9 @@ class PointingHandlerMixin:
         if hasattr(self, '_aiming_active') and self._aiming_active:
             print("[Pointing]   .  .")
             return False
+        if getattr(self, "_led_test_active", False):
+            print("[Pointing] LED Test 실행 중에는 Start Aiming을 시작할 수 없습니다.")
+            return False
 
         pan_t, tilt_t = self.computed_targets[track_id]
         pan_t, tilt_t = self._quantize_pan_tilt(pan_t, tilt_t)
@@ -949,14 +1237,17 @@ class PointingHandlerMixin:
         time.sleep(wait_s)
 
     def _apply_final_pan_tilt_approach(self, pan, tilt, settle_s=0.3):
-        """Scheduling test path: pan+1, tilt+1 -> final target."""
+        """Scheduling test path: pan+1,tilt+1 -> wait -> tilt-1 -> 0.3s -> pan-1."""
         pan_f = float(pan)
         tilt_f = float(tilt)
         pre_pan = pan_f + FINAL_PAN_APPROACH_RIGHT_DEG
         pre_tilt = max(-30.0, min(90.0, tilt_f + FINAL_TILT_APPROACH_UP_DEG))
+        pan_f, tilt_f = self._quantize_pan_tilt(pan_f, tilt_f)
         pre_pan, pre_tilt = self._quantize_pan_tilt(pre_pan, pre_tilt)
         wait_s = max(0.02, float(settle_s))
+        tilt_only_wait_s = max(0.02, float(FINAL_PAN_ONLY_APPROACH_WAIT_S))
 
+        # 1) pan+1, tilt+1에서 대기
         self.ctrl.send({
             "cmd": "move",
             "pan": pre_pan,
@@ -966,15 +1257,17 @@ class PointingHandlerMixin:
         })
         time.sleep(wait_s)
 
+        # 2) tilt만 최종값으로 먼저 복귀
         self.ctrl.send({
             "cmd": "move",
-            "pan": pan_f,
+            "pan": pre_pan,
             "tilt": tilt_f,
             "speed": 100,
             "acc": 1.0,
         })
+        time.sleep(tilt_only_wait_s)
 
-        # 2)  tilt
+        # 3) pan을 최종값으로 복귀
         self.ctrl.send({
             "cmd": "move",
             "pan": pan_f,
@@ -982,7 +1275,6 @@ class PointingHandlerMixin:
             "speed": 100,
             "acc": 1.0,
         })
-        time.sleep(wait_s)
 
     def _fine_aim_thread_adaptive(self, track_id):
         """
@@ -1033,50 +1325,88 @@ class PointingHandlerMixin:
                 print(f"\n[Pointing-Adaptive] ===== Iteration {iteration} / Phase {phase_name} =====")
                 self._update_aiming_status(track_id, iteration, f"Adaptive  {iteration} ({phase_name})")
 
-                # Step 1: YOLO   LED diff)
-                # LED  Normal(  
-                self.set_ir_cut("night")
-                time.sleep(0.05)
-                self.ctrl.send({"cmd": "led", "value": 255})
-                time.sleep(led_settle)
-                img_led_on = self._snap_and_wait(
-                    f"pointing_adaptive_led_on_{iteration}",
-                    shutter_speed=10000,
-                    analogue_gain=None,
-                )
-                if img_led_on is None:
+                # Step 1: YOLO detection from LED ON/OFF pair.
+                # Phase 1/2 both retry once if no object is detected for the required ROI.
+                img_led_on = None
+                img_led_off = None
+                obj_cx = obj_cy = None
+                bbox = None
+                all_bboxes = []
+                phase_center_roi_box = None
+                led_pair_capture_failed = False
+                for detect_try in range(2):
+                    snap_suffix = "" if detect_try == 0 else f"_retry{detect_try + 1}"
+
+                    self.set_ir_cut("night")
+                    time.sleep(0.05)
+                    self.ctrl.send({"cmd": "led", "value": 255})
+                    time.sleep(led_settle)
+                    img_led_on = self._snap_and_wait(
+                        f"pointing_adaptive_led_on_{iteration}{snap_suffix}",
+                        shutter_speed=10000,
+                        analogue_gain=None,
+                    )
+                    if img_led_on is None:
+                        self.ctrl.send({"cmd": "led", "value": 0})
+                        self.set_ir_cut("day")
+                        print("[Pointing-Adaptive]  LED ON   ")
+                        led_pair_capture_failed = True
+                        break
+
                     self.ctrl.send({"cmd": "led", "value": 0})
+                    time.sleep(led_settle)
+                    img_led_off = self._snap_and_wait(
+                        f"pointing_adaptive_led_off_{iteration}{snap_suffix}",
+                        shutter_speed=10000,
+                        analogue_gain=None,
+                    )
+                    if img_led_off is None:
+                        self.set_ir_cut("day")
+                        print("[Pointing-Adaptive]  LED OFF   ")
+                        led_pair_capture_failed = True
+                        break
+
+                    #   IR
                     self.set_ir_cut("day")
-                    print("[Pointing-Adaptive]  LED ON   ")
+
+                    try:
+                        save_suffix = "" if detect_try == 0 else f"_retry{detect_try + 1}"
+                        cv2.imwrite(f"{log_dir}/iter_{iteration}_led_on{save_suffix}.jpg", img_led_on)
+                        cv2.imwrite(f"{log_dir}/iter_{iteration}_led_off{save_suffix}.jpg", img_led_off)
+                    except Exception as e:
+                        print(f"[Pointing-Adaptive] Log save failed: {e}")
+
+                    phase_center_roi_box = self._get_center_roi_box(img_led_on.shape) if phase >= 2 else None
+                    obj_cx, obj_cy, bbox, all_bboxes = self._find_object_center(
+                        img_led_on,
+                        img_led_off,
+                        selection_roi_box=phase_center_roi_box,
+                    )
+                    if obj_cx is not None:
+                        break
+
+                    if detect_try == 0:
+                        if phase >= 2:
+                            print(
+                                "[Pointing-Adaptive] Phase 2: no object inside center ROI -> "
+                                "retry LED ON/OFF detection once"
+                            )
+                            self._update_aiming_status(
+                                track_id,
+                                iteration,
+                                f"Phase 2: center ROI miss -> retry once",
+                            )
+                        else:
+                            print("[Pointing-Adaptive] Phase 1: no YOLO object -> retry LED ON/OFF once")
+                            self._update_aiming_status(
+                                track_id,
+                                iteration,
+                                "Phase 1: object miss -> retry once",
+                            )
+
+                if led_pair_capture_failed or img_led_on is None or img_led_off is None:
                     continue
 
-                self.ctrl.send({"cmd": "led", "value": 0})
-                time.sleep(led_settle)
-                img_led_off = self._snap_and_wait(
-                    f"pointing_adaptive_led_off_{iteration}",
-                    shutter_speed=10000,
-                    analogue_gain=None,
-                )
-                if img_led_off is None:
-                    self.set_ir_cut("day")
-                    print("[Pointing-Adaptive]  LED OFF   ")
-                    continue
-                
-                #   IR  
-                self.set_ir_cut("day")
-
-                try:
-                    cv2.imwrite(f"{log_dir}/iter_{iteration}_led_on.jpg", img_led_on)
-                    cv2.imwrite(f"{log_dir}/iter_{iteration}_led_off.jpg", img_led_off)
-                except Exception as e:
-                    print(f"[Pointing-Adaptive] Log save failed: {e}")
-
-                phase_center_roi_box = self._get_center_roi_box(img_led_on.shape) if phase >= 2 else None
-                obj_cx, obj_cy, bbox, all_bboxes = self._find_object_center(
-                    img_led_on,
-                    img_led_off,
-                    selection_roi_box=phase_center_roi_box,
-                )
                 if obj_cx is None:
                     if phase >= 2:
                         roi_msg = (
@@ -1452,6 +1782,17 @@ class PointingHandlerMixin:
                                 pan_q, tilt_q = self._quantize_pan_tilt(self._curr_pan, self._curr_tilt)
                                 self.computed_targets[track_id] = (pan_q, tilt_q)
                                 self._update_target_button_value(track_id, pan_q, tilt_q)
+                                if hasattr(self, "_track_phase3_response"):
+                                    self._track_phase3_response[track_id] = {
+                                        "mean": float(best_resp_mean),
+                                        "core": float(best_resp_core),
+                                        "max": float(best_resp_max),
+                                    }
+                                self._capture_final_led_state_at_current_pose(
+                                    track_id,
+                                    label=f"pointing_final_led_{iteration}_phase3_best",
+                                    led_settle=led_settle,
+                                )
                                 self._persist_final_target_to_csv(track_id, pan_q, tilt_q)
                                 print(
                                     "[Pointing-Adaptive] Phase 3 best: "
@@ -1460,8 +1801,22 @@ class PointingHandlerMixin:
                                     f"pose=({self._curr_pan:.2f},{self._curr_tilt:.2f}), ok={phase3_ok}"
                                 )
                             else:
+                                if hasattr(self, "_track_phase3_response"):
+                                    self._track_phase3_response.pop(track_id, None)
+                                self._capture_final_led_state_at_current_pose(
+                                    track_id,
+                                    label=f"pointing_final_led_{iteration}_phase3_fallback",
+                                    led_settle=led_settle,
+                                )
                                 self._persist_final_target_to_csv(track_id, final_pan, final_tilt)
                         else:
+                            if hasattr(self, "_track_phase3_response"):
+                                self._track_phase3_response.pop(track_id, None)
+                            self._capture_final_led_state_at_current_pose(
+                                track_id,
+                                label=f"pointing_final_led_{iteration}_phase2_final",
+                                led_settle=led_settle,
+                            )
                             self._persist_final_target_to_csv(track_id, final_pan, final_tilt)
                             print(
                                 "[Pointing-Adaptive] Phase 3 disabled -> "
@@ -2167,13 +2522,31 @@ class PointingHandlerMixin:
         all_bboxes = []
         target_bbox = None
         target_center = None
-        self._last_object_led_info = {"pred": "NONE", "score": {"R": 0, "G": 0, "B": 0}, "roi": None}
+        self._last_object_led_info = {"pred": "NONE", "bits": "000", "score": {"R": 0, "G": 0, "B": 0}, "roi": None}
 
         H, W = diff.shape[:2]
         center_x, center_y = W // 2, H // 2
 
         # 3) conf>=0.5    ( )
         use_results = [r for r in results if len(r) >= 6 and float(r[4]) >= 0.5] or results
+        if use_results:
+            try:
+                nms_boxes = []
+                nms_scores = []
+                for r in use_results:
+                    x1, y1, x2, y2, conf, _cls_id = r
+                    nms_boxes.append([
+                        float(x1),
+                        float(y1),
+                        max(0.0, float(x2) - float(x1)),
+                        max(0.0, float(y2) - float(y1)),
+                    ])
+                    nms_scores.append(float(conf))
+                keep_indices = list(non_max_suppression(nms_boxes, nms_scores, iou_threshold=0.6))
+                if keep_indices:
+                    use_results = [use_results[int(i)] for i in keep_indices]
+            except Exception:
+                pass
         led_params = getattr(self, "led_filter_params", None) or get_default_led_filter_params()
         candidates = []
 
@@ -2199,6 +2572,7 @@ class PointingHandlerMixin:
                 led_roi_seed,
                 params=led_params,
             )
+            led_bits = led_score_to_bits(led_score, threshold=led_params.get("min_pixels", 0))["bits"]
             led_strength = max(int(led_score["R"]), int(led_score["G"]), int(led_score["B"]))
             candidates.append({
                 "bbox": bbox,
@@ -2206,6 +2580,7 @@ class PointingHandlerMixin:
                 "dist": dist,
                 "in_selection_roi": self._point_in_box(cx, cy, selection_roi_box),
                 "led_pred": led_pred,
+                "led_bits": led_bits,
                 "led_score": led_score,
                 "led_roi": led_roi,
                 "led_strength": led_strength,
@@ -2224,6 +2599,7 @@ class PointingHandlerMixin:
                 target_center = best["center"]
                 self._last_object_led_info = {
                     "pred": best["led_pred"],
+                    "bits": best["led_bits"],
                     "score": dict(best["led_score"]),
                     "roi": best["led_roi"],
                 }
@@ -2246,7 +2622,7 @@ class PointingHandlerMixin:
                         cx = x + w / 2.0
                         cy = y + h / 2.0
                         all_bboxes = [(int(x), int(y), int(w), int(h))]
-                        self._last_object_led_info = {"pred": "NONE", "score": {"R": 0, "G": 0, "B": 0}, "roi": None}
+                        self._last_object_led_info = {"pred": "NONE", "bits": "000", "score": {"R": 0, "G": 0, "B": 0}, "roi": None}
                         if selection_roi_box is not None and not self._point_in_box(cx, cy, selection_roi_box):
                             return None, None, None, all_bboxes
                         return cx, cy, (int(x), int(y), int(w), int(h)), all_bboxes
@@ -2507,35 +2883,55 @@ class PointingHandlerMixin:
     ):
         """Phase3 단일 측정: 타겟 재검출 + area response 계산."""
         try:
-            self.set_ir_cut("night")
-            time.sleep(0.05)
+            img_led_on = None
+            img_led_off = None
+            center_roi_box = None
+            obj_cx = obj_cy = None
+            bbox = None
+            all_bboxes = fallback_bboxes
 
-            self.ctrl.send({"cmd": "led", "value": 255})
-            time.sleep(led_settle)
-            img_led_on = self._snap_and_wait(
-                f"pointing_phase3_led_on_{base_iteration}_{phase3_iter}_{phase3_tag}",
-            )
-            self.ctrl.send({"cmd": "led", "value": 0})
-            if img_led_on is None:
+            for detect_try in range(2):
+                snap_suffix = "" if detect_try == 0 else f"_retry{detect_try + 1}"
+                self.set_ir_cut("night")
+                time.sleep(0.05)
+
+                self.ctrl.send({"cmd": "led", "value": 255})
+                time.sleep(led_settle)
+                img_led_on = self._snap_and_wait(
+                    f"pointing_phase3_led_on_{base_iteration}_{phase3_iter}_{phase3_tag}{snap_suffix}",
+                    shutter_speed=10000,
+                    analogue_gain=1.0,
+                )
+                self.ctrl.send({"cmd": "led", "value": 0})
+                if img_led_on is None:
+                    self.set_ir_cut("day")
+                    return None, px_per_cm_hint, fallback_bboxes
+
+                time.sleep(led_settle)
+                img_led_off = self._snap_and_wait(
+                    f"pointing_phase3_led_off_{base_iteration}_{phase3_iter}_{phase3_tag}{snap_suffix}",
+                    shutter_speed=10000,
+                    analogue_gain=1.0,
+                )
                 self.set_ir_cut("day")
-                return None, px_per_cm_hint, fallback_bboxes
+                if img_led_off is None:
+                    return None, px_per_cm_hint, fallback_bboxes
 
-            time.sleep(led_settle)
-            img_led_off = self._snap_and_wait(
-                f"pointing_phase3_led_off_{base_iteration}_{phase3_iter}_{phase3_tag}",
-            )
-            self.set_ir_cut("day")
-            if img_led_off is None:
-                return None, px_per_cm_hint, fallback_bboxes
-
-            center_roi_box = self._get_center_roi_box(img_led_on.shape)
-            obj_cx, obj_cy, bbox, all_bboxes = self._find_object_center(
-                img_led_on,
-                img_led_off,
-                selection_roi_box=center_roi_box,
-            )
-            if all_bboxes is None:
-                all_bboxes = fallback_bboxes
+                center_roi_box = self._get_center_roi_box(img_led_on.shape)
+                obj_cx, obj_cy, bbox, all_bboxes = self._find_object_center(
+                    img_led_on,
+                    img_led_off,
+                    selection_roi_box=center_roi_box,
+                )
+                if all_bboxes is None:
+                    all_bboxes = fallback_bboxes
+                if bbox is not None:
+                    break
+                if detect_try == 0:
+                    print(
+                        "[Pointing-Adaptive] Phase 3: no object inside center ROI -> "
+                        "retry LED ON/OFF detection once"
+                    )
 
             if obj_cx is None and not px_per_cm_hint:
                 px_per_cm_hint = 10.0
@@ -2563,6 +2959,8 @@ class PointingHandlerMixin:
             time.sleep(led_settle)
             img_laser_on = self._snap_and_wait(
                 f"pointing_phase3_laser_on_{base_iteration}_{phase3_iter}_{phase3_tag}",
+                shutter_speed=1000,
+                analogue_gain=1.0,
             )
             self.ctrl.send({"cmd": "laser", "value": 0})
             if img_laser_on is None:
@@ -2571,6 +2969,8 @@ class PointingHandlerMixin:
             time.sleep(led_settle)
             img_laser_off = self._snap_and_wait(
                 f"pointing_phase3_laser_off_{base_iteration}_{phase3_iter}_{phase3_tag}",
+                shutter_speed=1000,
+                analogue_gain=1.0,
             )
             if img_laser_off is None:
                 return None, px_per_cm_hint, all_bboxes
