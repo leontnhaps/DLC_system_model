@@ -1,0 +1,31 @@
+======================================================================
+PV efficiency summary using beam_integral_sum
+======================================================================
+
+Voltage column             : vol_load [V]
+Integral column            : beam_integral_sum
+Load resistor              : 100 ohm
+Ambient voltage subtracted : 0.0175 V
+Regression/fitting         : not applied in this script
+
+Total rows                 : 69
+Valid rows                 : 47
+
+[Input intensity]
+beam_integral_sum min/max/mean : 412.11231 / 18458.869 / 5102.6093
+
+[Corrected voltage]
+vol_load min/max/mean      : 0.02 / 1.248 / 0.3712766 V
+vol_corr min/max/mean      : 0.0025 / 1.2305 / 0.3537766 V
+
+[Electrical output]
+I_calc min/max/mean        : 0.025 / 12.305 / 3.537766 mA
+P_elec min/max/mean        : 6.25e-05 / 15.141302 / 2.6073472 mW
+
+[Correlation only]
+Pearson r: sum vs vol_corr : 0.40209707
+Pearson r: sum vs P_elec   : 0.33726171
+
+[Generated files]
+CSV     : efficiency_sum.csv
+Summary : efficiency_sum_summary.txt

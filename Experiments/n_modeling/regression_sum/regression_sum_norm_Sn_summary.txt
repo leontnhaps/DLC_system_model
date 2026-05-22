@@ -1,0 +1,86 @@
+﻿======================================================================
+SUM / NORMALIZED S_N regression summary with 5 holdout points (normalized S_n)
+======================================================================
+Input CSV       : C:\Users\gmlwn\OneDrive\바탕 화면\ICon2학년\DLC_system_model\Captures\n modeling\efficiency_sum.csv
+X column        : beam_integral_sum
+Y column        : corrected voltage = vol_load - 0.0175
+Total rows      : 69
+Valid rows      : 47
+Training rows   : 42
+Holdout rows    : 5
+Holdout indices : [53, 32, 63, 58, 66]
+
+[Method]
+The valid data range on the x-axis was divided into 5 intervals.
+One data point was selected from each interval as holdout data.
+The 5 holdout points were excluded from fitting.
+Regression was performed using the remaining training data.
+
+[Internal x normalization]
+For numerical stability, regression uses normalized x:
+S_n = (S - S_min_train) / (S_max_train - S_min_train)
+Plots still use the original x-axis values.
+
+[Model results]
+
+----------------------------------------------------------------------
+Model: linear
+success       : True
+S_min_train   : 412.1123146755
+S_scale_train : 11356.4084281734
+train R^2     : 0.2690494755
+train RMSE    : 0.3210253748
+holdout R^2   : -4.6434740968
+holdout RMSE  : 0.7056364621
+Equation      : V = m*S_n + b
+m = 0.9787354156
+b = -0.0187392971
+
+----------------------------------------------------------------------
+Model: quadratic
+success       : True
+S_min_train   : 412.1123146755
+S_scale_train : 11356.4084281734
+train R^2     : 0.2690494754
+train RMSE    : 0.3210253748
+holdout R^2   : -4.6434741031
+holdout RMSE  : 0.7056364625
+Equation      : V = a*S_n^2 + b*S_n + c
+a = 0.0000000000
+b = 0.9787354162
+c = -0.0187392973
+
+----------------------------------------------------------------------
+Model: shifted_quadratic
+success       : True
+S_min_train   : 412.1123146755
+S_scale_train : 11356.4084281734
+train R^2     : 0.2540678080
+train RMSE    : 0.3242985791
+holdout R^2   : -5.3211686724
+holdout RMSE  : 0.7468036560
+Equation      : V = a*(S_n - h)^2 + c
+a = 0.0973795306
+h = -4.5228282769
+c = -2.0000000000
+
+----------------------------------------------------------------------
+Model: exponential_growth
+success       : True
+S_min_train   : 412.1123146755
+S_scale_train : 11356.4084281734
+train R^2     : 0.2556167497
+train RMSE    : 0.3239616982
+holdout R^2   : -5.2876275411
+holdout RMSE  : 0.7448196909
+Equation      : V = A*(exp(k*S_n) - 1) + c
+A = 5.0000000000
+k = 0.1787552317
+c = -0.0094320314
+
+[Best model by holdout RMSE]
+1. linear: holdout RMSE=0.7056364621, train R^2=0.2690494755
+2. quadratic: holdout RMSE=0.7056364625, train R^2=0.2690494754
+3. exponential_growth: holdout RMSE=0.7448196909, train R^2=0.2556167497
+4. shifted_quadratic: holdout RMSE=0.7468036560, train R^2=0.2540678080
+======================================================================
