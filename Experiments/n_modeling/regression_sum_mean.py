@@ -817,7 +817,7 @@ def plot_all_highlight_holdout(
     x_line = _x_line_from_data(x_train, x_holdout)
     _plot_fit_lines(x_line, fits)
 
-    plt.xlabel(x_col)
+    plt.xlabel("Beam Intensity Mean")
     plt.ylabel("Corrected load voltage [V]")
     plt.title(f"{prefix.upper()}: all data with 5 holdout points highlighted")
     _save_current_plot(out_path)

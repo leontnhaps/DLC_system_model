@@ -1,7 +1,7 @@
 ﻿======================================================================
 SUM / NORMALIZED S_N regression summary with 5 holdout points (normalized S_n)
 ======================================================================
-Input CSV       : C:\Users\gmlwn\OneDrive\바탕 화면\ICon2학년\DLC_system_model\Captures\n modeling\efficiency_sum.csv
+Input CSV       : C:\Users\gmlwn\OneDrive\바탕 화면\ICon2학년\DLC_system_model\Experiments\n_modeling\efficiency_sum.csv
 X column        : beam_integral_sum
 Y column        : corrected voltage = vol_load - 0.0175
 Total rows      : 69
