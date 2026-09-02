@@ -284,32 +284,54 @@ class ComApp(EventHandlersMixin, PointingHandlerMixin, AppHelpersMixin):
         print(f"[PREVIEW] Auto-restore ({reason}): {w}x{h} @ {fps}fps")
         self.toggle_preview(True, w, h, fps, q)
 
+    @staticmethod
+    def _normalize_led_bits_for_preview(value):
+        text = str(value or "").strip()
+        if 1 <= len(text) <= 3 and all(ch in "01" for ch in text):
+            return text.zfill(3)
+        return None
+
+    def _get_preview_led_bits(self, track_id=None, fallback=None):
+        bits = None
+        track_key = None
+        if track_id is not None:
+            try:
+                track_key = int(track_id)
+            except Exception:
+                track_key = track_id
+            final_states = getattr(self, "_track_final_led_state", {}) or {}
+            state_info = final_states.get(track_key)
+            if state_info is None and track_key is not track_id:
+                state_info = final_states.get(track_id)
+            if isinstance(state_info, dict):
+                bits = self._normalize_led_bits_for_preview(state_info.get("bits"))
+
+        if bits is None:
+            bits = self._normalize_led_bits_for_preview(fallback)
+
+        if bits is None and track_key is not None:
+            latest_states = getattr(self, "_scheduling_led_latest", {}) or {}
+            bits = self._normalize_led_bits_for_preview(latest_states.get(track_key))
+            if bits is None and track_key is not track_id:
+                bits = self._normalize_led_bits_for_preview(latest_states.get(track_id))
+
+        return bits or "-"
+
     def _set_preview_overlay(self, current_id=None, phase="Idle", dwell_elapsed=None, dwell_total=None, led_state=None):
-        """프리뷰 오버레이(현재 ID + Phase + RR slice 진행률) 갱신"""
+        """프리뷰 오버레이에 진행 시간과 CSV/스케줄링 LED bit 표시"""
         cid = "-" if current_id is None else str(current_id)
-        led_txt = "-" if led_state in (None, "") else str(led_state)
+        bits = self._get_preview_led_bits(current_id, fallback=led_state)
         if dwell_elapsed is not None and dwell_total is not None and dwell_total > 0:
-            text = f"RR Slice: {dwell_elapsed:.1f}/{dwell_total:.1f}s | ID: {cid} | LED: {led_txt} | {phase}"
+            time_text = f"Slice: {dwell_elapsed:.1f}/{dwell_total:.1f}s"
         else:
-            text = f"RR Slice: - | ID: {cid} | LED: {led_txt} | {phase}"
+            time_text = "Slice: -"
+        text = f"{time_text} | ID: {cid} | BIT: {bits}"
         if hasattr(self, "preview_frame") and hasattr(self.preview_frame, "set_overlay_text"):
             self.root.after(0, lambda t=text: self.preview_frame.set_overlay_text(t))
         if hasattr(self, "preview_frame") and hasattr(self.preview_frame, "set_overlay_roi"):
-            roi = None
-            source_size = None
-            roi_label = "LED ROI"
-            if current_id is not None:
-                try:
-                    track_key = int(current_id)
-                except Exception:
-                    track_key = current_id
-                roi = (getattr(self, "_track_led_roi", {}) or {}).get(track_key)
-                source_size = (getattr(self, "_track_led_roi_source_size", {}) or {}).get(track_key)
-                if roi is not None:
-                    roi_label = f"LED ROI ID {track_key}"
             self.root.after(
                 0,
-                lambda r=roi, s=source_size, lbl=roi_label: self.preview_frame.set_overlay_roi(r, s, lbl),
+                lambda: self.preview_frame.set_overlay_roi(None, None),
             )
 
     def _send_scan_run(self, cmd, session):

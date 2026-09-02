@@ -123,6 +123,9 @@ class EventHandlersMixin:
         if hasattr(self, "_notify_blocking_snap_saved"):
             self._notify_blocking_snap_saved(name, data)
 
+        if name.startswith("sched_led_"):
+            return
+
         scan = self._get_scan_backend()
         if scan.is_active():
             saved_path = scan.save_image(name, data)

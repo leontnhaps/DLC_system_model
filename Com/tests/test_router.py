@@ -43,12 +43,16 @@ class FakeApp:
         self.info_label = FakeInfoLabel()
         self.pointing_calls = []
         self.preview_calls = []
+        self.blocking_snap_notifications = []
 
     def _on_pointing_image_received(self, name, data):
         self.pointing_calls.append((name, data))
 
     def _set_preview(self, data):
         self.preview_calls.append(data)
+
+    def _notify_blocking_snap_saved(self, name, data):
+        self.blocking_snap_notifications.append((name, data))
 
 
 class RouterTest(unittest.TestCase):
@@ -111,6 +115,20 @@ class RouterTest(unittest.TestCase):
         self.assertEqual(len(app.scan_ctrl.save_calls), 0)
         self.assertEqual(len(app.preview_calls), 1)
         self.assertEqual(app.preview_calls[0], data)
+
+    def test_scheduling_led_probe_route_is_hidden(self):
+        app = FakeApp(aiming_active=False, scan_active=False)
+        name = "sched_led_single_id1_20260101_000000_000000.jpg"
+        data = b"scheduling-led-probe-data"
+
+        route_saved_image(app, name, data)
+
+        self.assertEqual(app.blocking_snap_notifications, [(name, data)])
+        self.assertEqual(len(app.pointing_calls), 0)
+        self.assertEqual(len(app.scan_ctrl.save_calls), 0)
+        self.assertEqual(len(app.preview_calls), 0)
+        self.assertFalse((app_config.SAVE_DIR / name).exists())
+        self.assertIsNone(app.info_label.last_text)
 
 
 if __name__ == "__main__":

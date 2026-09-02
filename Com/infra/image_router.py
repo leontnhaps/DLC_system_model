@@ -18,6 +18,9 @@ def route_saved_image(app, name: str, data: bytes) -> None:
     if hasattr(app, "_notify_blocking_snap_saved"):
         app._notify_blocking_snap_saved(name, data)
 
+    if name.startswith("sched_led_"):
+        return
+
     if name.startswith("led_test_"):
         app._set_preview(data)
         return
