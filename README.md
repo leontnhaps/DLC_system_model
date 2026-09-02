@@ -851,43 +851,10 @@ Additional fields may contain:
 - final pointing coordinates,
 - and other experimental measurements.
 
----
-
-# 22. Publications
-
-## Battery-Aware Scheduling for Multi-Receiver Laser Wireless Power Transfer in IoT Systems
-
-**H. J. Lee, S. M. Kim, and J. Kim**
-
-International Conference on Ubiquitous and Future Networks (**ICUFN**), 2026.
-
-Main contributions:
-
-- 3-bit LED representation of receiver battery state,
-- camera-based receiver-state recognition,
-- receiver-state-dependent charging-time allocation,
-- experimental comparison with Round-Robin scheduling,
-- and validation using a real indoor laser-based OWPT testbed.
 
 ---
 
-## Battery and Energy Transfer Efficiency Based Laser Wireless Power Transfer Scheduling for Wireless Sensor Networks
-
-**H. J. Lee, S. M. Kim, and J. Kim**
-
-2026.
-
-Main contributions:
-
-- image-based laser intensity estimation,
-- Gaussian beam modeling,
-- regression-based PV voltage estimation,
-- energy-transfer-efficiency-aware scheduling,
-- and network-lifetime evaluation using First Node Death.
-
----
-
-# 23. Key Research Contributions
+# 22. Key Research Contributions
 
 This project demonstrates an integrated framework for:
 
@@ -901,7 +868,7 @@ This project demonstrates an integrated framework for:
 
 ---
 
-# 24. Future Work
+# 23. Future Work
 
 Possible extensions include:
 
